@@ -74,13 +74,14 @@ cd program
 cargo test --features no-entrypoint --all-targets
 ```
 
-This runs 52 unit tests + 3 litesvm integration tests:
+This runs 56 unit tests + 3 litesvm integration tests:
 
-- **52 unit tests** — fixed-point health engine, breach detection, partial-close
+- **56 unit tests** — fixed-point health engine, breach detection, partial-close
   solver, action selection precedence + caps, 2-of-2 withdraw matrix, tick
   freshness/degraded mode, nonce semantics, serialization round-trips, Jupiter
-  safety-net serialization + co-signed build persistence, and the owner
-  `Confirm` commit path + its rejection matrix.
+  safety-net serialization + co-signed build persistence, the owner `Confirm`
+  commit path + its rejection matrix, and the verified Pyth `PriceUpdateV2`
+  accessor (feed/staleness/confidence gates + 6dp scaling).
 - **1 litesvm integration test** (`init.rs`) — `InitGuard` CPI-create + deposit.
 - **2 litesvm e2e tests** (`tick.rs`):
   - *Autonomous*: an underwater position on a breach tick triggers the guard
@@ -161,7 +162,7 @@ The guard's margin wallet is a 2-of-2 (`user` + `co_authority`) — see §8.5.
 - [x] CI (fmt, clippy, build-sbf, tests)
 - [x] Phase 3 — Jupiter co-signed safety-net adapter (build + persist the owner-signed instruction)
 - [x] Phase 3.5 — owner `Confirm` instruction to land the pending Jupiter instruction + commit nonce
-- [ ] Phase 4 — Pyth Lazer price wiring (if Flash V2's own stream is insufficient)
+- [x] Phase 4 — verified Pyth `PriceUpdateV2` accessor (feed/staleness/confidence gates + 6dp scaling)
 - [ ] Phase 5 — dashboard (real latency chart first, then state panels)
 - [ ] Deployment — devnet program, live ER delegation round-trip, latency benchmark
 

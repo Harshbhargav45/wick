@@ -15,6 +15,7 @@ pub mod flash;
 pub mod instruction;
 pub mod jupiter;
 pub mod processor;
+pub mod pyth;
 pub mod state;
 
 #[cfg(not(feature = "no-entrypoint"))]
