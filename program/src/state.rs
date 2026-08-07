@@ -98,14 +98,14 @@ pub fn compute_pnl(
         .checked_sub(entry)
         .ok_or(WickError::MathOverflow)?;
     let raw = size.checked_mul(price_delta).ok_or(WickError::MathOverflow)?;
-    Ok(raw.checked_div(SCALE as i128).ok_or(WickError::MathOverflow)?)
+    raw.checked_div(SCALE as i128).ok_or(WickError::MathOverflow)
 }
 
 /// Maintenance margin required on `abs_size`, scaled by `margin_bps`.
 pub fn compute_margin_required(abs_size: u128, margin_bps: u128) -> Result<u128, WickError> {
     let num = (abs_size as i128).checked_mul(margin_bps as i128)
         .ok_or(WickError::MathOverflow)?;
-    Ok((num / BPS_DENOM as i128).try_into().or(Err(WickError::MathOverflow))?)
+    (num / BPS_DENOM as i128).try_into().or(Err(WickError::MathOverflow))
 }
 
 /// Equity = collateral + pnl. Can be negative (insolvency).
@@ -190,14 +190,11 @@ pub fn solve_partial_close_fraction(
         Ok((equity_after >= remaining_target, equity_after))
     };
 
-    match is_safe(BPS_DENOM)? {
-        (false, equity_at_full) => {
-            // Closing 100% still doesn't reach target, or equity is negative (insolvency).
-            if equity_at_full <= 0 {
-                return Err(WickError::CannotReachSafeBuffer);
-            }
+    if let (false, equity_at_full) = is_safe(BPS_DENOM)? {
+        // Closing 100% still doesn't reach target, or equity is negative (insolvency).
+        if equity_at_full <= 0 {
+            return Err(WickError::CannotReachSafeBuffer);
         }
-        _ => {}
     }
 
     let (mut lo, mut hi): (u128, u128) = (0, BPS_DENOM);

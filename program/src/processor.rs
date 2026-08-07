@@ -17,7 +17,7 @@ use pinocchio::error::ProgramResult;
 use pinocchio::instruction::{cpi::Signer, seeds};
 use pinocchio::{AccountView, Address};
 
-use pinocchio_system::create_program_account_with_minimum_balance_signed;
+use pinocchio_system::instructions::CreateAccount;
 
 use crate::account::{GuardState, GUARD_DATA_LEN};
 use crate::error::WickError;
@@ -106,7 +106,7 @@ fn load_guard(account: &AccountView, program_id: &Address) -> Result<GuardState,
 }
 
 /// Write a decoded guard state back into its account.
-fn store_guard(account: &mut AccountView, state: &GuardState) -> Result<(), WickError> {
+fn store_guard(account: &AccountView, state: &GuardState) -> Result<(), WickError> {
     let mut data = account
         .try_borrow_mut()
         .map_err(|_| WickError::NotInitialized)?;
@@ -121,7 +121,7 @@ fn store_guard(account: &mut AccountView, state: &GuardState) -> Result<(), Wick
 
 fn init_guard(
     program_id: &Address,
-    accounts: &mut [AccountView],
+    accounts: &[AccountView],
     data: &[u8],
 ) -> ProgramResult {
     let (guard, owner, payer, rent) = split_4(accounts)?;
@@ -144,14 +144,16 @@ fn init_guard(
     let seeds = seeds!(GUARD_SEED, &venue_owner[..], &bump);
     let signer = Signer::from(&seeds);
 
-    create_program_account_with_minimum_balance_signed(
-        guard,
-        GUARD_DATA_LEN,
-        program_id,
-        payer,
-        Some(rent),
-        &[signer],
-    )?;
+    if guard.lamports() == 0 {
+        let create_account = CreateAccount::with_minimum_balance(
+            payer,
+            guard,
+            GUARD_DATA_LEN as u64,
+            program_id,
+            Some(rent),
+        )?;
+        create_account.invoke_signed(&[signer])?;
+    }
 
     let state = GuardState {
         venue: 0, // Phase 1: no venue adapter yet
@@ -173,7 +175,7 @@ fn init_guard(
 
 fn deposit_margin(
     program_id: &Address,
-    accounts: &mut [AccountView],
+    accounts: &[AccountView],
     data: &[u8],
 ) -> ProgramResult {
     let (guard, owner) = split_2(accounts)?;
@@ -197,7 +199,7 @@ fn deposit_margin(
 
 fn withdraw_margin(
     program_id: &Address,
-    accounts: &mut [AccountView],
+    accounts: &[AccountView],
     data: &[u8],
 ) -> ProgramResult {
     let (guard, owner, co_authority) = split_3(accounts)?;
@@ -225,7 +227,7 @@ fn withdraw_margin(
 
 fn set_paused(
     program_id: &Address,
-    accounts: &mut [AccountView],
+    accounts: &[AccountView],
     data: &[u8],
 ) -> ProgramResult {
     let (config, authority) = split_2(accounts)?;
@@ -263,43 +265,40 @@ fn set_paused(
 // Account splitting helpers
 // -------------------------------------------------------------------------
 
-fn split_2(accounts: &mut [AccountView]) -> Result<(&mut AccountView, &mut AccountView), WickError> {
+fn split_2(accounts: &[AccountView]) -> Result<(&AccountView, &AccountView), WickError> {
     if accounts.len() < 2 {
         return Err(WickError::InvalidInstruction);
     }
-    let (first, rest) = accounts.split_at_mut(1);
-    Ok((&mut first[0], &mut rest[0]))
+    let (first, rest) = accounts.split_at(1);
+    Ok((&first[0], &rest[0]))
 }
 
 fn split_3(
-    accounts: &mut [AccountView],
-) -> Result<(&mut AccountView, &mut AccountView, &mut AccountView), WickError> {
+    accounts: &[AccountView],
+) -> Result<(&AccountView, &AccountView, &AccountView), WickError> {
     if accounts.len() < 3 {
         return Err(WickError::InvalidInstruction);
     }
-    let (first, rest) = accounts.split_at_mut(1);
-    let (second, rest) = rest.split_at_mut(1);
-    Ok((&mut first[0], &mut second[0], &mut rest[0]))
+    let (first, rest) = accounts.split_at(1);
+    let (second, rest) = rest.split_at(1);
+    Ok((&first[0], &second[0], &rest[0]))
 }
 
 fn split_4(
-    accounts: &mut [AccountView],
-) -> Result<
-    (&mut AccountView, &mut AccountView, &mut AccountView, &mut AccountView),
-    WickError,
-> {
+    accounts: &[AccountView],
+) -> Result<(&AccountView, &AccountView, &AccountView, &AccountView), WickError> {
     if accounts.len() < 4 {
         return Err(WickError::InvalidInstruction);
     }
-    let (first, rest) = accounts.split_at_mut(1);
-    let (second, rest) = rest.split_at_mut(1);
-    let (third, rest) = rest.split_at_mut(1);
-    Ok((&mut first[0], &mut second[0], &mut third[0], &mut rest[0]))
+    let (first, rest) = accounts.split_at(1);
+    let (second, rest) = rest.split_at(1);
+    let (third, rest) = rest.split_at(1);
+    Ok((&first[0], &second[0], &third[0], &rest[0]))
 }
 
 pub fn process_instruction(
     program_id: &Address,
-    accounts: &mut [AccountView],
+    accounts: &[AccountView],
     data: &[u8],
 ) -> ProgramResult {
     let Some(discriminator_byte) = data.first().copied() else {
@@ -453,7 +452,7 @@ mod tests {
                 (*raw).is_signer = is_signer as u8;
                 (*raw).is_writable = is_writable as u8;
                 (*raw).executable = 0;
-                (*raw).padding = [0; 4];
+                (*raw).resize_delta = 0;
                 (*raw).address = address;
                 (*raw).owner = owner;
                 (*raw).lamports = lamports;

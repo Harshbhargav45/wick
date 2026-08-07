@@ -9,9 +9,10 @@ rust-version = "1.89.0"
 crate-type = ["cdylib", "lib"]
 
 [dependencies]
-pinocchio = { version = "0.11.2", features = ["alloc", "cpi", "account-resize"] }
+pinocchio = { version = "0.10", features = ["alloc", "cpi", "copy"] }
 pinocchio-log = "0.5.1"
-pinocchio-system = { version = "0.6", features = ["account-resize"] }
+pinocchio-system = { version = "0.5" }
+ephemeral-rollups-pinocchio = "0.16.2"
 
 [features]
 no-entrypoint = []
