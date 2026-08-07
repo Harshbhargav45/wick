@@ -74,11 +74,12 @@ cd program
 cargo test --features no-entrypoint --all-targets
 ```
 
-This runs 45 tests:
+This runs 48 unit tests + 3 litesvm integration tests:
 
-- **42 unit tests** — fixed-point health engine, breach detection, partial-close
+- **48 unit tests** — fixed-point health engine, breach detection, partial-close
   solver, action selection precedence + caps, 2-of-2 withdraw matrix, tick
-  freshness/degraded mode, nonce semantics, serialization round-trips.
+  freshness/degraded mode, nonce semantics, serialization round-trips, Jupiter
+  safety-net serialization + co-signed build persistence.
 - **1 litesvm integration test** (`init.rs`) — `InitGuard` CPI-create + deposit.
 - **2 litesvm e2e tests** (`tick.rs`):
   - *Autonomous*: an underwater position on a breach tick triggers the guard
@@ -87,6 +88,9 @@ This runs 45 tests:
     path, proven end-to-end against a real SBF VM.
   - *Co-signed*: the same breach never reaches the venue; the action is held
     as pending and the nonce does not advance until an owner signature exists.
+    On Jupiter, the guard additionally **builds** the owner-signed
+    `instant_create_tpsl` safety-net instruction data and persists it beside the
+    expected nonce — the owner's signature is what lands it (§8.4/§8.7).
 
 Linting / formatting (what CI enforces):
 
@@ -128,9 +132,12 @@ The guard's margin wallet is a 2-of-2 (`user` + `co_authority`) — see §8.5.
 
 ## Known limitations
 
-- **Jupiter adapter not yet implemented** — the co-signed safety-net path is
-  designed in the architecture but not wired; the guard currently holds the
-  built action as `pending` state only.
+- **Jupiter adapter covers the safety-net build only** — the guard builds and
+  persists the owner-signed `instant_create_tpsl` instruction for take-profit,
+  but there is no `Confirm` instruction to land it, and defensive (breach)
+  Jupiter closes are not yet expressed as a signed instruction — the guard holds
+  those as pending state only. The co-signed path needs the owner's L1
+  signature to fully close the loop.
 - **No frontend/dashboard yet** — guard state is readable on-chain but there is
   no UI or latency chart.
 - **No measured latency benchmark** — the autonomous path is proven in an SBF
@@ -149,7 +156,8 @@ The guard's margin wallet is a 2-of-2 (`user` + `co_authority`) — see §8.5.
 - [x] Phase 1 — guard program, health engine, selector, solver, authority, serialization
 - [x] Phase 1.5 — FlashTrade `close_position` adapter + autonomous e2e proof
 - [x] CI (fmt, clippy, build-sbf, tests)
-- [ ] Phase 3 — Jupiter co-signed safety-net adapter
+- [x] Phase 3 — Jupiter co-signed safety-net adapter (build + persist the owner-signed instruction)
+- [ ] Phase 3.5 — owner `Confirm` instruction to land the pending Jupiter instruction + commit nonce
 - [ ] Phase 4 — Pyth Lazer price wiring (if Flash V2's own stream is insufficient)
 - [ ] Phase 5 — dashboard (real latency chart first, then state panels)
 - [ ] Deployment — devnet program, live ER delegation round-trip, latency benchmark

@@ -20,11 +20,12 @@ use pinocchio::{AccountView, Address};
 
 use pinocchio_system::instructions::CreateAccount;
 
-use crate::account::{GuardState, GUARD_DATA_LEN};
+use crate::account::{GuardState, PendingIx, GUARD_DATA_LEN};
 use crate::delegation;
 use crate::error::WickError;
 use crate::flash::{ClosePositionAccounts, ClosePositionParams, VENUE_FLASH};
 use crate::instruction::WickInstruction;
+use crate::jupiter::{build_tp_safety_net, VENUE_JUPITER};
 use crate::state::{
     accept_tick, guard_act, select_action, track_tick_freshness, Action, ActionCaps,
     AuthorityRequirement, DispatchRegime, HealthSnapshot, RouteConfig, VenuePolicy,
@@ -177,6 +178,7 @@ fn init_guard(program_id: &Address, accounts: &[AccountView], data: &[u8]) -> Pr
         nonce: 0,
         last_check_slot: 0,
         pending: None,
+        pending_ix: None,
         degraded: false,
         stale_streak: 0,
     };
@@ -348,7 +350,7 @@ fn on_price_tick(program_id: &Address, accounts: &[AccountView], data: &[u8]) ->
     };
 
     // §8.4 — two-regime authority dispatch.
-    let (regime, _expected_nonce) = guard_act(&state.policy, state.nonce)?;
+    let (regime, expected_nonce) = guard_act(&state.policy, state.nonce)?;
     match regime {
         DispatchRegime::Autonomous => {
             match execute_autonomous(&state, action, accounts, bump) {
@@ -363,9 +365,25 @@ fn on_price_tick(program_id: &Address, accounts: &[AccountView], data: &[u8]) ->
             }
         }
         DispatchRegime::CoSigned => {
-            // Build the owner-signed instruction (the client reconstructs it
-            // deterministically from the stored action) and hold it as pending.
-            // The nonce must NOT advance until the owner co-signs on L1 (§8.4).
+            // §8.4 / §8.7 — Jupiter is build-only for the guard. Build the
+            // owner-signed safety-net instruction and hold it as pending; the
+            // nonce must NOT advance until the owner co-signs on L1. The guard
+            // never signs or submits it (no fake autonomy).
+            if state.venue == VENUE_JUPITER {
+                if let Action::TakeProfit = action {
+                    let now = Clock::from_account_view(clock)
+                        .map_err(|_| WickError::InvalidInstruction)?
+                        .unix_timestamp;
+                    let data = build_tp_safety_net(
+                        state.policy.take_profit.unwrap_or(state.current_price),
+                        now,
+                    )?;
+                    state.pending_ix = Some(PendingIx {
+                        expected_nonce,
+                        data,
+                    });
+                }
+            }
             state.pending = Some(action);
         }
     }
@@ -390,6 +408,13 @@ fn execute_autonomous(
     accounts: &[AccountView],
     bump: u8,
 ) -> Result<VenueOutcome, WickError> {
+    if state.venue == VENUE_JUPITER {
+        // §8.7 — Jupiter is the co-signed tier. The guard cannot fake the
+        // position owner's signature, so it never executes Jupiter
+        // instructions autonomously. The safety-net TP/SL instruction data is
+        // the owner's to sign (§8.4 CoSigned); autonomy here is not possible.
+        return Err(WickError::UnsupportedVenueAction);
+    }
     if state.venue != VENUE_FLASH {
         return Err(WickError::UnsupportedVenueAction);
     }
@@ -678,6 +703,7 @@ mod tests {
             nonce: 0,
             last_check_slot: 0,
             pending: None,
+            pending_ix: None,
             degraded: false,
             stale_streak: 0,
         };
@@ -718,6 +744,7 @@ mod tests {
             nonce,
             last_check_slot,
             pending: None,
+            pending_ix: None,
             degraded: false,
             stale_streak: 0,
         };
@@ -1153,6 +1180,38 @@ mod tests {
         assert_eq!(state.last_check_slot, 20);
         assert_eq!(state.current_price, 48_000_000);
         assert!(!state.degraded);
+    }
+
+    #[test]
+    fn tick_cosigned_jupiter_tp_builds_owner_signed_safety_net() {
+        // Jupiter + CoSigned + a take-profit action: the guard must build the
+        // owner-signed `instantCreateTpsl` safety-net and hold it as pending —
+        // but never advance the nonce and never submit it (§8.4/§8.7).
+        let mut guard_data = make_guard(AuthorityRequirement::CoSigned, VENUE_JUPITER, 0, 0);
+        {
+            let mut state = GuardState::from_bytes(&guard_data).unwrap();
+            state.policy.take_profit = Some(55_000_000);
+            state.write_into(&mut guard_data).unwrap();
+        }
+        let guard = TestAccount::new(PROGRAM_ID, PROGRAM_ID, 100, &guard_data, false, true);
+        let clock = clock_account(20);
+
+        // price 58m (> TP 55m): take-profit fires; equity 900m > req, TP wins.
+        let result = run_tick(&guard, &clock, &tick_data(58_000_000, 1, 0));
+        assert!(result.is_ok());
+
+        let state = GuardState::from_bytes(guard.data()).unwrap();
+        assert_eq!(state.pending, Some(Action::TakeProfit));
+        let px = state
+            .pending_ix
+            .expect("jupiter TP must build owner-signed data");
+        // Expected nonce is nonce+1 and is NOT committed until owner confirms.
+        assert_eq!(px.expected_nonce, 1);
+        assert_eq!(state.nonce, 0, "nonce must not advance on CoSigned build");
+        // The built data is the deterministic instantCreateTpsl payload.
+        // clock_account leaves unix_timestamp at 0.
+        let expected = build_tp_safety_net(55_000_000, 0).unwrap();
+        assert_eq!(px.data, expected);
     }
 
     #[test]

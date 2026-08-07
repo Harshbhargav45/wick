@@ -13,6 +13,7 @@ pub mod delegation;
 pub mod error;
 pub mod flash;
 pub mod instruction;
+pub mod jupiter;
 pub mod processor;
 pub mod state;
 

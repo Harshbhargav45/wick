@@ -131,9 +131,17 @@ impl RouteConfig {
 //   [260..276] pending amount (u128, meaningful for TopUp/PartialClose)
 //   [276]      degraded (u8: 0=healthy, 1=degraded — §8.1.3)
 //   [277]      stale streak (u8 — consecutive stale ticks)
-// Total: 278
+//   [278]      pending_ix tag (u8, 0=None, 1=JupiterInstantTpsl)
+//   [279..287] pending_ix expected_nonce (u64)
+//   [287..337] pending_ix data (50 bytes — owner-signed instruction built by
+//              the guard; see jupiter.rs, build-only boundary)
+// Total: 338
 // -------------------------------------------------------------------------
-pub const GUARD_DATA_LEN: usize = 278;
+pub const GUARD_DATA_LEN: usize = 338;
+
+/// Max size of a guard-built owner-signed instruction payload (discriminator +
+/// `InstantCreateTpslParams`). Must match `jupiter::build_instant_tpsl_data`.
+pub const PENDING_IX_DATA_LEN: usize = 50;
 
 const G_VENUE_OFF: usize = 1;
 const G_VENUE_OWNER_OFF: usize = 2;
@@ -156,8 +164,23 @@ const G_PENDING_TAG_OFF: usize = 259;
 const G_PENDING_AMT_OFF: usize = 260;
 const G_DEGRADED_OFF: usize = 276;
 const G_STALE_STREAK_OFF: usize = 277;
+const G_PX_TAG_OFF: usize = 278;
+const G_PX_NONCE_OFF: usize = 279;
+const G_PX_DATA_OFF: usize = 287;
 
 const NONE_PRICE: u128 = u128::MAX;
+
+/// A guard-built owner-signed instruction awaiting the position owner's
+/// signature (§8.4 CoSigned). Build-only: the guard constructs the serialized
+/// payload and records the nonce it expects to commit when the owner lands it;
+/// it never signs or submits the instruction itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingIx {
+    /// The nonce the guard will commit iff the owner confirms the build.
+    pub expected_nonce: u64,
+    /// Serialized owner-signed instruction data (see `jupiter::build_instant_tpsl_data`).
+    pub data: [u8; PENDING_IX_DATA_LEN],
+}
 
 /// Decoded view of a `PositionGuard` account.
 pub struct GuardState {
@@ -173,6 +196,7 @@ pub struct GuardState {
     pub nonce: u64,
     pub last_check_slot: u64,
     pub pending: Option<Action>,
+    pub pending_ix: Option<PendingIx>,
     pub degraded: bool,
     pub stale_streak: u8,
 }
@@ -203,6 +227,24 @@ impl GuardState {
             }),
             3 => Some(Action::TakeProfit),
             4 => Some(Action::EscalateManualReview),
+            _ => return Err(()),
+        };
+
+        let pending_ix = match data[G_PX_TAG_OFF] {
+            0 => None,
+            1 => {
+                let expected_nonce = u64::from_le_bytes(
+                    data[G_PX_NONCE_OFF..G_PX_NONCE_OFF + 8]
+                        .try_into()
+                        .map_err(|_| ())?,
+                );
+                let mut px = [0u8; PENDING_IX_DATA_LEN];
+                px.copy_from_slice(&data[G_PX_DATA_OFF..G_PX_DATA_OFF + PENDING_IX_DATA_LEN]);
+                Some(PendingIx {
+                    expected_nonce,
+                    data: px,
+                })
+            }
             _ => return Err(()),
         };
 
@@ -254,6 +296,7 @@ impl GuardState {
                     .map_err(|_| ())?,
             ),
             pending,
+            pending_ix,
             degraded: data[G_DEGRADED_OFF] == 1,
             stale_streak: data[G_STALE_STREAK_OFF],
         })
@@ -310,6 +353,15 @@ impl GuardState {
         }
         out[G_DEGRADED_OFF] = if self.degraded { 1 } else { 0 };
         out[G_STALE_STREAK_OFF] = self.stale_streak;
+        match self.pending_ix {
+            None => out[G_PX_TAG_OFF] = 0,
+            Some(px) => {
+                out[G_PX_TAG_OFF] = 1;
+                out[G_PX_NONCE_OFF..G_PX_NONCE_OFF + 8]
+                    .copy_from_slice(&px.expected_nonce.to_le_bytes());
+                out[G_PX_DATA_OFF..G_PX_DATA_OFF + PENDING_IX_DATA_LEN].copy_from_slice(&px.data);
+            }
+        }
         Ok(())
     }
 }
@@ -367,6 +419,10 @@ mod tests {
             nonce: 42,
             last_check_slot: 9000,
             pending: Some(Action::TopUp { amount: 7 }),
+            pending_ix: Some(PendingIx {
+                expected_nonce: 43,
+                data: [7u8; PENDING_IX_DATA_LEN],
+            }),
             degraded: true,
             stale_streak: 3,
         };
@@ -386,6 +442,13 @@ mod tests {
         assert_eq!(back.nonce, 42);
         assert_eq!(back.last_check_slot, 9000);
         assert_eq!(back.pending, Some(Action::TopUp { amount: 7 }));
+        assert_eq!(
+            back.pending_ix,
+            Some(PendingIx {
+                expected_nonce: 43,
+                data: [7u8; PENDING_IX_DATA_LEN],
+            })
+        );
         assert!(back.degraded);
         assert_eq!(back.stale_streak, 3);
     }
@@ -417,6 +480,7 @@ mod tests {
             nonce: 0,
             last_check_slot: 0,
             pending: None,
+            pending_ix: None,
             degraded: false,
             stale_streak: 0,
         };
@@ -424,6 +488,7 @@ mod tests {
         let back = GuardState::from_bytes(&buf).unwrap();
         assert_eq!(back.policy.take_profit, None);
         assert_eq!(back.pending, None);
+        assert_eq!(back.pending_ix, None);
         assert!(!back.degraded);
         assert_eq!(back.stale_streak, 0);
     }
