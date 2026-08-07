@@ -9,6 +9,7 @@
 #![no_std]
 
 pub mod account;
+pub mod delegation;
 pub mod error;
 pub mod instruction;
 pub mod processor;

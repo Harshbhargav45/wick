@@ -13,6 +13,12 @@ pub enum WickInstruction {
     /// Pause / resume the whole program (route-config authority). Defined,
     /// wired in a later phase alongside global state.
     SetPaused = 3,
+    /// Delegate the guard PDA to the MagicBlock Ephemeral Rollup (§8.6).
+    Delegate = 4,
+    /// Commit guard state back to the base layer and undelegate (§8.6).
+    CommitAndUndelegate = 5,
+    /// Commit guard state to the base layer, keeping the guard delegated.
+    Commit = 6,
 }
 
 impl WickInstruction {
@@ -22,6 +28,9 @@ impl WickInstruction {
             1 => Some(Self::DepositMargin),
             2 => Some(Self::WithdrawMargin),
             3 => Some(Self::SetPaused),
+            4 => Some(Self::Delegate),
+            5 => Some(Self::CommitAndUndelegate),
+            6 => Some(Self::Commit),
             _ => None,
         }
     }

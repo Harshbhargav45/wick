@@ -20,6 +20,7 @@ use pinocchio::{AccountView, Address};
 use pinocchio_system::instructions::CreateAccount;
 
 use crate::account::{GuardState, GUARD_DATA_LEN};
+use crate::delegation;
 use crate::error::WickError;
 use crate::instruction::WickInstruction;
 use crate::state::{ActionCaps, AuthorityRequirement, RouteConfig, VenuePolicy};
@@ -304,6 +305,19 @@ pub fn process_instruction(
     let Some(discriminator_byte) = data.first().copied() else {
         return Err(WickError::InvalidInstruction.into());
     };
+
+    // The Delegation Program's undelegation callback uses a fixed 8-byte
+    // discriminator, distinct from the 1-byte `WickInstruction` space.
+    if data.len() >= 8
+        && data[..8] == ephemeral_rollups_pinocchio::consts::EXTERNAL_UNDELEGATE_DISCRIMINATOR
+    {
+        return crate::delegation::process_undelegation_callback(
+            program_id,
+            accounts,
+            &data[8..],
+        );
+    }
+
     let Some(ix) = WickInstruction::from_byte(discriminator_byte) else {
         return Err(WickError::InvalidInstruction.into());
     };
@@ -313,6 +327,11 @@ pub fn process_instruction(
         WickInstruction::DepositMargin => deposit_margin(program_id, accounts, data),
         WickInstruction::WithdrawMargin => withdraw_margin(program_id, accounts, data),
         WickInstruction::SetPaused => set_paused(program_id, accounts, data),
+        WickInstruction::Delegate => delegation::process_delegate(accounts, &data[1..]),
+        WickInstruction::CommitAndUndelegate => {
+            delegation::process_commit_and_undelegate(accounts)
+        }
+        WickInstruction::Commit => delegation::process_commit(accounts),
     }
 }
 
@@ -722,5 +741,65 @@ mod tests {
         let data = [3u8, 1];
         let result = process_instruction(&PROGRAM_ID, &mut accounts, &data);
         assert_eq!(result, Err(WickError::Unauthorized.into()));
+    }
+
+    #[test]
+    fn delegate_requires_full_account_set() {
+        // A `Delegate` (discriminator 4) needs 8 accounts + optional validator.
+        // With too few accounts the SDK's `delegate_account` returns
+        // `NotEnoughAccountKeys` before doing any CPI work.
+        let empty: [AccountView; 0] = [];
+        let data = [4u8, 0]; // bump = 0
+        let result = delegation::process_delegate(&empty, &data[1..]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn commit_and_undelegate_requires_signer() {
+        // `CommitAndUndelegate` (discriminator 5) requires a signed payer.
+        // A non-signer payer must be rejected before any magic-program CPI.
+        let payer_acc = TestAccount::new(
+            addr(1), Address::new_from_array([0u8; 32]), 0, &[], false, false,
+        );
+        let guard_acc = TestAccount::new(
+            PROGRAM_ID, PROGRAM_ID, 100, &[0u8; GUARD_DATA_LEN], false, true,
+        );
+        let magic = TestAccount::new(
+            addr(2), Address::new_from_array([0u8; 32]), 0, &[], false, false,
+        );
+        let ctx = TestAccount::new(
+            addr(3), Address::new_from_array([0u8; 32]), 0, &[], false, false,
+        );
+        let accounts = [payer_acc.view, guard_acc.view, magic.view, ctx.view];
+        let result = delegation::process_commit_and_undelegate(&accounts);
+        assert_eq!(result, Err(WickError::MissingOwnerAuthority.into()));
+    }
+
+    #[test]
+    fn commit_requires_signer() {
+        let payer_acc = TestAccount::new(
+            addr(1), Address::new_from_array([0u8; 32]), 0, &[], false, false,
+        );
+        let guard_acc = TestAccount::new(
+            PROGRAM_ID, PROGRAM_ID, 100, &[0u8; GUARD_DATA_LEN], false, true,
+        );
+        let magic = TestAccount::new(
+            addr(2), Address::new_from_array([0u8; 32]), 0, &[], false, false,
+        );
+        let ctx = TestAccount::new(
+            addr(3), Address::new_from_array([0u8; 32]), 0, &[], false, false,
+        );
+        let accounts = [payer_acc.view, guard_acc.view, magic.view, ctx.view];
+        let result = delegation::process_commit(&accounts);
+        assert_eq!(result, Err(WickError::MissingOwnerAuthority.into()));
+    }
+
+    #[test]
+    fn delegate_unknown_byte_still_unhandled() {
+        // Discriminator 7 is not assigned; must be rejected.
+        let empty: [AccountView; 0] = [];
+        let data = [7u8, 0];
+        let result = process_instruction(&PROGRAM_ID, &empty, &data);
+        assert_eq!(result, Err(WickError::InvalidInstruction.into()));
     }
 }
