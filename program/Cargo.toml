@@ -16,6 +16,21 @@ pinocchio-system = { version = "0.6", features = ["account-resize"] }
 [features]
 no-entrypoint = []
 
+[dev-dependencies]
+litesvm = "0.15.2"
+solana-address = "~2.6.1"
+solana-keypair = "3.1.2"
+solana-message = "4.2.4"
+solana-instruction = "3.4.0"
+solana-transaction = "4.1.5"
+solana-signer = "3.0.1"
+solana-native-token = "3.0.0"
+solana-system-interface = "3.2.0"
+solana-signature = "~3.4.1"
+solana-hash = "~4.5.0"
+solana-account = "4.3.0"
+solana-transaction-error = "~3.3.1"
+
 [lints.rust]
 unexpected_cfgs = { level = "allow", check-cfg = ['cfg(solana)'] }
 

@@ -2,9 +2,9 @@
 //!
 //! Account layout per instruction:
 //!
-//! * `InitGuard`    — [0] guard PDA (writable, created), [1] payer (signer,
-//!   writable), [2] rent sysvar. Payload carries the policy + co_authority;
-//!   the PDA itself is derived from `b"guard"` || venue_owner.
+//! * `InitGuard`    — [0] guard PDA (writable, created), [1] owner (signer),
+//!   [2] payer (signer, writable), [3] rent sysvar. Payload = [bump | policy
+//!   blob]; the PDA is derived from `b"guard"` || owner || bump.
 //! * `DepositMargin`— [0] guard (writable, program-owned), [1] owner (signer).
 //!   Payload is the deposit `amount` (u128 LE). Credited to `collateral`.
 //! * `WithdrawMargin`— [0] guard (writable, program-owned), [1] owner
@@ -124,21 +124,23 @@ fn init_guard(
     accounts: &mut [AccountView],
     data: &[u8],
 ) -> ProgramResult {
-    let (guard, payer, rent) = split_3(accounts)?;
-    if !payer.is_signer() {
+    let (guard, owner, payer, rent) = split_4(accounts)?;
+    if !owner.is_signer() || !payer.is_signer() {
         return Err(WickError::MissingOwnerAuthority.into());
     }
-    let payload = data.get(1..).ok_or(WickError::InvalidInstruction)?;
+
+    // Init payload: [0] bump (u8) then the policy blob.
+    let bump = *data.get(1).ok_or(WickError::InvalidInstruction)?;
+    let payload = data.get(2..).ok_or(WickError::InvalidInstruction)?;
     let (policy, co_authority) = parse_policy(payload)?;
 
-    // The guard PDA is derived from `b"guard"` || venue_owner. We recover
-    // venue_owner from the account address so an attacker can't forge the
-    // stored owner. (Phase 1: the PDA is created here and its address equals
-    // the account address; the seeds below let the runtime re-derive it.)
-    let venue_owner_bytes = guard.address().to_bytes();
-    let venue_owner: [u8; 32] = venue_owner_bytes;
-
-    let bump = [0u8];
+    // The guard PDA is derived from `b"guard" || owner_pubkey || bump`. The
+    // owner pubkey is supplied as a signed account, so an attacker cannot
+    // forge the stored owner. The runtime re-derives the address from these
+    // seeds during the CPI and refuses creation if it does not match
+    // `guard.address()`.
+    let venue_owner = owner.address().to_bytes();
+    let bump = [bump];
     let seeds = seeds!(GUARD_SEED, &venue_owner[..], &bump);
     let signer = Signer::from(&seeds);
 
@@ -278,6 +280,21 @@ fn split_3(
     let (first, rest) = accounts.split_at_mut(1);
     let (second, rest) = rest.split_at_mut(1);
     Ok((&mut first[0], &mut second[0], &mut rest[0]))
+}
+
+fn split_4(
+    accounts: &mut [AccountView],
+) -> Result<
+    (&mut AccountView, &mut AccountView, &mut AccountView, &mut AccountView),
+    WickError,
+> {
+    if accounts.len() < 4 {
+        return Err(WickError::InvalidInstruction);
+    }
+    let (first, rest) = accounts.split_at_mut(1);
+    let (second, rest) = rest.split_at_mut(1);
+    let (third, rest) = rest.split_at_mut(1);
+    Ok((&mut first[0], &mut second[0], &mut third[0], &mut rest[0]))
 }
 
 pub fn process_instruction(
