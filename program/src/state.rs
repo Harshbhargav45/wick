@@ -132,6 +132,53 @@ pub fn accept_tick(current_slot: u64, last_check_slot: u64) -> bool {
     current_slot.saturating_sub(last_check_slot) <= MAX_TICK_AGE_SLOTS
 }
 
+/// §8.1.3 Consecutive stale ticks before the guard flips to `degraded`.
+/// Policy-configurable later; start at 3 as the doc specifies.
+pub const MAX_STALE_STREAK: u8 = 3;
+
+/// §8.1.3 Stale-tick state machine.
+///
+/// A rejected tick cannot just mean "no-op this tick" — several stale ticks in
+/// a row mean the guard is silently protecting against dead data. On N
+/// consecutive stale ticks the guard flips to `degraded`, which the frontend
+/// must surface immediately (not just log). A fresh tick clears the streak and
+/// the degraded flag.
+///
+/// Returns `(new_streak, degraded)`.
+pub fn track_tick_freshness(stale_streak: u8, fresh: bool) -> (u8, bool) {
+    if fresh {
+        (0, false)
+    } else {
+        let streak = stale_streak.saturating_add(1);
+        (streak, streak >= MAX_STALE_STREAK)
+    }
+}
+
+/// §8.4 Two-regime authority dispatch result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DispatchRegime {
+    /// Execute the venue action now; the nonce is committed immediately.
+    Autonomous,
+    /// Build the owner-signed instruction and hold it as pending; the nonce
+    /// must NOT advance until the owner co-signs on L1 (§8.4). Advancing it at
+    /// build-time would treat a second genuine breach (arriving while the owner
+    /// reads) as a replay and silently drop it.
+    CoSigned,
+}
+
+/// §8.4 — decide the dispatch regime for a guard and the nonce that a *successful*
+/// autonomous execution would commit.
+///
+/// The nonce commit rule lives here so it is unit-testable: only the Autonomous
+/// branch may advance `nonce`; the CoSigned branch defers it to the confirm step.
+pub fn guard_act(policy: &VenuePolicy, nonce: u64) -> Result<(DispatchRegime, u64), WickError> {
+    let expected_nonce = nonce.checked_add(1).ok_or(WickError::MathOverflow)?;
+    match policy.authority {
+        AuthorityRequirement::Autonomous => Ok((DispatchRegime::Autonomous, expected_nonce)),
+        AuthorityRequirement::CoSigned => Ok((DispatchRegime::CoSigned, expected_nonce)),
+    }
+}
+
 /// §8.3 Bounded binary-search partial-close fraction in [0, BPS_DENOM].
 ///
 /// Returns the minimal `f_bps` such that closing that fraction restores the
@@ -352,6 +399,50 @@ mod tests {
         assert!(accept_tick(100, 80));       // 20 slots ok
         assert!(!accept_tick(100, 74));      // 26 too old
         assert!(accept_tick(100, 100));      // same slot ok
+    }
+
+    #[test]
+    fn stale_streak_degrades_after_three_and_recovers() {
+        // Fresh tick clears the streak and degraded flag.
+        assert_eq!(track_tick_freshness(0, true), (0, false));
+        assert_eq!(track_tick_freshness(2, true), (0, false));
+
+        // Stale ticks build the streak; the third flips degraded.
+        assert_eq!(track_tick_freshness(0, false), (1, false));
+        assert_eq!(track_tick_freshness(1, false), (2, false));
+        assert_eq!(track_tick_freshness(2, false), (3, true));
+
+        // Streak saturates — stays degraded.
+        assert_eq!(track_tick_freshness(3, false), (4, true));
+    }
+
+    #[test]
+    fn guard_act_commits_nonce_only_on_autonomous() {
+        let base = VenuePolicy {
+            maintenance_bps: 0,
+            trigger_buffer_bps: 0,
+            fee_bps: 0,
+            authority: AuthorityRequirement::Autonomous,
+            caps: ActionCaps {
+                top_up_usd_per_action: 0,
+                partial_close_usd_per_action: 0,
+                daily_total_usd: 0,
+            },
+            take_profit: None,
+        };
+        let auth_auto = base;
+        let auth_co = VenuePolicy { authority: AuthorityRequirement::CoSigned, ..base };
+
+        // Autonomous: execute now, nonce = old + 1.
+        let (regime, expected) = guard_act(&auth_auto, 7).unwrap();
+        assert_eq!(regime, DispatchRegime::Autonomous);
+        assert_eq!(expected, 8);
+
+        // CoSigned: defer, nonce = old + 1 but must NOT be committed by the
+        // build step (§8.4) — the confirm step commits it later.
+        let (regime, expected) = guard_act(&auth_co, 7).unwrap();
+        assert_eq!(regime, DispatchRegime::CoSigned);
+        assert_eq!(expected, 8);
     }
 
     #[test]

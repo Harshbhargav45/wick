@@ -19,6 +19,12 @@ pub enum WickInstruction {
     CommitAndUndelegate = 5,
     /// Commit guard state to the base layer, keeping the guard delegated.
     Commit = 6,
+    /// A price tick from the ER oracle — runs the §7.2 critical path:
+    /// staleness → health → nonce → caps → action selection → dispatch.
+    OnPriceTick = 7,
+    /// Record the watched position's snapshot (collateral, size, entry). Called
+    /// by the owner when the position is opened so the guard has real state.
+    UpdatePosition = 8,
 }
 
 impl WickInstruction {
@@ -31,6 +37,8 @@ impl WickInstruction {
             4 => Some(Self::Delegate),
             5 => Some(Self::CommitAndUndelegate),
             6 => Some(Self::Commit),
+            7 => Some(Self::OnPriceTick),
+            8 => Some(Self::UpdatePosition),
             _ => None,
         }
     }

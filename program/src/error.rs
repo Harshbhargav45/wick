@@ -30,6 +30,10 @@ pub enum WickError {
     Replay = 0xb,
     /// User of a signer mismatch - signer flag set but not a signer account.
     Unauthorized = 0xc,
+    /// The venue adapter has no way to execute the selected action yet.
+    UnsupportedVenueAction = 0xd,
+    /// The venue CPI call failed inside the adapter.
+    VenueCpi = 0xe,
 }
 
 impl From<WickError> for ProgramError {

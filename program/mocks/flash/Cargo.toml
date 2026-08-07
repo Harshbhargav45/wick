@@ -1,0 +1,17 @@
+[package]
+name = "mock-flash"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89.0"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+pinocchio = { version = "0.10", features = ["alloc", "cpi", "copy"] }
+
+[features]
+no-entrypoint = []
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(solana)'] }

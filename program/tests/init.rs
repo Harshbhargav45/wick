@@ -33,20 +33,21 @@ fn read_wick_program() -> Vec<u8> {
     })
 }
 
-/// Build the InitGuard payload: discriminator 0, bump, then the 145-byte
+/// Build the InitGuard payload: discriminator 0, bump, then the 146-byte
 /// policy blob (see `processor::parse_policy`).
 fn init_data(bump: u8) -> Vec<u8> {
     let mut data = vec![0u8, bump];
-    let mut blob = vec![0u8; 145];
-    blob[0..32].copy_from_slice(&[9u8; 32]); // co_authority
-    blob[32] = 1; // authority_req = CoSigned
-    blob[33..49].copy_from_slice(&500u128.to_le_bytes()); // maintenance_bps
-    blob[49..65].copy_from_slice(&500u128.to_le_bytes()); // trigger_buffer_bps
-    blob[65..81].copy_from_slice(&10u128.to_le_bytes()); // fee_bps
-    blob[81..97].copy_from_slice(&1_000_000u128.to_le_bytes()); // cap_top_up
-    blob[97..113].copy_from_slice(&1_000_000u128.to_le_bytes()); // cap_partial_close
-    blob[113..129].copy_from_slice(&5_000_000u128.to_le_bytes()); // cap_daily
-    blob[129..145].copy_from_slice(&u128::MAX.to_le_bytes()); // no take_profit
+    let mut blob = vec![0u8; 146];
+    blob[0] = 0; // venue = none (Phase 1 litesvm test exercises the non-venue path)
+    blob[1..33].copy_from_slice(&[9u8; 32]); // co_authority
+    blob[33] = 1; // authority_req = CoSigned
+    blob[34..50].copy_from_slice(&500u128.to_le_bytes()); // maintenance_bps
+    blob[50..66].copy_from_slice(&500u128.to_le_bytes()); // trigger_buffer_bps
+    blob[66..82].copy_from_slice(&10u128.to_le_bytes()); // fee_bps
+    blob[82..98].copy_from_slice(&1_000_000u128.to_le_bytes()); // cap_top_up
+    blob[98..114].copy_from_slice(&1_000_000u128.to_le_bytes()); // cap_partial_close
+    blob[114..130].copy_from_slice(&5_000_000u128.to_le_bytes()); // cap_daily
+    blob[130..146].copy_from_slice(&u128::MAX.to_le_bytes()); // no take_profit
     data.extend_from_slice(&blob);
     data
 }

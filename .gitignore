@@ -15,6 +15,9 @@ id.json
 keypair.json
 wallet.json
 *.env.local
+# Program/deploy keypairs (any naming) — never commit
+**/*-keypair.json
+*keypair*.json
 
 # Node
 node_modules/

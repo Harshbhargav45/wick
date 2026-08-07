@@ -15,6 +15,7 @@
 
 use pinocchio::error::ProgramResult;
 use pinocchio::instruction::{cpi::Signer, seeds};
+use pinocchio::sysvars::clock::Clock;
 use pinocchio::{AccountView, Address};
 
 use pinocchio_system::instructions::CreateAccount;
@@ -22,8 +23,12 @@ use pinocchio_system::instructions::CreateAccount;
 use crate::account::{GuardState, GUARD_DATA_LEN};
 use crate::delegation;
 use crate::error::WickError;
+use crate::flash::{ClosePositionAccounts, ClosePositionParams, VENUE_FLASH};
 use crate::instruction::WickInstruction;
-use crate::state::{ActionCaps, AuthorityRequirement, RouteConfig, VenuePolicy};
+use crate::state::{
+    accept_tick, guard_act, select_action, track_tick_freshness, Action, ActionCaps,
+    AuthorityRequirement, DispatchRegime, HealthSnapshot, RouteConfig, VenuePolicy,
+};
 
 const GUARD_SEED: &[u8] = b"guard";
 
@@ -43,23 +48,24 @@ fn parse_amount(data: &[u8]) -> Result<u128, WickError> {
 }
 
 /// InitGuard payload layout (after the discriminator byte):
-///   [0..32]   co_authority
-///   [32]      authority_req (0 = Autonomous, 1 = CoSigned)
-///   [33..49]  maintenance_bps (u128 LE)
-///   [49..65]  trigger_buffer_bps (u128 LE)
-///   [65..81]  fee_bps (u128 LE)
-///   [81..97]  cap_top_up (u128 LE)
-///   [97..113] cap_partial_close (u128 LE)
-///   [113..129] cap_daily (u128 LE)
-///   [129..145] take_profit (u128 LE; u128::MAX = none)
-const INIT_PAYLOAD_LEN: usize = 145;
+///   [0]       venue (u8 — which venue adapter owns the position; 0 = none)
+///   [1..33]   co_authority
+///   [33]      authority_req (0 = Autonomous, 1 = CoSigned)
+///   [34..50]  maintenance_bps (u128 LE)
+///   [50..66]  trigger_buffer_bps (u128 LE)
+///   [66..82]  fee_bps (u128 LE)
+///   [82..98]  cap_top_up (u128 LE)
+///   [98..114] cap_partial_close (u128 LE)
+///   [114..130] cap_daily (u128 LE)
+///   [130..146] take_profit (u128 LE; u128::MAX = none)
+const INIT_PAYLOAD_LEN: usize = 146;
 
-fn parse_policy(payload: &[u8]) -> Result<(VenuePolicy, [u8; 32]), WickError> {
+fn parse_policy(payload: &[u8]) -> Result<(VenuePolicy, [u8; 32], u8), WickError> {
     if payload.len() != INIT_PAYLOAD_LEN {
         return Err(WickError::InvalidInstruction);
     }
     let mut co_authority = [0u8; 32];
-    co_authority.copy_from_slice(&payload[0..32]);
+    co_authority.copy_from_slice(&payload[1..33]);
 
     let rd = |off: usize| -> Result<u128, WickError> {
         Ok(u128::from_le_bytes(
@@ -69,25 +75,25 @@ fn parse_policy(payload: &[u8]) -> Result<(VenuePolicy, [u8; 32]), WickError> {
         ))
     };
 
-    let authority_req = match payload[32] {
+    let authority_req = match payload[33] {
         0 => AuthorityRequirement::Autonomous,
         1 => AuthorityRequirement::CoSigned,
         _ => return Err(WickError::InvalidInstruction),
     };
-    let take_profit = rd(129)?;
+    let take_profit = rd(130)?;
     let policy = VenuePolicy {
-        maintenance_bps: rd(33)?,
-        trigger_buffer_bps: rd(49)?,
-        fee_bps: rd(65)?,
+        maintenance_bps: rd(34)?,
+        trigger_buffer_bps: rd(50)?,
+        fee_bps: rd(66)?,
         authority: authority_req,
         caps: ActionCaps {
-            top_up_usd_per_action: rd(81)?,
-            partial_close_usd_per_action: rd(97)?,
-            daily_total_usd: rd(113)?,
+            top_up_usd_per_action: rd(82)?,
+            partial_close_usd_per_action: rd(98)?,
+            daily_total_usd: rd(114)?,
         },
         take_profit: if take_profit == u128::MAX { None } else { Some(take_profit) },
     };
-    Ok((policy, co_authority))
+    Ok((policy, co_authority, payload[0]))
 }
 
 // -------------------------------------------------------------------------
@@ -133,7 +139,7 @@ fn init_guard(
     // Init payload: [0] bump (u8) then the policy blob.
     let bump = *data.get(1).ok_or(WickError::InvalidInstruction)?;
     let payload = data.get(2..).ok_or(WickError::InvalidInstruction)?;
-    let (policy, co_authority) = parse_policy(payload)?;
+    let (policy, co_authority, venue) = parse_policy(payload)?;
 
     // The guard PDA is derived from `b"guard" || owner_pubkey || bump`. The
     // owner pubkey is supplied as a signed account, so an attacker cannot
@@ -157,7 +163,7 @@ fn init_guard(
     }
 
     let state = GuardState {
-        venue: 0, // Phase 1: no venue adapter yet
+        venue,
         venue_owner,
         co_authority,
         authority_req: policy.authority,
@@ -169,6 +175,8 @@ fn init_guard(
         nonce: 0,
         last_check_slot: 0,
         pending: None,
+        degraded: false,
+        stale_streak: 0,
     };
     store_guard(guard, &state)?;
     Ok(())
@@ -262,6 +270,177 @@ fn set_paused(
     Ok(())
 }
 
+/// Record the watched position's snapshot. Only the guard owner (venue owner)
+/// may set it — this is the enrollment step after the position is opened.
+///
+/// Account layout: [0] guard (writable, program-owned), [1] owner (signer).
+/// Data (after discriminator): collateral (u128), size (i128), entry (u128).
+fn update_position(
+    program_id: &Address,
+    accounts: &[AccountView],
+    data: &[u8],
+) -> ProgramResult {
+    let (guard, owner) = split_2(accounts)?;
+    if !owner.is_signer() {
+        return Err(WickError::MissingOwnerAuthority.into());
+    }
+    let payload = data.get(1..).ok_or(WickError::InvalidInstruction)?;
+    if payload.len() != 48 {
+        return Err(WickError::InvalidInstruction.into());
+    }
+    let collateral = u128::from_le_bytes(payload[0..16].try_into().unwrap());
+    let size = i128::from_le_bytes(payload[16..32].try_into().unwrap());
+    let entry = u128::from_le_bytes(payload[32..48].try_into().unwrap());
+
+    let mut state = load_guard(guard, program_id)?;
+    if owner.address() != &Address::from(state.venue_owner) {
+        return Err(WickError::SignerKeyMismatch.into());
+    }
+    state.collateral = collateral;
+    state.size = size;
+    state.entry = entry;
+    store_guard(guard, &state)?;
+    Ok(())
+}
+
+// -------------------------------------------------------------------------
+// §7.2 critical path — price tick
+// -------------------------------------------------------------------------
+
+/// OnPriceTick data layout (after the discriminator byte):
+///   [0..16]  price (u128 LE, 6-decimal scale)
+///   [16..24] tick nonce (u64 LE — monotonic, supplied by the tick source)
+///   [24]     guard PDA bump (needed to sign the autonomous venue CPI)
+///
+/// Account layout:
+///   [0]    guard (writable, program-owned)
+///   [1]    clock sysvar (readonly)
+///   [2..]  venue adapter accounts (only consumed for an autonomous Flash close)
+fn on_price_tick(
+    program_id: &Address,
+    accounts: &[AccountView],
+    data: &[u8],
+) -> ProgramResult {
+    let (guard, clock) = split_2(accounts)?;
+    if !guard.owned_by(program_id) {
+        return Err(WickError::WrongAccountOwner.into());
+    }
+    let current_slot = Clock::from_account_view(clock)
+        .map_err(|_| WickError::InvalidInstruction)?
+        .slot;
+
+    let payload = data.get(1..).ok_or(WickError::InvalidInstruction)?;
+    if payload.len() < 25 {
+        return Err(WickError::InvalidInstruction.into());
+    }
+    let price = u128::from_le_bytes(payload[0..16].try_into().unwrap());
+    let tick_nonce = u64::from_le_bytes(payload[16..24].try_into().unwrap());
+    let bump = payload[24];
+
+    let mut state = load_guard(guard, program_id)?;
+
+    // §8.1.3 — reject stale ticks, tracking the degraded streak. A rejected
+    // tick is not "do nothing this tick": it updates the streak/flag so the
+    // guard can never silently protect against dead data.
+    let fresh = accept_tick(current_slot, state.last_check_slot);
+    let (streak, degraded) = track_tick_freshness(state.stale_streak, fresh);
+    state.stale_streak = streak;
+    state.degraded = degraded;
+    state.current_price = price;
+    state.last_check_slot = current_slot;
+
+    if !fresh {
+        store_guard(guard, &state)?;
+        return Ok(());
+    }
+
+    // §8.2 — health → nonce → caps → action selection (§7.2 ordering).
+    let health = HealthSnapshot {
+        collateral: state.collateral,
+        size: state.size,
+        entry: state.entry,
+        current_price: price,
+    };
+    let Some(action) = select_action(&health, &state.policy, tick_nonce, state.nonce)? else {
+        store_guard(guard, &state)?; // healthy — snapshot updated, nothing else
+        return Ok(());
+    };
+
+    // §8.4 — two-regime authority dispatch.
+    let (regime, _expected_nonce) = guard_act(&state.policy, state.nonce)?;
+    match regime {
+        DispatchRegime::Autonomous => {
+            match execute_autonomous(&state, action, accounts, bump) {
+                Ok(VenueOutcome::Executed) => {
+                    // Nonce commits only when the venue action actually lands.
+                    state.nonce = tick_nonce;
+                }
+                Ok(VenueOutcome::Escalate) | Err(WickError::UnsupportedVenueAction) => {
+                    state.pending = Some(Action::EscalateManualReview);
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        DispatchRegime::CoSigned => {
+            // Build the owner-signed instruction (the client reconstructs it
+            // deterministically from the stored action) and hold it as pending.
+            // The nonce must NOT advance until the owner co-signs on L1 (§8.4).
+            state.pending = Some(action);
+        }
+    }
+    store_guard(guard, &state)?;
+    Ok(())
+}
+
+/// Outcome of an autonomous venue execution.
+enum VenueOutcome {
+    /// The venue action landed on-chain; the nonce may commit.
+    Executed,
+    /// No venue action is possible; surface manual review.
+    Escalate,
+}
+
+/// Execute an action through the venue adapter in the autonomous tier. The
+/// guard PDA signs as the position owner — that is what ER delegation (§8.6)
+/// unlocks for sub-50ms execution.
+fn execute_autonomous(
+    state: &GuardState,
+    action: Action,
+    accounts: &[AccountView],
+    bump: u8,
+) -> Result<VenueOutcome, WickError> {
+    if state.venue != VENUE_FLASH {
+        return Err(WickError::UnsupportedVenueAction);
+    }
+    match action {
+        Action::PartialClose { .. } | Action::TakeProfit => {
+            // Flash's close_position closes the whole position, so both the
+            // guard's partial-close and take-profit resolve to a protective
+            // full close here. Conservative by design: exiting beats being
+            // liquidated.
+            let venue_accounts = accounts.get(2..).ok_or(WickError::InvalidInstruction)?;
+            let adapter = ClosePositionAccounts::from_account_views(venue_accounts)?;
+            let exit_price = u64::try_from(state.current_price)
+                .map_err(|_| WickError::MathOverflow)?;
+            let params = ClosePositionParams { price: exit_price };
+
+            let bump_bytes = [bump];
+            let seeds = seeds!(GUARD_SEED, &state.venue_owner[..], &bump_bytes);
+            adapter
+                .invoke(&params, &[Signer::from(&seeds)])
+                .map_err(|_| WickError::VenueCpi)?;
+            Ok(VenueOutcome::Executed)
+        }
+        Action::TopUp { .. } => {
+            // No Flash collateral-add CPI in the adapter yet. Escalate rather
+            // than error so the tick's state progress (slot/nonce/snapshot)
+            // still persists.
+            Err(WickError::UnsupportedVenueAction)
+        }
+        Action::EscalateManualReview => Ok(VenueOutcome::Escalate),
+    }
+}
+
 // -------------------------------------------------------------------------
 // Account splitting helpers
 // -------------------------------------------------------------------------
@@ -332,6 +511,8 @@ pub fn process_instruction(
             delegation::process_commit_and_undelegate(accounts)
         }
         WickInstruction::Commit => delegation::process_commit(accounts),
+        WickInstruction::OnPriceTick => on_price_tick(program_id, accounts, data),
+        WickInstruction::UpdatePosition => update_position(program_id, accounts, data),
     }
 }
 
@@ -404,17 +585,19 @@ mod tests {
     #[test]
     fn parse_policy_roundtrip() {
         let mut payload = [0u8; INIT_PAYLOAD_LEN];
-        payload[32] = 1; // CoSigned
-        payload[33..49].copy_from_slice(&500u128.to_le_bytes());
-        payload[49..65].copy_from_slice(&500u128.to_le_bytes());
-        payload[65..81].copy_from_slice(&10u128.to_le_bytes());
-        payload[81..97].copy_from_slice(&1_000u128.to_le_bytes());
-        payload[97..113].copy_from_slice(&2_000u128.to_le_bytes());
-        payload[113..129].copy_from_slice(&5_000u128.to_le_bytes());
-        payload[129..145].copy_from_slice(&60_000_000u128.to_le_bytes());
-        payload[0..32].copy_from_slice(&[9u8; 32]);
+        payload[0] = 1; // venue = Flash
+        payload[1..33].copy_from_slice(&[9u8; 32]); // co_authority
+        payload[33] = 1; // CoSigned
+        payload[34..50].copy_from_slice(&500u128.to_le_bytes());
+        payload[50..66].copy_from_slice(&500u128.to_le_bytes());
+        payload[66..82].copy_from_slice(&10u128.to_le_bytes());
+        payload[82..98].copy_from_slice(&1_000u128.to_le_bytes());
+        payload[98..114].copy_from_slice(&2_000u128.to_le_bytes());
+        payload[114..130].copy_from_slice(&5_000u128.to_le_bytes());
+        payload[130..146].copy_from_slice(&60_000_000u128.to_le_bytes());
 
-        let (policy, co) = parse_policy(&payload).unwrap();
+        let (policy, co, venue) = parse_policy(&payload).unwrap();
+        assert_eq!(venue, 1);
         assert_eq!(policy.authority, AuthorityRequirement::CoSigned);
         assert_eq!(policy.maintenance_bps, 500);
         assert_eq!(policy.caps.daily_total_usd, 5_000);
@@ -425,7 +608,7 @@ mod tests {
     #[test]
     fn parse_policy_rejects_bad_authority() {
         let mut payload = [0u8; INIT_PAYLOAD_LEN];
-        payload[32] = 7;
+        payload[33] = 7;
         assert_eq!(parse_policy(&payload).unwrap_err(), WickError::InvalidInstruction);
     }
 
@@ -436,10 +619,10 @@ mod tests {
 
     extern crate std;
 
-    use crate::account::{GuardState, GUARD_DATA_LEN};
-    use crate::state::{ActionCaps, AuthorityRequirement, RouteConfig, VenuePolicy};
-    use crate::account::ROUTE_CONFIG_LEN;
+    use crate::account::{GuardState, GUARD_DATA_LEN, ROUTE_CONFIG_LEN};
+    use crate::state::{Action, ActionCaps, AuthorityRequirement, RouteConfig, VenuePolicy};
     use pinocchio::account::{RuntimeAccount, NOT_BORROWED};
+    use pinocchio::sysvars::clock::CLOCK_ID;
     use std::mem;
     use std::vec;
     use std::vec::Vec;
@@ -517,10 +700,77 @@ mod tests {
             nonce: 0,
             last_check_slot: 0,
             pending: None,
+            degraded: false,
+            stale_streak: 0,
         };
         let mut buf = vec![0u8; GUARD_DATA_LEN];
         state.write_into(&mut buf).unwrap();
         buf
+    }
+
+    /// Build a guard with generous caps so `select_action` resolves to a
+    /// `TopUp` on a breach (keeps tick assertions deterministic).
+    fn make_guard(
+        authority: AuthorityRequirement,
+        venue: u8,
+        nonce: u64,
+        last_check_slot: u64,
+    ) -> Vec<u8> {
+        let state = GuardState {
+            venue,
+            venue_owner: [9u8; 32],
+            co_authority: [5u8; 32],
+            authority_req: authority,
+            policy: VenuePolicy {
+                maintenance_bps: 500,
+                trigger_buffer_bps: 500,
+                fee_bps: 10,
+                authority,
+                caps: ActionCaps {
+                    top_up_usd_per_action: u128::MAX,
+                    partial_close_usd_per_action: u128::MAX,
+                    daily_total_usd: u128::MAX,
+                },
+                take_profit: None,
+            },
+            collateral: 100_000_000,
+            size: 100_000_000,
+            entry: 50_000_000,
+            current_price: 50_000_000,
+            nonce,
+            last_check_slot,
+            pending: None,
+            degraded: false,
+            stale_streak: 0,
+        };
+        let mut buf = vec![0u8; GUARD_DATA_LEN];
+        state.write_into(&mut buf).unwrap();
+        buf
+    }
+
+    /// OnPriceTick payload: [7, price:16, nonce:8, bump:1].
+    fn tick_data(price: u128, nonce: u64, bump: u8) -> [u8; 26] {
+        let mut d = [0u8; 26];
+        d[0] = 7;
+        d[1..17].copy_from_slice(&price.to_le_bytes());
+        d[17..25].copy_from_slice(&nonce.to_le_bytes());
+        d[25] = bump;
+        d
+    }
+
+    /// A Clock sysvar account reporting `slot`. Address must be CLOCK_ID or
+    /// `Clock::from_account_view` rejects it.
+    fn clock_account(slot: u64) -> TestAccount {
+        let mut data = vec![0u8; 40];
+        data[0..8].copy_from_slice(&slot.to_le_bytes());
+        TestAccount::new(
+            CLOCK_ID,
+            Address::new_from_array([0u8; 32]),
+            0,
+            &data,
+            false,
+            false,
+        )
     }
 
     #[test]
@@ -796,10 +1046,172 @@ mod tests {
 
     #[test]
     fn delegate_unknown_byte_still_unhandled() {
-        // Discriminator 7 is not assigned; must be rejected.
+        // Discriminator 9 is not assigned; must be rejected.
         let empty: [AccountView; 0] = [];
-        let data = [7u8, 0];
+        let data = [9u8, 0];
         let result = process_instruction(&PROGRAM_ID, &empty, &data);
         assert_eq!(result, Err(WickError::InvalidInstruction.into()));
+    }
+
+    // ------------------------------------------------------------------
+    //  OnPriceTick — §7.2 critical path
+    // ------------------------------------------------------------------
+
+    /// Drive one tick against a guard. `guard_acc` is the writable guard
+    /// account; a fresh clock account is created per call.
+    fn run_tick(
+        guard_acc: &TestAccount,
+        clock: &TestAccount,
+        data: &[u8],
+    ) -> Result<(), pinocchio::error::ProgramError> {
+        let mut accounts = [guard_acc.view, clock.view];
+        process_instruction(&PROGRAM_ID, &mut accounts, data)
+    }
+
+    #[test]
+    fn tick_cosigned_breach_stores_pending_without_advancing_nonce() {
+        let guard_data = make_guard(AuthorityRequirement::CoSigned, 0, 0, 0);
+        let guard = TestAccount::new(PROGRAM_ID, PROGRAM_ID, 100, &guard_data, false, true);
+        let clock = clock_account(20); // fresh: 20 - 0 <= 25
+
+        // price 48m: pnl = 100m*(48m-50m)/1m = -200m, equity -100m, breach.
+        let result = run_tick(&guard, &clock, &tick_data(48_000_000, 1, 0));
+        assert!(result.is_ok());
+
+        let state = GuardState::from_bytes(guard.data()).unwrap();
+        // §8.4: CoSigned stores the action as pending...
+        assert!(state.pending.is_some());
+        // ...and must NOT advance the nonce — only the owner's L1 confirm does.
+        assert_eq!(state.nonce, 0);
+        assert_eq!(state.last_check_slot, 20);
+        assert_eq!(state.current_price, 48_000_000);
+        assert!(!state.degraded);
+    }
+
+    #[test]
+    fn tick_healthy_updates_snapshot_no_action() {
+        let guard_data = make_guard(AuthorityRequirement::CoSigned, 0, 0, 0);
+        let guard = TestAccount::new(PROGRAM_ID, PROGRAM_ID, 100, &guard_data, false, true);
+        let clock = clock_account(20);
+
+        // price 55m: equity 600m > req 5m — not liquidatable, TP unset.
+        let result = run_tick(&guard, &clock, &tick_data(55_000_000, 1, 0));
+        assert!(result.is_ok());
+
+        let state = GuardState::from_bytes(guard.data()).unwrap();
+        assert!(state.pending.is_none());
+        assert_eq!(state.current_price, 55_000_000);
+        assert_eq!(state.last_check_slot, 20);
+        assert_eq!(state.nonce, 0);
+    }
+
+    #[test]
+    fn tick_replayed_nonce_is_noop() {
+        let guard_data = make_guard(AuthorityRequirement::CoSigned, 0, 5, 0);
+        let guard = TestAccount::new(PROGRAM_ID, PROGRAM_ID, 100, &guard_data, false, true);
+        let clock = clock_account(20);
+
+        // Breach price but nonce 5 == last nonce → hard reject (§8.2).
+        let result = run_tick(&guard, &clock, &tick_data(48_000_000, 5, 0));
+        assert!(result.is_ok());
+
+        let state = GuardState::from_bytes(guard.data()).unwrap();
+        assert!(state.pending.is_none());
+        assert_eq!(state.nonce, 5);
+        // Snapshot still refreshes so the guard never protects against
+        // stale prices.
+        assert_eq!(state.current_price, 48_000_000);
+    }
+
+    #[test]
+    fn tick_stale_ticks_flip_degraded_after_three_then_recover() {
+        let guard_data = make_guard(AuthorityRequirement::CoSigned, 0, 0, 0);
+        let guard = TestAccount::new(PROGRAM_ID, PROGRAM_ID, 100, &guard_data, false, true);
+
+        // Three stale ticks — each arrives >25 slots after the previous check
+        // (a glitching stream). First two do nothing, the third flips degraded.
+        for slot in [100u64, 130, 160] {
+            let clock = clock_account(slot);
+            let result = run_tick(&guard, &clock, &tick_data(48_000_000, 1, 0));
+            assert!(result.is_ok());
+        }
+        let state = GuardState::from_bytes(guard.data()).unwrap();
+        assert_eq!(state.stale_streak, 3);
+        assert!(state.degraded);
+        // Stale ticks must never dispatch an action.
+        assert!(state.pending.is_none());
+
+        // A tick arriving within 25 slots of the last check is fresh and
+        // clears the streak and the degraded flag (§8.1.3).
+        let clock = clock_account(165); // 165 - 160 = 5 → fresh
+        let result = run_tick(&guard, &clock, &tick_data(48_000_000, 1, 0));
+        assert!(result.is_ok());
+        let state = GuardState::from_bytes(guard.data()).unwrap();
+        assert_eq!(state.stale_streak, 0);
+        assert!(!state.degraded);
+    }
+
+    #[test]
+    fn tick_autonomous_unsupported_venue_escalates() {
+        // Autonomous regime but venue 0 (no adapter) — the venue executor
+        // rejects, and the guard escalates to manual review rather than
+        // silently no-opping (§8.2 #4).
+        let guard_data = make_guard(AuthorityRequirement::Autonomous, 0, 0, 0);
+        let guard = TestAccount::new(PROGRAM_ID, PROGRAM_ID, 100, &guard_data, false, true);
+        let clock = clock_account(20);
+
+        let result = run_tick(&guard, &clock, &tick_data(48_000_000, 1, 0));
+        assert!(result.is_ok());
+
+        let state = GuardState::from_bytes(guard.data()).unwrap();
+        assert_eq!(state.pending, Some(Action::EscalateManualReview));
+        // Nonce NOT committed — the venue action never landed.
+        assert_eq!(state.nonce, 0);
+    }
+
+    #[test]
+    fn tick_wrong_clock_address_rejected() {
+        let guard_data = make_guard(AuthorityRequirement::CoSigned, 0, 0, 0);
+        let guard = TestAccount::new(PROGRAM_ID, PROGRAM_ID, 100, &guard_data, false, true);
+        // Clock account at a non-sysvar address — must be rejected before any
+        // state change.
+        let bad_clock = TestAccount::new(
+            addr(99), Address::new_from_array([0u8; 32]), 0, &[0u8; 40], false, false,
+        );
+        let mut accounts = [guard.view, bad_clock.view];
+        let result = process_instruction(&PROGRAM_ID, &mut accounts, &tick_data(48_000_000, 1, 0));
+        assert_eq!(result, Err(WickError::InvalidInstruction.into()));
+    }
+
+    #[test]
+    fn update_position_records_snapshot_owner_only() {
+        let owner = addr(9);
+        let guard_data = make_guard(AuthorityRequirement::CoSigned, 0, 0, 0);
+        let guard = TestAccount::new(PROGRAM_ID, PROGRAM_ID, 100, &guard_data, false, true);
+
+        let mut data = vec![8u8];
+        data.extend_from_slice(&300_000_000u128.to_le_bytes());
+        data.extend_from_slice(&(-150_000_000i128).to_le_bytes());
+        data.extend_from_slice(&55_000_000u128.to_le_bytes());
+
+        let owner_acc = TestAccount::new(
+            owner, Address::new_from_array([0u8; 32]), 0, &[], true, false,
+        );
+        let mut accounts = [guard.view, owner_acc.view];
+        let result = process_instruction(&PROGRAM_ID, &mut accounts, &data);
+        assert!(result.is_ok());
+
+        let state = GuardState::from_bytes(guard.data()).unwrap();
+        assert_eq!(state.collateral, 300_000_000);
+        assert_eq!(state.size, -150_000_000);
+        assert_eq!(state.entry, 55_000_000);
+
+        // Non-owner signer rejected, snapshot untouched.
+        let stranger = TestAccount::new(
+            addr(42), Address::new_from_array([0u8; 32]), 0, &[], true, false,
+        );
+        let mut accounts = [guard.view, stranger.view];
+        let result = process_instruction(&PROGRAM_ID, &mut accounts, &data);
+        assert_eq!(result, Err(WickError::SignerKeyMismatch.into()));
     }
 }

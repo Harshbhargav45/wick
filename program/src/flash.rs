@@ -26,10 +26,13 @@
 //!   11. `token_program`
 
 use pinocchio::cpi::invoke_signed_with_bounds;
-use pinocchio::instruction::{InstructionAccount, InstructionView};
+use pinocchio::instruction::{cpi::Signer, InstructionAccount, InstructionView};
 use pinocchio::{AccountView, Address, ProgramResult};
 
 use crate::error::WickError;
+
+/// `state.venue` tag for the Flash adapter.
+pub const VENUE_FLASH: u8 = 1;
 
 /// Flash Perpetuals program ID (mainnet-beta).
 pub const FLASH_PROGRAM_ID: Address =
@@ -78,6 +81,32 @@ pub struct ClosePositionAccounts<'a> {
 }
 
 impl<'a> ClosePositionAccounts<'a> {
+    /// Reconstruct the adapter from the tail of the `OnPriceTick` account list.
+    /// Expects exactly the 12 `close_position` accounts in the order the Anchor
+    /// context declares them, with `owner` first (the guard PDA itself in the
+    /// autonomous tier).
+    pub fn from_account_views(
+        views: &'a [AccountView],
+    ) -> Result<Self, WickError> {
+        if views.len() < CLOSE_POSITION_ACCOUNT_COUNT {
+            return Err(WickError::InvalidInstruction);
+        }
+        Ok(Self {
+            owner: &views[0],
+            receiving_account: &views[1],
+            transfer_authority: &views[2],
+            perpetuals: &views[3],
+            pool: &views[4],
+            position: &views[5],
+            custody: &views[6],
+            custody_oracle_token: &views[7],
+            collateral_custody: &views[8],
+            collateral_custody_oracle: &views[9],
+            collateral_custody_token_account: &views[10],
+            token_program: &views[11],
+        })
+    }
+
     /// Build the account meta slice for the CPI.
     fn metas(&self) -> [InstructionAccount<'a>; CLOSE_POSITION_ACCOUNT_COUNT] {
         let writable = |a: &'a AccountView| InstructionAccount::writable(a.address());
@@ -100,11 +129,18 @@ impl<'a> ClosePositionAccounts<'a> {
 
     /// CPI into Flash `close_position`.
     ///
-    /// The `owner` account signs this instruction: Flash requires the position
-    /// owner's signature on every state change (no delegated authority exists),
-    /// so this adapter is used in the *co-signed* protection tier. It never
-    /// claims autonomous execution on Flash.
-    pub fn invoke(&self, params: &ClosePositionParams) -> ProgramResult {
+    /// `owner` must appear as the position owner signer. Two tiers use this:
+    ///
+    /// * **Co-signed** (`signer_seeds == []`): the venue requires the position
+    ///   owner's signature on every state change, supplied by the owner in the
+    ///   outer transaction. Wick never claims autonomous execution on this path.
+    /// * **Autonomous** (`signer_seeds == [guard_seeds]`): Wick itself opened
+    ///   the position, so the guard PDA *is* the owner. Once the guard PDA is
+    ///   delegated to the Ephemeral Rollup (§8.6), the guard signs as owner via
+    ///   its own PDA seeds — this is the sub-50ms tier. Flash's account
+    ///   checks are identical either way; only who supplies the owner signature
+    ///   changes.
+    pub fn invoke(&self, params: &ClosePositionParams, signer_seeds: &[Signer]) -> ProgramResult {
         let data = params.try_to_data()?;
         let metas = self.metas();
         let instruction = InstructionView {
@@ -126,9 +162,11 @@ impl<'a> ClosePositionAccounts<'a> {
             self.collateral_custody_token_account,
             self.token_program,
         ];
-        // No guard PDA signs here — the venue requires the owner's signature,
-        // which must already be present in the transaction.
-        invoke_signed_with_bounds::<CLOSE_POSITION_ACCOUNT_COUNT>(&instruction, &account_views, &[])
+        invoke_signed_with_bounds::<CLOSE_POSITION_ACCOUNT_COUNT>(
+            &instruction,
+            &account_views,
+            signer_seeds,
+        )
     }
 }
 
