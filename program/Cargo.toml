@@ -9,14 +9,12 @@ rust-version = "1.89.0"
 crate-type = ["cdylib", "lib"]
 
 [dependencies]
-pinocchio = { version = "0.11.2", features = ["alloc", "cpi"] }
+pinocchio = { version = "0.11.2", features = ["alloc", "cpi", "account-resize"] }
 pinocchio-log = "0.5.1"
+pinocchio-system = { version = "0.6", features = ["account-resize"] }
 
 [features]
 no-entrypoint = []
-
-[dev-dependencies]
-pinocchio-system = "0.6"
 
 [lints.rust]
 unexpected_cfgs = { level = "allow", check-cfg = ['cfg(solana)'] }
