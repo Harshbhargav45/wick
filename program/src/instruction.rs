@@ -25,6 +25,10 @@ pub enum WickInstruction {
     /// Record the watched position's snapshot (collateral, size, entry). Called
     /// by the owner when the position is opened so the guard has real state.
     UpdatePosition = 8,
+    /// Owner confirms the pending owner-signed venue instruction, committing the
+    /// expected nonce (§8.4 CoSigned / §8.7 Jupiter). Lands the Jupiter
+    /// safety-net on L1 with the owner's signature (§3 Phase-3).
+    ConfirmYes = 9,
 }
 
 impl WickInstruction {
@@ -39,6 +43,7 @@ impl WickInstruction {
             6 => Some(Self::Commit),
             7 => Some(Self::OnPriceTick),
             8 => Some(Self::UpdatePosition),
+            9 => Some(Self::ConfirmYes),
             _ => None,
         }
     }

@@ -290,6 +290,38 @@ fn update_position(program_id: &Address, accounts: &[AccountView], data: &[u8]) 
     Ok(())
 }
 
+/// Owner confirms the pending owner-signed venue instruction, committing the
+/// expected nonce this tick must use (§8.4 CoSigned / §8.7 Jupiter).
+///
+/// The guard builds the owner-signed safety-net instruction on `OnPriceTick`
+/// but holds it pending and does **not** advance the nonce. The owner lands
+/// that instruction on L1 with their own signature; `Confirm` records that it
+/// happened: it commits `expected_nonce` as the new base and clears the pending
+/// instruction so a later genuine breach is not mistaken for a replay.
+///
+/// Account layout: [0] guard (writable, program-owned), [1] owner (signer).
+/// Data (after discriminator): none — the pending instruction is on the guard.
+fn confirm_pending(program_id: &Address, accounts: &[AccountView], _data: &[u8]) -> ProgramResult {
+    let (guard, owner) = split_2(accounts)?;
+    if !guard.owned_by(program_id) {
+        return Err(WickError::WrongAccountOwner.into());
+    }
+    if !owner.is_signer() {
+        return Err(WickError::MissingOwnerAuthority.into());
+    }
+    let mut state = load_guard(guard, program_id)?;
+    if owner.address() != &Address::from(state.venue_owner) {
+        return Err(WickError::SignerKeyMismatch.into());
+    }
+    let px = state.pending_ix.ok_or(WickError::NoPendingConfirm)?;
+    // §8.4 — the nonce commits only when the owner confirms on L1.
+    state.nonce = px.expected_nonce;
+    state.pending_ix = None;
+    state.pending = None;
+    store_guard(guard, &state)?;
+    Ok(())
+}
+
 // -------------------------------------------------------------------------
 // §7.2 critical path — price tick
 // -------------------------------------------------------------------------
@@ -513,6 +545,7 @@ pub fn process_instruction(
         WickInstruction::Commit => delegation::process_commit(accounts),
         WickInstruction::OnPriceTick => on_price_tick(program_id, accounts, data),
         WickInstruction::UpdatePosition => update_position(program_id, accounts, data),
+        WickInstruction::ConfirmYes => confirm_pending(program_id, accounts, data),
     }
 }
 
@@ -622,7 +655,7 @@ mod tests {
 
     extern crate std;
 
-    use crate::account::{GuardState, GUARD_DATA_LEN, ROUTE_CONFIG_LEN};
+    use crate::account::{GuardState, GUARD_DATA_LEN, PENDING_IX_DATA_LEN, ROUTE_CONFIG_LEN};
     use crate::state::{Action, ActionCaps, AuthorityRequirement, RouteConfig, VenuePolicy};
     use pinocchio::account::{RuntimeAccount, NOT_BORROWED};
     use pinocchio::sysvars::clock::CLOCK_ID;
@@ -1212,6 +1245,116 @@ mod tests {
         // clock_account leaves unix_timestamp at 0.
         let expected = build_tp_safety_net(55_000_000, 0).unwrap();
         assert_eq!(px.data, expected);
+    }
+
+    #[test]
+    fn confirm_commits_nonce_and_clears_pending_ix() {
+        // Guard with a pending owner-signed Jupiter instruction (expected 43).
+        let mut guard_data = make_guard(AuthorityRequirement::CoSigned, VENUE_JUPITER, 42, 0);
+        {
+            let mut state = GuardState::from_bytes(&guard_data).unwrap();
+            state.pending_ix = Some(PendingIx {
+                expected_nonce: 43,
+                data: [7u8; PENDING_IX_DATA_LEN],
+            });
+            state.write_into(&mut guard_data).unwrap();
+        }
+        let guard = TestAccount::new(PROGRAM_ID, PROGRAM_ID, 100, &guard_data, false, true);
+        // Owner signer must match the guard's venue_owner, which make_guard
+        // sets to [9u8; 32] — rebuild the owner account with that key.
+        let owner = TestAccount::new(
+            Address::new_from_array([9u8; 32]),
+            Address::new_from_array([0u8; 32]),
+            0,
+            &[],
+            true,
+            false,
+        );
+
+        // ConfirmYes discriminator = 9; no payload bytes needed.
+        let data = [9u8];
+        let accounts = [guard.view, owner.view];
+        let result = process_instruction(&PROGRAM_ID, &accounts, &data);
+        assert!(result.is_ok());
+
+        let state = GuardState::from_bytes(guard.data()).unwrap();
+        // §8.4 — the nonce commits only on the owner's L1 confirm.
+        assert_eq!(state.nonce, 43);
+        assert_eq!(state.pending_ix, None);
+        assert_eq!(state.pending, None);
+    }
+
+    #[test]
+    fn confirm_rejects_non_owner() {
+        let mut guard_data = make_guard(AuthorityRequirement::CoSigned, VENUE_JUPITER, 42, 0);
+        {
+            let mut state = GuardState::from_bytes(&guard_data).unwrap();
+            state.pending_ix = Some(PendingIx {
+                expected_nonce: 43,
+                data: [7u8; PENDING_IX_DATA_LEN],
+            });
+            state.write_into(&mut guard_data).unwrap();
+        }
+        let guard = TestAccount::new(PROGRAM_ID, PROGRAM_ID, 100, &guard_data, false, true);
+        // Stranger signs — key != venue_owner ([9u8;32]).
+        let stranger = TestAccount::new(
+            Address::new_from_array([99u8; 32]),
+            Address::new_from_array([0u8; 32]),
+            0,
+            &[],
+            true,
+            false,
+        );
+
+        let accounts = [guard.view, stranger.view];
+        let result = process_instruction(&PROGRAM_ID, &accounts, &[9u8]);
+        assert_eq!(result, Err(WickError::SignerKeyMismatch.into()));
+        // Nonce untouched.
+        let state = GuardState::from_bytes(&guard_data).unwrap();
+        assert_eq!(state.nonce, 42);
+        assert!(state.pending_ix.is_some());
+    }
+
+    #[test]
+    fn confirm_rejects_missing_signer_flag() {
+        let mut guard_data = make_guard(AuthorityRequirement::CoSigned, VENUE_JUPITER, 42, 0);
+        {
+            let mut state = GuardState::from_bytes(&guard_data).unwrap();
+            state.pending_ix = Some(PendingIx {
+                expected_nonce: 43,
+                data: [7u8; PENDING_IX_DATA_LEN],
+            });
+            state.write_into(&mut guard_data).unwrap();
+        }
+        let guard = TestAccount::new(PROGRAM_ID, PROGRAM_ID, 100, &guard_data, false, true);
+        let owner_acc = TestAccount::new(
+            Address::new_from_array([9u8; 32]),
+            Address::new_from_array([0u8; 32]),
+            0,
+            &[],
+            false, // correct key but is_signer = false
+            false,
+        );
+        let accounts = [guard.view, owner_acc.view];
+        let result = process_instruction(&PROGRAM_ID, &accounts, &[9u8]);
+        assert_eq!(result, Err(WickError::MissingOwnerAuthority.into()));
+    }
+
+    #[test]
+    fn confirm_rejects_when_nothing_pending() {
+        let guard_data = make_guard(AuthorityRequirement::CoSigned, VENUE_JUPITER, 42, 0);
+        let guard = TestAccount::new(PROGRAM_ID, PROGRAM_ID, 100, &guard_data, false, true);
+        let owner = TestAccount::new(
+            Address::new_from_array([9u8; 32]),
+            Address::new_from_array([0u8; 32]),
+            0,
+            &[],
+            true,
+            false,
+        );
+        let accounts = [guard.view, owner.view];
+        let result = process_instruction(&PROGRAM_ID, &accounts, &[9u8]);
+        assert_eq!(result, Err(WickError::NoPendingConfirm.into()));
     }
 
     #[test]

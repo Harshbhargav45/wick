@@ -34,6 +34,8 @@ pub enum WickError {
     UnsupportedVenueAction = 0xd,
     /// The venue CPI call failed inside the adapter.
     VenueCpi = 0xe,
+    /// No owner-signed instruction is pending that the owner can confirm.
+    NoPendingConfirm = 0xf,
 }
 
 impl From<WickError> for ProgramError {
