@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Wick — Competitive Landscape</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d; --text: #e6edf3;
+    --muted: #8b949e; --accent: #f0883e; --good: #3fb950; --warn: #d29922; --bad: #f85149;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font-family: -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; line-height: 1.55; }
+  .wrap { max-width: 1000px; margin: 0 auto; padding: 40px 24px; }
+  h1 { font-size: 28px; margin-bottom: 4px; }
+  .sub { color: var(--muted); font-size: 14px; }
+  .verdict { display: inline-flex; align-items: center; gap: 8px; margin: 18px 0 4px; padding: 8px 16px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); font-weight: 600; }
+  .pill { --c: var(--good); background: color-mix(in srgb, var(--c) 18%, transparent); color: var(--c); border: 1px solid color-mix(in srgb, var(--c) 40%, transparent); border-radius: 20px; padding: 2px 12px; font-size: 13px; }
+  h2 { font-size: 19px; margin: 34px 0 12px; padding-bottom: 6px; border-bottom: 1px solid var(--border); }
+  h3 { font-size: 15px; margin: 22px 0 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  th { text-align: left; background: #1c2128; color: var(--muted); font-weight: 600; padding: 9px 12px; }
+  td { padding: 9px 12px; border-top: 1px solid var(--border); vertical-align: top; }
+  .t-h { background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--accent); }
+  .lead { color: var(--muted); font-size: 14px; margin: 10px 0 4px; }
+  .note { color: var(--muted); font-size: 12.5px; margin-top: 14px; }
+  ul { margin: 4px 0; }
+  li { margin: 3px 0; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 700px) { .grid2 { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Wick — Competitive Landscape</h1>
+  <div class="sub">Onchain liquidation-protection layer for existing Solana perps (FlashTrade, Jupiter Perps) &middot; compiled 2026-08-07</div>
+
+  <div class="verdict">Crowdedness (direct niche): <span class="pill" style="--n:var(--warn)">moderate</span></div>
+  <p class="lead">Threats are real but none occupy the exact wedge. The direct wedge — <b>trustless, sub-50ms, onchain auto-execution that beats the liquidator — is unclaimed</b>. Adjacent categories (alerts, liquidation bots, CEX bots, venue-native TP/SL) are crowded; the <em>winning side</em> of the race is what no one sells.</p>
+
+  <h2>Competitor matrix (scope × trust drive the axes)</h2>
+  <table>
+    <thead><tr><th>Player</th><th>Status</th><th>Type</th><th>What they do</th><th>Weakness / where they're vulnerable</th><th>Threat</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><b>Jupiter Perps native TP/SL</b><br>jup.ag/perps</td><td>Live</td><td>Substitute</td>
+        <td>Venue-native stop-loss / take-profit / trailing / OCO / insta-trigger via keeper network</td>
+        <td>Static or fixed triggers; no health-factor auto-collateral; not sub-50ms; can't separate safety from capitulation; owner must sign every change</td><td>High</td>
+      </tr>
+      <tr>
+        <td><b>FlashTrade</b><br>MagicBlock ER perp DEX</td><td>Live</td><td>Venue (partner)</td>
+        <td>ER sub-50ms perp execution; our autonomous regime target</td>
+        <td>Potential to absorb same protection features; still single-venue</td><td>Medium</td>
+      </tr>
+      <tr>
+        <td><b>Coinrule (420k+ users)</b><br>coinrule.com</td><td>Live</td><td>Substitute (CEX)</td>
+        <td>Stop-loss / trailing / auto-exit automation on Binance, Bybit etc.</td>
+        <td>CEX, not self-custody perps; fails exactly during congestion; no onchain verifiability</td><td>Medium</td>
+      </tr>
+      <tr>
+        <td><b>3Commas / Bitsgap / Mizar</b></td><td>Live</td><td>Substitute (CEX)</td>
+        <td>Hosted trading-bot stop-loss automation</td><td>Same custodial, congestion-fragile ceiling</td><td>Low</td>
+      </tr>
+      <tr>
+        <td><b>Alertio / Solyzer / Defi Saver</b></td><td>Live</td><td>Substitute (alert)</td>
+        <td>Health-factor monitors + alerts; Defi Saver auto-repay for lending</td>
+        <td>Warn, don't execute; lending-only for auto-repay; lend HF ≠ perp margin</td><td>Medium</td>
+      </tr>
+      <tr>
+        <td><b>Liquidation bots</b><br>(Marginfi/Kamino/Solend refs)</td><td>Live</td><td>Co-opetition</td>
+        <td>Detect HF&lt;1, liquidate (the very event we prevent)</td>
+        <td>Complementary; the real speed rival is co-located RPC infra (~65ms detect-to-submit)</td><td>Low (on wrong side)</td>
+      </tr>
+      <tr>
+        <td><b>Trigger-order keepers</b><br>(Jupiter keeper, open-keeper SDK)</td><td>Live</td><td>Co-opetition</td>
+        <td>Off-chain keepers poll + submit on breach</td>
+        <td>Polling/enqueue latency &gt; in-session ER action; no co-sign safety</td><td>Low–Medium</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>2. Substitutes (same problem, different approach)</h2>
+  <table>
+    <thead><tr><th>Name</th><th>Approach</th><th>Why users stay</th></tr></thead>
+    <tbody>
+      <tr><td>Jupiter Perps native TP/SL + trailing</td><td>Venue-owned trigger orders + keepers</td><td>Zero integration, trusted, already shipped (V2, OCO/OTOCO)</td></tr>
+      <tr><td>CEX bots (Coinrule, 3Commas, etc.)</td><td>Hosted auto-exit on Binance/Bybit</td><td>Familiar, paid, works until congestion</td></tr>
+      <tr><td>Health-factor alert tools</td><td>Read-only monitor + notify</td><td>Simple, no execution trust required</td></tr>
+      <tr><td>Manual collateral management</td><td>Trader clicks "add collateral"</td><td>Zero third-party trust</td></tr>
+    </tbody>
+  </table>
+
+  <div class="grid2">
+    <div class="card">
+      <h3 style="margin-top:0">3. Dead / failed (landmines)</h3>
+      <ul>
+        <li><b>"Auto-add-collateral" scripts/guides</b> — never shipped trustless; ones that existed ran a single trusted bot key = replicated custody. <em>Lesson:</em> users demand a presented, honest authority model.</li>
+        <li><b>"Position manager" tools</b> — most shipped alerts, none shipped the trigger. <em>Lesson:</em> the gap is execution, not notification.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">4. Moat</h3>
+      <ul>
+        <li><b>Type:</b> technical complexity + venue-adapter lock-in (deliberately thin); network effects seeded later.</li>
+        <li><b>Differentiation:</b> only anti-liquidation layer that is trustless, sub-50ms, co-signed margin wallet, honest latency labels.</li>
+        <li><b>Biggest threat:</b> venue absorbing advanced-order features (LimitBook absorption pattern).</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>5. Verdict</h2>
+  <p class="lead">The direct, valuable wedge — <b>executing</b> protection before the liquidator, with verifiable custody — is <b>moderate</b>: real adjacent traction, but no winner in the exact lane. Opportunity: lead with the two honest speed tiers and the latency/verifiability proof, since no alert-only or keeper-based substitute can match an in-session sub-50ms action.</p>
+  <p class="note">Sources: DefiLlama protocol data, Jupiter/FlashTrade docs, jup-perps-client IDL, Coinrule official stats, subglow/rpcfast liquidation infra, ballooning perp-DEX editorial boards (2026). All facts re-verified at build time per architecture doc Section 9.</p>
+</div>
+</body>
+</html>

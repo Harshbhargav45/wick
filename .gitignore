@@ -1,0 +1,22 @@
+# Rust
+/target
+**/target
+
+# Rust build artifacts
+Cargo.lock.*
+**/*.rs.bk
+
+# Environment / secrets — never commit
+.env
+.env.*
+*.pem
+*.key
+id.json
+keypair.json
+wallet.json
+*.env.local
+
+# Node
+node_modules/
+dist/
+.next/
