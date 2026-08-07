@@ -81,8 +81,13 @@ fn autonomous_tick_cpis_close_position_signed_by_guard_pda() {
     let system = Address::from_str_const(SYSTEM_PROGRAM);
 
     let mut svm = LiteSVM::new().with_sigverify(false);
-    svm.add_program(program_id, &read_so("target/deploy/wick_guard.so")).unwrap();
-    svm.add_program(flash_id, &read_so("mocks/flash/target/deploy/mock_flash.so")).unwrap();
+    svm.add_program(program_id, &read_so("target/deploy/wick_guard.so"))
+        .unwrap();
+    svm.add_program(
+        flash_id,
+        &read_so("mocks/flash/target/deploy/mock_flash.so"),
+    )
+    .unwrap();
 
     let owner_kp = Keypair::new();
     let owner = owner_kp.pubkey();
@@ -129,7 +134,13 @@ fn autonomous_tick_cpis_close_position_signed_by_guard_pda() {
     // `position` (index 5). They must exist and be owned by the flash program
     // for the write to be legal. ---
     let flash_pubkey = Pubkey::from(flash_id.to_bytes());
-    let dummy_meta = Account { lamports: 1_000_000, data: vec![], owner: flash_pubkey, executable: false, rent_epoch: 0 };
+    let dummy_meta = Account {
+        lamports: 1_000_000,
+        data: vec![],
+        owner: flash_pubkey,
+        executable: false,
+        rent_epoch: 0,
+    };
     let position_acc = Account {
         lamports: 1_000_000,
         data: vec![0u8; 8],
@@ -151,9 +162,18 @@ fn autonomous_tick_cpis_close_position_signed_by_guard_pda() {
     let token_program = Address::from([20u8; 32]);
 
     svm.set_account(position, position_acc).unwrap();
-    for a in [receiving, transfer_authority, perpetuals, pool, custody,
-              custody_oracle, collateral_custody, collateral_oracle,
-              collateral_token, token_program] {
+    for a in [
+        receiving,
+        transfer_authority,
+        perpetuals,
+        pool,
+        custody,
+        custody_oracle,
+        collateral_custody,
+        collateral_oracle,
+        collateral_token,
+        token_program,
+    ] {
         svm.set_account(a, dummy_meta.clone()).unwrap();
     }
 
@@ -174,7 +194,7 @@ fn autonomous_tick_cpis_close_position_signed_by_guard_pda() {
             AccountMeta::new_readonly(transfer_authority, false),
             AccountMeta::new_readonly(perpetuals, false),
             AccountMeta::new(pool, false),
-            AccountMeta::new(position, false),       // [7] position (mock stamps this)
+            AccountMeta::new(position, false), // [7] position (mock stamps this)
             AccountMeta::new(custody, false),
             AccountMeta::new_readonly(custody_oracle, false),
             AccountMeta::new(collateral_custody, false),
@@ -224,8 +244,13 @@ fn cosigned_tick_never_reaches_venue() {
     let system = Address::from_str_const(SYSTEM_PROGRAM);
 
     let mut svm = LiteSVM::new().with_sigverify(false);
-    svm.add_program(program_id, &read_so("target/deploy/wick_guard.so")).unwrap();
-    svm.add_program(flash_id, &read_so("mocks/flash/target/deploy/mock_flash.so")).unwrap();
+    svm.add_program(program_id, &read_so("target/deploy/wick_guard.so"))
+        .unwrap();
+    svm.add_program(
+        flash_id,
+        &read_so("mocks/flash/target/deploy/mock_flash.so"),
+    )
+    .unwrap();
 
     let owner_kp = Keypair::new();
     let owner = owner_kp.pubkey();
@@ -273,13 +298,17 @@ fn cosigned_tick_never_reaches_venue() {
     svm.warp_to_slot(TICK_SLOT); // fresh: TICK_SLOT - 0 <= MAX_TICK_AGE_SLOTS
     let position = Address::from([42u8; 32]);
     let flash_pubkey = Pubkey::from(flash_id.to_bytes());
-    svm.set_account(position, Account {
-        lamports: 1_000_000,
-        data: vec![0u8; 8],
-        owner: flash_pubkey,
-        executable: false,
-        rent_epoch: 0,
-    }).unwrap();
+    svm.set_account(
+        position,
+        Account {
+            lamports: 1_000_000,
+            data: vec![0u8; 8],
+            owner: flash_pubkey,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
 
     let mut tick = vec![7u8];
     tick.extend_from_slice(&50_000_000u128.to_le_bytes());
@@ -318,5 +347,8 @@ fn cosigned_tick_never_reaches_venue() {
     assert_eq!(nonce, 0, "CoSigned must not commit the nonce");
 
     // Pending action stored for the frontend to co-sign (tag at offset 259).
-    assert_ne!(guard_after.data[259], 0, "pending action must be held for co-sign");
+    assert_ne!(
+        guard_after.data[259], 0,
+        "pending action must be held for co-sign"
+    );
 }

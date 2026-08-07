@@ -43,7 +43,9 @@ fn parse_amount(data: &[u8]) -> Result<u128, WickError> {
         return Err(WickError::InvalidInstruction);
     }
     Ok(u128::from_le_bytes(
-        payload.try_into().map_err(|_| WickError::InvalidInstruction)?,
+        payload
+            .try_into()
+            .map_err(|_| WickError::InvalidInstruction)?,
     ))
 }
 
@@ -91,7 +93,11 @@ fn parse_policy(payload: &[u8]) -> Result<(VenuePolicy, [u8; 32], u8), WickError
             partial_close_usd_per_action: rd(98)?,
             daily_total_usd: rd(114)?,
         },
-        take_profit: if take_profit == u128::MAX { None } else { Some(take_profit) },
+        take_profit: if take_profit == u128::MAX {
+            None
+        } else {
+            Some(take_profit)
+        },
     };
     Ok((policy, co_authority, payload[0]))
 }
@@ -126,11 +132,7 @@ fn store_guard(account: &AccountView, state: &GuardState) -> Result<(), WickErro
 // Handlers
 // -------------------------------------------------------------------------
 
-fn init_guard(
-    program_id: &Address,
-    accounts: &[AccountView],
-    data: &[u8],
-) -> ProgramResult {
+fn init_guard(program_id: &Address, accounts: &[AccountView], data: &[u8]) -> ProgramResult {
     let (guard, owner, payer, rent) = split_4(accounts)?;
     if !owner.is_signer() || !payer.is_signer() {
         return Err(WickError::MissingOwnerAuthority.into());
@@ -182,11 +184,7 @@ fn init_guard(
     Ok(())
 }
 
-fn deposit_margin(
-    program_id: &Address,
-    accounts: &[AccountView],
-    data: &[u8],
-) -> ProgramResult {
+fn deposit_margin(program_id: &Address, accounts: &[AccountView], data: &[u8]) -> ProgramResult {
     let (guard, owner) = split_2(accounts)?;
     if !owner.is_signer() {
         return Err(WickError::MissingOwnerAuthority.into());
@@ -206,11 +204,7 @@ fn deposit_margin(
     Ok(())
 }
 
-fn withdraw_margin(
-    program_id: &Address,
-    accounts: &[AccountView],
-    data: &[u8],
-) -> ProgramResult {
+fn withdraw_margin(program_id: &Address, accounts: &[AccountView], data: &[u8]) -> ProgramResult {
     let (guard, owner, co_authority) = split_3(accounts)?;
     let amount = parse_amount(data)?;
 
@@ -234,11 +228,7 @@ fn withdraw_margin(
     Ok(())
 }
 
-fn set_paused(
-    program_id: &Address,
-    accounts: &[AccountView],
-    data: &[u8],
-) -> ProgramResult {
+fn set_paused(program_id: &Address, accounts: &[AccountView], data: &[u8]) -> ProgramResult {
     let (config, authority) = split_2(accounts)?;
     if !config.owned_by(program_id) {
         return Err(WickError::WrongAccountOwner.into());
@@ -252,10 +242,9 @@ fn set_paused(
         _ => return Err(WickError::InvalidInstruction.into()),
     };
 
-    let mut cfg = RouteConfig::from_bytes(
-        &config.try_borrow().map_err(|_| WickError::NotInitialized)?,
-    )
-    .map_err(|_| WickError::NotInitialized)?;
+    let mut cfg =
+        RouteConfig::from_bytes(&config.try_borrow().map_err(|_| WickError::NotInitialized)?)
+            .map_err(|_| WickError::NotInitialized)?;
     if authority.address() != &Address::from(cfg.authority) {
         return Err(WickError::Unauthorized.into());
     }
@@ -275,11 +264,7 @@ fn set_paused(
 ///
 /// Account layout: [0] guard (writable, program-owned), [1] owner (signer).
 /// Data (after discriminator): collateral (u128), size (i128), entry (u128).
-fn update_position(
-    program_id: &Address,
-    accounts: &[AccountView],
-    data: &[u8],
-) -> ProgramResult {
+fn update_position(program_id: &Address, accounts: &[AccountView], data: &[u8]) -> ProgramResult {
     let (guard, owner) = split_2(accounts)?;
     if !owner.is_signer() {
         return Err(WickError::MissingOwnerAuthority.into());
@@ -316,11 +301,7 @@ fn update_position(
 ///   [0]    guard (writable, program-owned)
 ///   [1]    clock sysvar (readonly)
 ///   [2..]  venue adapter accounts (only consumed for an autonomous Flash close)
-fn on_price_tick(
-    program_id: &Address,
-    accounts: &[AccountView],
-    data: &[u8],
-) -> ProgramResult {
+fn on_price_tick(program_id: &Address, accounts: &[AccountView], data: &[u8]) -> ProgramResult {
     let (guard, clock) = split_2(accounts)?;
     if !guard.owned_by(program_id) {
         return Err(WickError::WrongAccountOwner.into());
@@ -420,8 +401,8 @@ fn execute_autonomous(
             // liquidated.
             let venue_accounts = accounts.get(2..).ok_or(WickError::InvalidInstruction)?;
             let adapter = ClosePositionAccounts::from_account_views(venue_accounts)?;
-            let exit_price = u64::try_from(state.current_price)
-                .map_err(|_| WickError::MathOverflow)?;
+            let exit_price =
+                u64::try_from(state.current_price).map_err(|_| WickError::MathOverflow)?;
             let params = ClosePositionParams { price: exit_price };
 
             let bump_bytes = [bump];
@@ -490,11 +471,7 @@ pub fn process_instruction(
     if data.len() >= 8
         && data[..8] == ephemeral_rollups_pinocchio::consts::EXTERNAL_UNDELEGATE_DISCRIMINATOR
     {
-        return crate::delegation::process_undelegation_callback(
-            program_id,
-            accounts,
-            &data[8..],
-        );
+        return crate::delegation::process_undelegation_callback(program_id, accounts, &data[8..]);
     }
 
     let Some(ix) = WickInstruction::from_byte(discriminator_byte) else {
@@ -507,9 +484,7 @@ pub fn process_instruction(
         WickInstruction::WithdrawMargin => withdraw_margin(program_id, accounts, data),
         WickInstruction::SetPaused => set_paused(program_id, accounts, data),
         WickInstruction::Delegate => delegation::process_delegate(accounts, &data[1..]),
-        WickInstruction::CommitAndUndelegate => {
-            delegation::process_commit_and_undelegate(accounts)
-        }
+        WickInstruction::CommitAndUndelegate => delegation::process_commit_and_undelegate(accounts),
         WickInstruction::Commit => delegation::process_commit(accounts),
         WickInstruction::OnPriceTick => on_price_tick(program_id, accounts, data),
         WickInstruction::UpdatePosition => update_position(program_id, accounts, data),
@@ -609,7 +584,10 @@ mod tests {
     fn parse_policy_rejects_bad_authority() {
         let mut payload = [0u8; INIT_PAYLOAD_LEN];
         payload[33] = 7;
-        assert_eq!(parse_policy(&payload).unwrap_err(), WickError::InvalidInstruction);
+        assert_eq!(
+            parse_policy(&payload).unwrap_err(),
+            WickError::InvalidInstruction
+        );
     }
 
     // ------------------------------------------------------------------
@@ -778,26 +756,29 @@ mod tests {
         let owner = addr(9);
         let guard_data = sample_guard(owner);
         let guard = TestAccount::new(
-            PROGRAM_ID,        // address (unused for deposit)
-            PROGRAM_ID,        // owned by program
-            100,               // lamports
+            PROGRAM_ID, // address (unused for deposit)
+            PROGRAM_ID, // owned by program
+            100,        // lamports
             &guard_data,
-            false,             // not a signer (guard itself never signs)
-            true,              // writable
+            false, // not a signer (guard itself never signs)
+            true,  // writable
         );
         let owner_acc = TestAccount::new(
             owner,
             Address::new_from_array([0u8; 32]),
             0,
             &[],
-            true,  // signer
+            true, // signer
             false,
         );
 
-        let mut accounts = [guard.view, owner_acc.view];
-        let data = [1u8, 0x2a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]; // Deposit 42
+        let accounts = [guard.view, owner_acc.view];
+        let data = [
+            1u8, 0x2a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00,
+        ]; // Deposit 42
 
-        let result = process_instruction(&PROGRAM_ID, &mut accounts, &data);
+        let result = process_instruction(&PROGRAM_ID, &accounts, &data);
         assert!(result.is_ok());
 
         let new_state = GuardState::from_bytes(guard.data()).unwrap();
@@ -808,17 +789,20 @@ mod tests {
     fn deposit_rejects_non_owner_signer() {
         let owner = addr(9);
         let guard_data = sample_guard(owner);
-        let guard = TestAccount::new(
-            PROGRAM_ID, PROGRAM_ID, 100, &guard_data, false, true,
-        );
+        let guard = TestAccount::new(PROGRAM_ID, PROGRAM_ID, 100, &guard_data, false, true);
         // Signer is a different key than the stored venue_owner.
         let stranger = TestAccount::new(
-            addr(99), Address::new_from_array([0u8; 32]), 0, &[], true, false,
+            addr(99),
+            Address::new_from_array([0u8; 32]),
+            0,
+            &[],
+            true,
+            false,
         );
 
-        let mut accounts = [guard.view, stranger.view];
+        let accounts = [guard.view, stranger.view];
         let data = [1u8, 42, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        let result = process_instruction(&PROGRAM_ID, &mut accounts, &data);
+        let result = process_instruction(&PROGRAM_ID, &accounts, &data);
         assert_eq!(result, Err(WickError::SignerKeyMismatch.into()));
 
         // Collateral untouched.
@@ -830,17 +814,20 @@ mod tests {
     fn deposit_requires_signer_flag() {
         let owner = addr(9);
         let guard_data = sample_guard(owner);
-        let guard = TestAccount::new(
-            PROGRAM_ID, PROGRAM_ID, 100, &guard_data, false, true,
-        );
+        let guard = TestAccount::new(PROGRAM_ID, PROGRAM_ID, 100, &guard_data, false, true);
         // Correct key but is_signer = false.
         let owner_acc = TestAccount::new(
-            owner, Address::new_from_array([0u8; 32]), 0, &[], false, false,
+            owner,
+            Address::new_from_array([0u8; 32]),
+            0,
+            &[],
+            false,
+            false,
         );
 
-        let mut accounts = [guard.view, owner_acc.view];
+        let accounts = [guard.view, owner_acc.view];
         let data = [1u8, 42, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        let result = process_instruction(&PROGRAM_ID, &mut accounts, &data);
+        let result = process_instruction(&PROGRAM_ID, &accounts, &data);
         assert_eq!(result, Err(WickError::MissingOwnerAuthority.into()));
     }
 
@@ -848,20 +835,28 @@ mod tests {
     fn withdraw_requires_both_sigs_end_to_end() {
         let owner = addr(9);
         let guard_data = sample_guard(owner);
-        let guard = TestAccount::new(
-            PROGRAM_ID, PROGRAM_ID, 100, &guard_data, false, true,
-        );
+        let guard = TestAccount::new(PROGRAM_ID, PROGRAM_ID, 100, &guard_data, false, true);
         let owner_acc = TestAccount::new(
-            owner, Address::new_from_array([0u8; 32]), 0, &[], true, false,
+            owner,
+            Address::new_from_array([0u8; 32]),
+            0,
+            &[],
+            true,
+            false,
         );
         // co_authority not signed (correct key, wrong flag).
         let co = TestAccount::new(
-            addr(5), Address::new_from_array([0u8; 32]), 0, &[], false, false,
+            addr(5),
+            Address::new_from_array([0u8; 32]),
+            0,
+            &[],
+            false,
+            false,
         );
 
-        let mut accounts = [guard.view, owner_acc.view, co.view];
+        let accounts = [guard.view, owner_acc.view, co.view];
         let data = [2u8, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]; // Withdraw 10
-        let result = process_instruction(&PROGRAM_ID, &mut accounts, &data);
+        let result = process_instruction(&PROGRAM_ID, &accounts, &data);
         assert_eq!(result, Err(WickError::MissingCoAuthority.into()));
 
         // Collateral untouched.
@@ -873,19 +868,27 @@ mod tests {
     fn withdraw_success_with_both_sigs() {
         let owner = addr(9);
         let guard_data = sample_guard(owner);
-        let guard = TestAccount::new(
-            PROGRAM_ID, PROGRAM_ID, 100, &guard_data, false, true,
-        );
+        let guard = TestAccount::new(PROGRAM_ID, PROGRAM_ID, 100, &guard_data, false, true);
         let owner_acc = TestAccount::new(
-            owner, Address::new_from_array([0u8; 32]), 0, &[], true, false,
+            owner,
+            Address::new_from_array([0u8; 32]),
+            0,
+            &[],
+            true,
+            false,
         );
         let co = TestAccount::new(
-            addr(5), Address::new_from_array([0u8; 32]), 0, &[], true, false,
+            addr(5),
+            Address::new_from_array([0u8; 32]),
+            0,
+            &[],
+            true,
+            false,
         );
 
-        let mut accounts = [guard.view, owner_acc.view, co.view];
+        let accounts = [guard.view, owner_acc.view, co.view];
         let data = [2u8, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]; // Withdraw 10
-        let result = process_instruction(&PROGRAM_ID, &mut accounts, &data);
+        let result = process_instruction(&PROGRAM_ID, &accounts, &data);
         assert!(result.is_ok());
 
         let new_state = GuardState::from_bytes(guard.data()).unwrap();
@@ -896,24 +899,32 @@ mod tests {
     fn withdraw_rejects_over_balance() {
         let owner = addr(9);
         let guard_data = sample_guard(owner);
-        let guard = TestAccount::new(
-            PROGRAM_ID, PROGRAM_ID, 100, &guard_data, false, true,
-        );
+        let guard = TestAccount::new(PROGRAM_ID, PROGRAM_ID, 100, &guard_data, false, true);
         let owner_acc = TestAccount::new(
-            owner, Address::new_from_array([0u8; 32]), 0, &[], true, false,
+            owner,
+            Address::new_from_array([0u8; 32]),
+            0,
+            &[],
+            true,
+            false,
         );
         let co = TestAccount::new(
-            addr(5), Address::new_from_array([0u8; 32]), 0, &[], true, false,
+            addr(5),
+            Address::new_from_array([0u8; 32]),
+            0,
+            &[],
+            true,
+            false,
         );
 
-        let mut accounts = [guard.view, owner_acc.view, co.view];
+        let accounts = [guard.view, owner_acc.view, co.view];
         // Withdraw u128::MAX — way over 100_000_000 collateral.
         let mut data = [2u8; 17];
         data[0] = 2;
         for b in data[1..].iter_mut() {
             *b = 0xff;
         }
-        let result = process_instruction(&PROGRAM_ID, &mut accounts, &data);
+        let result = process_instruction(&PROGRAM_ID, &accounts, &data);
         assert_eq!(result, Err(WickError::MathOverflow.into()));
     }
 
@@ -931,15 +942,25 @@ mod tests {
             true,
         );
         let owner_acc = TestAccount::new(
-            owner, Address::new_from_array([0u8; 32]), 0, &[], true, false,
+            owner,
+            Address::new_from_array([0u8; 32]),
+            0,
+            &[],
+            true,
+            false,
         );
         let co = TestAccount::new(
-            addr(5), Address::new_from_array([0u8; 32]), 0, &[], true, false,
+            addr(5),
+            Address::new_from_array([0u8; 32]),
+            0,
+            &[],
+            true,
+            false,
         );
 
-        let mut accounts = [guard.view, owner_acc.view, co.view];
+        let accounts = [guard.view, owner_acc.view, co.view];
         let data = [2u8, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        let result = process_instruction(&PROGRAM_ID, &mut accounts, &data);
+        let result = process_instruction(&PROGRAM_ID, &accounts, &data);
         assert_eq!(result, Err(WickError::WrongAccountOwner.into()));
     }
 
@@ -953,16 +974,19 @@ mod tests {
         let mut buf = vec![0u8; ROUTE_CONFIG_LEN];
         cfg.write_into(&mut buf).unwrap();
 
-        let config_acc = TestAccount::new(
-            PROGRAM_ID, PROGRAM_ID, 100, &buf, false, true,
-        );
+        let config_acc = TestAccount::new(PROGRAM_ID, PROGRAM_ID, 100, &buf, false, true);
         let authority = TestAccount::new(
-            addr(3), Address::new_from_array([0u8; 32]), 0, &[], true, false,
+            addr(3),
+            Address::new_from_array([0u8; 32]),
+            0,
+            &[],
+            true,
+            false,
         );
 
-        let mut accounts = [config_acc.view, authority.view];
+        let accounts = [config_acc.view, authority.view];
         let data = [3u8, 1]; // SetPaused true
-        let result = process_instruction(&PROGRAM_ID, &mut accounts, &data);
+        let result = process_instruction(&PROGRAM_ID, &accounts, &data);
         assert!(result.is_ok());
 
         let new_cfg = RouteConfig::from_bytes(config_acc.data()).unwrap();
@@ -979,17 +1003,20 @@ mod tests {
         let mut buf = vec![0u8; ROUTE_CONFIG_LEN];
         cfg.write_into(&mut buf).unwrap();
 
-        let config_acc = TestAccount::new(
-            PROGRAM_ID, PROGRAM_ID, 100, &buf, false, true,
-        );
+        let config_acc = TestAccount::new(PROGRAM_ID, PROGRAM_ID, 100, &buf, false, true);
         // Signer does not match stored authority [3u8;32].
         let wrong = TestAccount::new(
-            addr(4), Address::new_from_array([0u8; 32]), 0, &[], true, false,
+            addr(4),
+            Address::new_from_array([0u8; 32]),
+            0,
+            &[],
+            true,
+            false,
         );
 
-        let mut accounts = [config_acc.view, wrong.view];
+        let accounts = [config_acc.view, wrong.view];
         let data = [3u8, 1];
-        let result = process_instruction(&PROGRAM_ID, &mut accounts, &data);
+        let result = process_instruction(&PROGRAM_ID, &accounts, &data);
         assert_eq!(result, Err(WickError::Unauthorized.into()));
     }
 
@@ -1009,16 +1036,36 @@ mod tests {
         // `CommitAndUndelegate` (discriminator 5) requires a signed payer.
         // A non-signer payer must be rejected before any magic-program CPI.
         let payer_acc = TestAccount::new(
-            addr(1), Address::new_from_array([0u8; 32]), 0, &[], false, false,
+            addr(1),
+            Address::new_from_array([0u8; 32]),
+            0,
+            &[],
+            false,
+            false,
         );
         let guard_acc = TestAccount::new(
-            PROGRAM_ID, PROGRAM_ID, 100, &[0u8; GUARD_DATA_LEN], false, true,
+            PROGRAM_ID,
+            PROGRAM_ID,
+            100,
+            &[0u8; GUARD_DATA_LEN],
+            false,
+            true,
         );
         let magic = TestAccount::new(
-            addr(2), Address::new_from_array([0u8; 32]), 0, &[], false, false,
+            addr(2),
+            Address::new_from_array([0u8; 32]),
+            0,
+            &[],
+            false,
+            false,
         );
         let ctx = TestAccount::new(
-            addr(3), Address::new_from_array([0u8; 32]), 0, &[], false, false,
+            addr(3),
+            Address::new_from_array([0u8; 32]),
+            0,
+            &[],
+            false,
+            false,
         );
         let accounts = [payer_acc.view, guard_acc.view, magic.view, ctx.view];
         let result = delegation::process_commit_and_undelegate(&accounts);
@@ -1028,16 +1075,36 @@ mod tests {
     #[test]
     fn commit_requires_signer() {
         let payer_acc = TestAccount::new(
-            addr(1), Address::new_from_array([0u8; 32]), 0, &[], false, false,
+            addr(1),
+            Address::new_from_array([0u8; 32]),
+            0,
+            &[],
+            false,
+            false,
         );
         let guard_acc = TestAccount::new(
-            PROGRAM_ID, PROGRAM_ID, 100, &[0u8; GUARD_DATA_LEN], false, true,
+            PROGRAM_ID,
+            PROGRAM_ID,
+            100,
+            &[0u8; GUARD_DATA_LEN],
+            false,
+            true,
         );
         let magic = TestAccount::new(
-            addr(2), Address::new_from_array([0u8; 32]), 0, &[], false, false,
+            addr(2),
+            Address::new_from_array([0u8; 32]),
+            0,
+            &[],
+            false,
+            false,
         );
         let ctx = TestAccount::new(
-            addr(3), Address::new_from_array([0u8; 32]), 0, &[], false, false,
+            addr(3),
+            Address::new_from_array([0u8; 32]),
+            0,
+            &[],
+            false,
+            false,
         );
         let accounts = [payer_acc.view, guard_acc.view, magic.view, ctx.view];
         let result = delegation::process_commit(&accounts);
@@ -1064,8 +1131,8 @@ mod tests {
         clock: &TestAccount,
         data: &[u8],
     ) -> Result<(), pinocchio::error::ProgramError> {
-        let mut accounts = [guard_acc.view, clock.view];
-        process_instruction(&PROGRAM_ID, &mut accounts, data)
+        let accounts = [guard_acc.view, clock.view];
+        process_instruction(&PROGRAM_ID, &accounts, data)
     }
 
     #[test]
@@ -1176,10 +1243,15 @@ mod tests {
         // Clock account at a non-sysvar address — must be rejected before any
         // state change.
         let bad_clock = TestAccount::new(
-            addr(99), Address::new_from_array([0u8; 32]), 0, &[0u8; 40], false, false,
+            addr(99),
+            Address::new_from_array([0u8; 32]),
+            0,
+            &[0u8; 40],
+            false,
+            false,
         );
-        let mut accounts = [guard.view, bad_clock.view];
-        let result = process_instruction(&PROGRAM_ID, &mut accounts, &tick_data(48_000_000, 1, 0));
+        let accounts = [guard.view, bad_clock.view];
+        let result = process_instruction(&PROGRAM_ID, &accounts, &tick_data(48_000_000, 1, 0));
         assert_eq!(result, Err(WickError::InvalidInstruction.into()));
     }
 
@@ -1195,10 +1267,15 @@ mod tests {
         data.extend_from_slice(&55_000_000u128.to_le_bytes());
 
         let owner_acc = TestAccount::new(
-            owner, Address::new_from_array([0u8; 32]), 0, &[], true, false,
+            owner,
+            Address::new_from_array([0u8; 32]),
+            0,
+            &[],
+            true,
+            false,
         );
-        let mut accounts = [guard.view, owner_acc.view];
-        let result = process_instruction(&PROGRAM_ID, &mut accounts, &data);
+        let accounts = [guard.view, owner_acc.view];
+        let result = process_instruction(&PROGRAM_ID, &accounts, &data);
         assert!(result.is_ok());
 
         let state = GuardState::from_bytes(guard.data()).unwrap();
@@ -1208,10 +1285,15 @@ mod tests {
 
         // Non-owner signer rejected, snapshot untouched.
         let stranger = TestAccount::new(
-            addr(42), Address::new_from_array([0u8; 32]), 0, &[], true, false,
+            addr(42),
+            Address::new_from_array([0u8; 32]),
+            0,
+            &[],
+            true,
+            false,
         );
-        let mut accounts = [guard.view, stranger.view];
-        let result = process_instruction(&PROGRAM_ID, &mut accounts, &data);
+        let accounts = [guard.view, stranger.view];
+        let result = process_instruction(&PROGRAM_ID, &accounts, &data);
         assert_eq!(result, Err(WickError::SignerKeyMismatch.into()));
     }
 }

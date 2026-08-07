@@ -42,9 +42,7 @@ pub fn process_instruction(
     }
 
     // Index 5 is `position`. Mark it closed.
-    let position = accounts
-        .get(5)
-        .ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let position = accounts.get(5).ok_or(ProgramError::NotEnoughAccountKeys)?;
     let mut position_data = position
         .try_borrow_mut()
         .map_err(|_| ProgramError::AccountBorrowFailed)?;

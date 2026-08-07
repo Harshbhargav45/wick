@@ -7,9 +7,13 @@
 //!
 //! All integers are little-endian.
 
-use crate::state::{
-    Action, ActionCaps, AuthorityRequirement, RouteConfig, VenuePolicy,
-};
+// The decode/encode helpers return `Result<_, ()>` where `()` is a deliberate
+// sentinel for "not our data / short buffer". Callers map it to
+// `WickError::NotInitialized`. A dedicated error enum here would add surface
+// for an unconditional `()` signal, so the unit error type is kept.
+#![allow(clippy::result_unit_err)]
+
+use crate::state::{Action, ActionCaps, AuthorityRequirement, RouteConfig, VenuePolicy};
 
 /// Account data version marker. Anything else is `NotInitialized`/foreign.
 pub const ACCOUNT_VERSION: u8 = 1;
@@ -47,7 +51,11 @@ impl WalletState {
                 .try_into()
                 .map_err(|_| ())?,
         );
-        Ok(Self { owner, co_authority, balance })
+        Ok(Self {
+            owner,
+            co_authority,
+            balance,
+        })
     }
 
     /// Serialize into an existing account-data buffer. Returns `Err` if the
@@ -187,8 +195,12 @@ impl GuardState {
         let tp_raw = rd(G_TP_OFF)?;
         let pending = match data[G_PENDING_TAG_OFF] {
             0 => None,
-            1 => Some(Action::TopUp { amount: rd(G_PENDING_AMT_OFF)? }),
-            2 => Some(Action::PartialClose { fraction_bps: rd(G_PENDING_AMT_OFF)? }),
+            1 => Some(Action::TopUp {
+                amount: rd(G_PENDING_AMT_OFF)?,
+            }),
+            2 => Some(Action::PartialClose {
+                fraction_bps: rd(G_PENDING_AMT_OFF)?,
+            }),
             3 => Some(Action::TakeProfit),
             4 => Some(Action::EscalateManualReview),
             _ => return Err(()),
@@ -217,19 +229,29 @@ impl GuardState {
                     partial_close_usd_per_action: rd(G_CAP_PARTIAL_OFF)?,
                     daily_total_usd: rd(G_CAP_DAILY_OFF)?,
                 },
-                take_profit: if tp_raw == NONE_PRICE { None } else { Some(tp_raw) },
+                take_profit: if tp_raw == NONE_PRICE {
+                    None
+                } else {
+                    Some(tp_raw)
+                },
             },
             collateral: rd(G_COLLAT_OFF)?,
             size: i128::from_le_bytes(
-                data[G_SIZE_OFF..G_SIZE_OFF + 16].try_into().map_err(|_| ())?,
+                data[G_SIZE_OFF..G_SIZE_OFF + 16]
+                    .try_into()
+                    .map_err(|_| ())?,
             ),
             entry: rd(G_ENTRY_OFF)?,
             current_price: rd(G_PRICE_OFF)?,
             nonce: u64::from_le_bytes(
-                data[G_NONCE_OFF..G_NONCE_OFF + 8].try_into().map_err(|_| ())?,
+                data[G_NONCE_OFF..G_NONCE_OFF + 8]
+                    .try_into()
+                    .map_err(|_| ())?,
             ),
             last_check_slot: u64::from_le_bytes(
-                data[G_SLOT_OFF..G_SLOT_OFF + 8].try_into().map_err(|_| ())?,
+                data[G_SLOT_OFF..G_SLOT_OFF + 8]
+                    .try_into()
+                    .map_err(|_| ())?,
             ),
             pending,
             degraded: data[G_DEGRADED_OFF] == 1,
@@ -266,7 +288,11 @@ impl GuardState {
         wr(out, G_BUF_OFF, self.policy.trigger_buffer_bps);
         wr(out, G_FEE_OFF, self.policy.fee_bps);
         wr(out, G_CAP_TOP_OFF, self.policy.caps.top_up_usd_per_action);
-        wr(out, G_CAP_PARTIAL_OFF, self.policy.caps.partial_close_usd_per_action);
+        wr(
+            out,
+            G_CAP_PARTIAL_OFF,
+            self.policy.caps.partial_close_usd_per_action,
+        );
         wr(out, G_CAP_DAILY_OFF, self.policy.caps.daily_total_usd);
         match self.policy.take_profit {
             Some(tp) => wr(out, G_TP_OFF, tp),
@@ -405,7 +431,11 @@ mod tests {
     #[test]
     fn route_config_roundtrip() {
         let mut buf = [0u8; ROUTE_CONFIG_LEN];
-        let c = RouteConfig { authority: [3u8; 32], paused: true, _padding: [0u8; 31] };
+        let c = RouteConfig {
+            authority: [3u8; 32],
+            paused: true,
+            _padding: [0u8; 31],
+        };
         c.write_into(&mut buf).unwrap();
         let back = RouteConfig::from_bytes(&buf).unwrap();
         assert_eq!(back.authority, [3u8; 32]);

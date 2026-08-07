@@ -87,8 +87,14 @@ fn init_guard_and_deposit() {
     assert!(res.is_ok(), "InitGuard failed: {res:?}");
 
     let guard_account = svm.get_account(&guard_pda).expect("guard account missing");
-    assert_eq!(guard_account.data[0], 1, "guard not initialized with version badge");
-    assert_eq!(guard_account.owner, program_id, "guard not owned by program");
+    assert_eq!(
+        guard_account.data[0], 1,
+        "guard not initialized with version badge"
+    );
+    assert_eq!(
+        guard_account.owner, program_id,
+        "guard not owned by program"
+    );
 
     // --- Deposit 1_000_000_000 ---
     let mut deposit_data = vec![1u8]; // discriminator
@@ -104,5 +110,6 @@ fn init_guard_and_deposit() {
     let deposit_msg =
         Message::new_with_blockhash(&[deposit_ix], Some(&owner), &svm.latest_blockhash());
     let deposit_tx = Transaction::new(&[&owner_kp], deposit_msg, svm.latest_blockhash());
-    svm.send_transaction(deposit_tx).expect("DepositMargin failed");
+    svm.send_transaction(deposit_tx)
+        .expect("DepositMargin failed");
 }

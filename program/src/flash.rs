@@ -35,11 +35,10 @@ use crate::error::WickError;
 pub const VENUE_FLASH: u8 = 1;
 
 /// Flash Perpetuals program ID (mainnet-beta).
-pub const FLASH_PROGRAM_ID: Address =
-    Address::new_from_array([
-        212, 236, 82, 74, 222, 71, 209, 50, 127, 252, 246, 137, 90, 104, 93, 148, 41, 240, 55,
-        144, 196, 35, 87, 71, 243, 123, 215, 163, 221, 165, 30, 221,
-    ]);
+pub const FLASH_PROGRAM_ID: Address = Address::new_from_array([
+    212, 236, 82, 74, 222, 71, 209, 50, 127, 252, 246, 137, 90, 104, 93, 148, 41, 240, 55, 144,
+    196, 35, 87, 71, 243, 123, 215, 163, 221, 165, 30, 221,
+]);
 
 /// Anchor discriminator of `global:close_position`.
 const CLOSE_POSITION_DISCRIMINATOR: [u8; 8] = [123, 134, 81, 0, 49, 68, 98, 98];
@@ -85,9 +84,7 @@ impl<'a> ClosePositionAccounts<'a> {
     /// Expects exactly the 12 `close_position` accounts in the order the Anchor
     /// context declares them, with `owner` first (the guard PDA itself in the
     /// autonomous tier).
-    pub fn from_account_views(
-        views: &'a [AccountView],
-    ) -> Result<Self, WickError> {
+    pub fn from_account_views(views: &'a [AccountView]) -> Result<Self, WickError> {
         if views.len() < CLOSE_POSITION_ACCOUNT_COUNT {
             return Err(WickError::InvalidInstruction);
         }

@@ -87,25 +87,25 @@ pub struct VenuePolicy {
 
 /// PnL for `size` (signed units) at `entry` vs `current`. Shorted positions are
 /// handled for free by signed `size` — do not special-case them.
-pub fn compute_pnl(
-    size: i128,
-    entry: u128,
-    current: u128,
-) -> Result<i128, WickError> {
+pub fn compute_pnl(size: i128, entry: u128, current: u128) -> Result<i128, WickError> {
     let entry = i128::try_from(entry).or(Err(WickError::MathOverflow))?;
     let current = i128::try_from(current).or(Err(WickError::MathOverflow))?;
-    let price_delta = current
-        .checked_sub(entry)
+    let price_delta = current.checked_sub(entry).ok_or(WickError::MathOverflow)?;
+    let raw = size
+        .checked_mul(price_delta)
         .ok_or(WickError::MathOverflow)?;
-    let raw = size.checked_mul(price_delta).ok_or(WickError::MathOverflow)?;
-    raw.checked_div(SCALE as i128).ok_or(WickError::MathOverflow)
+    raw.checked_div(SCALE as i128)
+        .ok_or(WickError::MathOverflow)
 }
 
 /// Maintenance margin required on `abs_size`, scaled by `margin_bps`.
 pub fn compute_margin_required(abs_size: u128, margin_bps: u128) -> Result<u128, WickError> {
-    let num = (abs_size as i128).checked_mul(margin_bps as i128)
+    let num = (abs_size as i128)
+        .checked_mul(margin_bps as i128)
         .ok_or(WickError::MathOverflow)?;
-    (num / BPS_DENOM as i128).try_into().or(Err(WickError::MathOverflow))
+    (num / BPS_DENOM as i128)
+        .try_into()
+        .or(Err(WickError::MathOverflow))
 }
 
 /// Equity = collateral + pnl. Can be negative (insolvency).
@@ -317,7 +317,9 @@ pub fn select_action(
         Err(e) => return Err(e),
     };
     if policy.caps.within_cap(ActionType::PartialClose, f_bps) {
-        return Ok(Some(Action::PartialClose { fraction_bps: f_bps }));
+        return Ok(Some(Action::PartialClose {
+            fraction_bps: f_bps,
+        }));
     }
 
     // 4. Nothing fits inside caps — escalate, never silently no-op.
@@ -374,31 +376,57 @@ mod tests {
     #[test]
     fn pnl_long_and_short() {
         // Long 100 units @ $50, now $60 => +$1_000 (=$1_000_000_000 at 6dp scale)
-        assert_eq!(compute_pnl(100 * SCALE as i128, 50 * SCALE as u128, 60 * SCALE as u128).unwrap(), 1_000_000_000);
+        assert_eq!(
+            compute_pnl(100 * SCALE as i128, 50 * SCALE, 60 * SCALE).unwrap(),
+            1_000_000_000
+        );
         // Short -100 units @ $50, now $40 => +$1_000
-        assert_eq!(compute_pnl(-100 * SCALE as i128, 50 * SCALE as u128, 40 * SCALE as u128).unwrap(), 1_000_000_000);
+        assert_eq!(
+            compute_pnl(-100 * SCALE as i128, 50 * SCALE, 40 * SCALE).unwrap(),
+            1_000_000_000
+        );
         // Short -100 @ $50, now $60 => -$1_000
-        assert_eq!(compute_pnl(-100 * SCALE as i128, 50 * SCALE as u128, 60 * SCALE as u128).unwrap(), -1_000_000_000);
+        assert_eq!(
+            compute_pnl(-100 * SCALE as i128, 50 * SCALE, 60 * SCALE).unwrap(),
+            -1_000_000_000
+        );
     }
 
     #[test]
     fn margin_required_5pct() {
-        assert_eq!(compute_margin_required(100 * SCALE as u128, 500).unwrap(), 5 * SCALE as u128);
+        assert_eq!(
+            compute_margin_required(100 * SCALE, 500).unwrap(),
+            5 * SCALE
+        );
     }
 
     #[test]
     fn breach_detected_cross_multiplied() {
         // Long 100 @ 50, now 48; collateral 200. equity=200 + (100*-2)=0 -> breach
-        assert!(is_liquidatable(200 * SCALE as u128, 100 * SCALE as i128, 50 * SCALE as u128, 48 * SCALE as u128, 500).unwrap());
+        assert!(is_liquidatable(
+            200 * SCALE,
+            100 * SCALE as i128,
+            50 * SCALE,
+            48 * SCALE,
+            500
+        )
+        .unwrap());
         // Healthy: collateral 600, price 55 => equity 1100 >= req 500
-        assert!(!is_liquidatable(600 * SCALE as u128, 100 * SCALE as i128, 50 * SCALE as u128, 55 * SCALE as u128, 500).unwrap());
+        assert!(!is_liquidatable(
+            600 * SCALE,
+            100 * SCALE as i128,
+            50 * SCALE,
+            55 * SCALE,
+            500
+        )
+        .unwrap());
     }
 
     #[test]
     fn accept_tick_bounds() {
-        assert!(accept_tick(100, 80));       // 20 slots ok
-        assert!(!accept_tick(100, 74));      // 26 too old
-        assert!(accept_tick(100, 100));      // same slot ok
+        assert!(accept_tick(100, 80)); // 20 slots ok
+        assert!(!accept_tick(100, 74)); // 26 too old
+        assert!(accept_tick(100, 100)); // same slot ok
     }
 
     #[test]
@@ -431,7 +459,10 @@ mod tests {
             take_profit: None,
         };
         let auth_auto = base;
-        let auth_co = VenuePolicy { authority: AuthorityRequirement::CoSigned, ..base };
+        let auth_co = VenuePolicy {
+            authority: AuthorityRequirement::CoSigned,
+            ..base
+        };
 
         // Autonomous: execute now, nonce = old + 1.
         let (regime, expected) = guard_act(&auth_auto, 7).unwrap();
@@ -449,14 +480,17 @@ mod tests {
     fn solver_reaches_safe_buffer() {
         // Not safe to do nothing (collateral 45m < target 52.5m) but full close
         // leaves positive equity (fee 0.1m + pnl 0), so a partial close restores it.
-        let collateral = 45 * SCALE as u128;
+        let collateral = 45 * SCALE;
         let size = 100 * SCALE as i128;
-        let entry = 50 * SCALE as u128;
-        let current = 50 * SCALE as u128;   // pnl = 0
-        let margin_bps = 5000;              // req full = 50% * $100 = $50, target = $52.5
-        let buffer_bps = 500;               // target = 1.05 * 50 = 52.5
+        let entry = 50 * SCALE;
+        let current = 50 * SCALE; // pnl = 0
+        let margin_bps = 5000; // req full = 50% * $100 = $50, target = $52.5
+        let buffer_bps = 500; // target = 1.05 * 50 = 52.5
         let fee_bps = 10;
-        let f = solve_partial_close_fraction(collateral, size, entry, current, margin_bps, buffer_bps, fee_bps).unwrap();
+        let f = solve_partial_close_fraction(
+            collateral, size, entry, current, margin_bps, buffer_bps, fee_bps,
+        )
+        .unwrap();
         assert!(f > 0);
         assert!(f <= BPS_DENOM);
     }
@@ -465,14 +499,16 @@ mod tests {
     fn solver_escalates_when_unsalvageable() {
         // Equity after FULL close = collateral - fee + pnl is still negative,
         // so no fraction can restore the buffer => escalate.
-        let collateral = 100 * SCALE as u128;
+        let collateral = 100 * SCALE;
         let size = 1_000 * SCALE as i128;
-        let entry = 50 * SCALE as u128;
-        let current = 1 * SCALE as u128;      // pnl = -49,000m; collateral 100m can't cover the loss
+        let entry = 50 * SCALE;
+        let current = SCALE; // pnl = -49,000m; collateral 100m can't cover the loss
         let margin_bps = 500;
         let buffer_bps = 500;
         let fee_bps = 0;
-        let err = solve_partial_close_fraction(collateral, size, entry, current, margin_bps, buffer_bps, fee_bps);
+        let err = solve_partial_close_fraction(
+            collateral, size, entry, current, margin_bps, buffer_bps, fee_bps,
+        );
         assert_eq!(err.unwrap_err(), WickError::CannotReachSafeBuffer);
     }
 
@@ -488,29 +524,35 @@ mod tests {
                 partial_close_usd_per_action: u128::MAX,
                 daily_total_usd: u128::MAX,
             },
-            take_profit: Some(60 * SCALE as u128),
+            take_profit: Some(60 * SCALE),
         };
         // Breached and TP crossed -> TakeProfit wins.
         let h = HealthSnapshot {
-            collateral: 50 * SCALE as u128,
+            collateral: 50 * SCALE,
             size: 100 * SCALE as i128,
-            entry: 50 * SCALE as u128,
-            current_price: 61 * SCALE as u128,
+            entry: 50 * SCALE,
+            current_price: 61 * SCALE,
         };
-        assert_eq!(select_action(&h, &policy, 5, 4).unwrap(), Some(Action::TakeProfit));
+        assert_eq!(
+            select_action(&h, &policy, 5, 4).unwrap(),
+            Some(Action::TakeProfit)
+        );
 
         // Replay nonce -> None even if breached.
         assert_eq!(select_action(&h, &policy, 4, 4).unwrap(), None);
 
         // Breached, TP not crossed, top-up within cap -> TopUp.
         let h2 = HealthSnapshot {
-            collateral: 50 * SCALE as u128,
+            collateral: 50 * SCALE,
             size: 100 * SCALE as i128,
-            entry: 50 * SCALE as u128,
-            current_price: 49 * SCALE as u128,
+            entry: 50 * SCALE,
+            current_price: 49 * SCALE,
         };
         // equity = 50 + (100 * -1) = -50 -> deficit = req(5) - (-50) = 55
-        assert!(matches!(select_action(&h2, &policy, 5, 4).unwrap(), Some(Action::TopUp { .. })));
+        assert!(matches!(
+            select_action(&h2, &policy, 5, 4).unwrap(),
+            Some(Action::TopUp { .. })
+        ));
 
         // Over-cap -> escalate rather than silent no-op.
         let tight = VenuePolicy {
@@ -521,6 +563,9 @@ mod tests {
             },
             ..policy
         };
-        assert_eq!(select_action(&h2, &tight, 5, 4).unwrap(), Some(Action::EscalateManualReview));
+        assert_eq!(
+            select_action(&h2, &tight, 5, 4).unwrap(),
+            Some(Action::EscalateManualReview)
+        );
     }
 }

@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  SOLANA_VERSION: 4.0.3
+
+jobs:
+  check-format:
+    name: Format (rustfmt)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: rustfmt
+      - name: Check formatting (guard)
+        working-directory: program
+        run: cargo fmt --check
+      - name: Check formatting (mock flash)
+        working-directory: program/mocks/flash
+        run: cargo fmt --check
+
+  lint:
+    name: Lint (clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: clippy
+      - name: Clippy (guard)
+        working-directory: program
+        run: cargo clippy --features no-entrypoint --all-targets -- -D warnings
+      - name: Clippy (mock flash)
+        working-directory: program/mocks/flash
+        run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: Build-SBF + tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Host Rust for `cargo test` (litesvm runs on host) + clippy/fmt already
+      # covered above; a stable toolchain matching rust-version is enough for tests.
+      - uses: dtolnay/rust-toolchain@1.97.1
+
+      # Solana CLI provides cargo-build-sbf (SBF target + sbf-tools auto-download).
+      - name: Install Solana CLI (${{ env.SOLANA_VERSION }})
+        run: |
+          curl -sSfL https://release.anza.xyz/v${SOLANA_VERSION}/install | sh
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+
+      - name: Cache SBF toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/solana
+          key: sbf-tools-${{ env.SOLANA_VERSION }}
+
+      - name: Build guard SBF
+        working-directory: program
+        run: cargo build-sbf
+
+      - name: Build mock flash SBF
+        working-directory: program/mocks/flash
+        run: cargo build-sbf
+
+      - name: Run tests
+        working-directory: program
+        run: cargo test --features no-entrypoint --all-targets

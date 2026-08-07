@@ -37,10 +37,7 @@ const INTENT_BUNDLE_DATA_BUF_SIZE: usize = 512;
 ///   8. `[optional]` ER validator to target
 ///
 /// `data` = `[bump]`, the guard PDA bump.
-pub fn process_delegate(
-    accounts: &[AccountView],
-    data: &[u8],
-) -> ProgramResult {
+pub fn process_delegate(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
     let bump = *data.first().ok_or(WickError::InvalidInstruction)?;
 
     let [payer, guard, owner_program, buffer, record, metadata, _delegation_program, system_program, rest @ ..] =
