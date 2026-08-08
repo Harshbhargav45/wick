@@ -356,13 +356,14 @@ venue. `flash.rs`, `mocks/flash/`, the `VENUE_FLASH` path, and the Flash e2e
 tests were deleted in the Drift relaunch. §8.7.2 is now the sole autonomous
 adapter; the historical wire format is preserved in git history.
 
-#### 8.7.2 Drift (autonomous tier, hard reduce-only)
+#### 8.7.2 Velocity (autonomous tier, hard reduce-only)
 
-Drift perps are the Flash successor for the autonomous tier. `drift.rs`
-encodes `place_perp_order` from the `velocity-exchange/protocol-v2` source:
+Velocity perps (the successor to decommissioned Drift v2) are the Flash
+successor for the autonomous tier. `drift.rs` encodes `place_perp_order` from
+the `velocity-exchange/protocol-v2` source:
 
 ```text
-data = 8-byte discr + 32-byte OrderParams (borsh, optionals None):
+data = 8-byte discr + 34-byte OrderParams (borsh, optionals None):
   [8]  order_type              = Market             (ORDER_TYPE_MARKET=0)
   [9]  market_type             = Perp              (MARKET_TYPE_PERP=1)
   [10] direction               = Long(0)/Short(1)  (reduces vs. guarded side)
@@ -372,12 +373,14 @@ data = 8-byte discr + 32-byte OrderParams (borsh, optionals None):
   [28..30] market_index        (u16 LE)   ← pinned in guard state at init
   [30] reduce_only = true                ← hard-coded in the serializer
   [31..40] post_only / notifications    (== None/0)
+  [40..42] builder_idx / builder_fee_tenth_bps (Option: None)
 accounts: state(ro) → user(w, crate::processor) → authority(Signer) → [remaining…]
 ```
 
-- **Program ID:** `dRiftyHA39MWEi3m9aunc5MzRF1JYuBsbn6VPcn33UH` (pinned by
-  byte-exact test `drift_program_id_is_drift`, verified against
-  `wrap_drift::declare_id!`).
+- **Program ID:** `vELoC1audYbSYVRXn1vPaV8Axoa9oU6BYmNGZZBDZ1P` (live
+  Velocity `declare_id!`; the decommissioned `dRifty...` id is retired). The
+  e2e proof (`real_drift.rs`) loads the real velocity BPF ELF, not a mock,
+  and runs the reduce against real mainnet account fixtures.
 - **Account order** (verified from source): `state` (`Box<Account<State>>`,
   readonly) → `user` (`AccountLoader<User>`, writable, PDA
   `["user", authority, sub_account_id.to_le_bytes()]`) → `authority`
@@ -385,7 +388,7 @@ accounts: state(ro) → user(w, crate::processor) → authority(Signer) → [rem
   oracle, perp/spot maps…) appended in SDK order.
 - **Delegation model** (verified from `available via can_sign_for_user` in
   `instructions/constraints.rs`): the venue owner sets the **guard PDA as
-  `User.delegate`** off-chain; the guard PDA signs as `authority`. Drift
+  `User.delegate`** off-chain; the guard PDA signs as `authority`. Velocity
   guarantees delegates **cannot withdraw funds**, but does **not** scope
   order placement — the hard reduce-only edit is what prevents
   sticky/full-position orders. The mock Drift in `mocks/drift/` models this

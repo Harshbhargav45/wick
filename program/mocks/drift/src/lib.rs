@@ -22,12 +22,14 @@ pub const PLACE_PERP_ORDER_DISCRIMINATOR: [u8; 8] = [69, 161, 93, 202, 120, 126,
 pub const REDUCED_MARKER: [u8; 6] = *b"REDUCE";
 
 /// Byte offset of `User.delegate` in Drift's zero-copy `User` layout.
-/// `User { authority: Pubkey, delegate: Pubkey, ... }`.
-const DELEGATE_OFFSET: usize = 32;
+/// Anchor prefix (8) + `authority: Pubkey` (32) => delegate at 8 + 32 = 40.
+/// Verified against `state/user.rs`: `User { authority, delegate, ... }`.
+const DELEGATE_OFFSET: usize = 40;
 
-/// Byte offset of `reduce_only` within the 40-byte `place_perp_order` data
-/// (8-byte discriminator + borsh `OrderParams`; `reduce_only: bool` sits at
-/// byte 30). Must match `drift.rs::ReduceOrderParams::try_to_data`.
+/// Byte offset of `reduce_only` within the 42-byte `place_perp_order` data
+/// (8-byte discriminator + 34-byte borsh `OrderParams`; `reduce_only: bool`
+/// sits at byte 30, unchanged from Drift's layout — Velocity only trails two
+/// extra `Option` fields). Must match `drift.rs::ReduceOrderParams::try_to_data`.
 const REDUCE_ONLY_OFFSET: usize = 30;
 
 program_entrypoint!(process_instruction);

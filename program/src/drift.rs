@@ -1,24 +1,33 @@
-//! Drift Protocol venue adapter — autonomous hard reduce-only tier (§8.7).
+//! Drift venue adapter — autonomous hard reduce-only tier (§8.7).
 //!
-//! This module encodes the exact instruction data and account layout
-//! taken from the Drift `protocol-v2` source (`velocity-exchange/protocol-v2`):
+//! This module encodes the exact instruction data and account layout taken
+//! from the live successor of Drift Protocol v2 (`velocity-exchange/protocol-v2`),
+//! deployed as **Velocity** (`vELoC1...`). The `dRifty...` program was
+//! decommissioned after the 2026 exploit and its on-chain binary now only
+//! handles withdrawals; the only live program that still executes
+//! `place_perp_order` is Velocity (same program ABI, new program ID).
 //!
 //! * Anchor 8-byte discriminator `sha256("global:place_perp_order")[..8]`.
 //!
 //! * `OrderParams` borsh layout per `state/order_params.rs` (anchor 0.29 /
 //!   borsh 0.10: unit enums serialize as one u8, `Option::None` as a zero tag).
+//!   Velocity's `OrderParams` gained two trailing fields over Drift's —
+//!   `builder_idx: Option<u8>`, `builder_fee_tenth_bps: Option<u16>` — so the
+//!   all-`None` params are 34 bytes, not 32.
 //!
 //! * Fixed account order (`PlaceOrder` in `instructions/user.rs`), followed by
-//!   Drift's `remaining_accounts` (perp market, oracle, spot markets, user maps
-//!   in SDK order):
+//!   the program's `remaining_accounts` (perp market, oracles, spot market in
+//!   SDK order — `getRemainingAccounts` emits oracles, then spot markets, then
+//!   perp markets):
 //!
 //!   0. `state` — `Account<State>` (readonly)
-//!   1. `user` — `AccountLoader<User>` (writable; PDSA seeds
+//!   1. `user` — `AccountLoader<User>` (writable; PDA seeds
 //!      `["user", authority, sub_account_id.to_le_bytes()]`)
-//!   2. `authority` — `Signer`; Drift accepts it iff `can_sign_for_user`:
+//!   2. `authority` — `Signer`; the program accepts it iff `can_sign_for_user`:
 //!      `user.authority == signer || (user.delegate == signer &&
 //!      user.delegate != default)`. Wick signs as the guard PDA which the user
-//!      has set as their delegate.
+//!      has set as their delegate. (`User.delegate` sits at data offset 40:
+//!      8-byte Anchor discriminator + `authority` Pubkey.)
 //!
 //! The guard passes the remaining tail through unchanged — it only ever builds
 //! a reduce-only order, hard by construction. The guard never allows the order
@@ -35,21 +44,24 @@ use crate::error::WickError;
 /// `state.venue` tag for the Drift adapter.
 pub const VENUE_DRIFT: u8 = 3;
 
-/// Drift Protocol program ID (mainnet & devnet).
+/// Drift venue program ID — the **live** successor to the decommissioned
+/// `dRifty...` program.
 ///
-/// `dRiftyHA39MWEi3m9aunc5MzRF1JYuBsbn6VPcn33UH` — from Drift's
+/// `vELoC1audYbSYVRXn1vPaV8Axoa9oU6BYmNGZZBDZ1P` — from Velocity's
 /// `programs/drift/src/lib.rs` `declare_id!`.
 pub const DRIFT_PROGRAM_ID: Address = Address::new_from_array([
-    9, 84, 219, 190, 158, 201, 96, 201, 138, 122, 41, 63, 226, 19, 54, 150, 111, 225, 128, 209, 81,
-    174, 75, 129, 121, 86, 31, 137, 133, 74, 83, 246,
+    13, 162, 222, 50, 93, 130, 241, 222, 120, 205, 77, 177, 103, 33, 15, 103, 45, 147, 250, 167,
+    129, 184, 165, 217, 84, 183, 159, 1, 88, 249, 227, 150,
 ]);
 
 /// Anchor discriminator of `global:place_perp_order`.
 pub const PLACE_PERP_ORDER_DISCRIMINATOR: [u8; 8] = [69, 161, 93, 202, 120, 126, 76, 185];
 
-/// Total serialized size of the reduce order: 8-byte discriminator + 32-byte
-/// `OrderParams` (all optional `Option::None`).
-pub const REDUCE_ORDER_DATA_LEN: usize = 8 + 32;
+/// Total serialized size of the reduce order: 8-byte discriminator + 34-byte
+/// `OrderParams` (all optional `Option::None`). Velocity's `OrderParams` adds
+/// `builder_idx: Option<u8>` and `builder_fee_tenth_bps: Option<u16>` after
+/// Drift's 32-byte layout.
+pub const REDUCE_ORDER_DATA_LEN: usize = 8 + 34;
 
 /// Order params borsh enums (pinned from `order_params.rs`), each 1 u8 in borsh.
 const ORDER_TYPE_MARKET: u8 = 0; // OrderType::Market
@@ -104,10 +116,12 @@ impl ReduceOrderParams {
         // [33] max_ts Option<i64> = None (0)
         // [34] trigger_price Option<u64> = None (0)
         d[35] = TRIGGER_COND_ABOVE; // trigger_condition (u8)
-                                    // [36] oracle_price_offset Option<i32> = None (0)
+                                    // [36] oracle_price_offset Option<i64> = None (0)
                                     // [37] auction_duration Option<u8> = None (0)
                                     // [38] auction_start_price Option<i64> = None (0)
                                     // [39] auction_end_price Option<i64> = None (0)
+                                    // [40] builder_idx Option<u8> = None (0) — Velocity-only
+                                    // [41] builder_fee_tenth_bps Option<u16> = None (0) — Velocity-only
         Ok(d)
     }
 }
@@ -197,11 +211,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn drift_program_id_is_drift() {
+    fn drift_program_id_is_velocity() {
         assert_eq!(DRIFT_PROGRAM_ID.to_bytes(), {
             [
-                9, 84, 219, 190, 158, 201, 96, 201, 138, 122, 41, 63, 226, 19, 54, 150, 111, 225,
-                128, 209, 81, 174, 75, 129, 121, 86, 31, 137, 133, 74, 83, 246,
+                13, 162, 222, 50, 93, 130, 241, 222, 120, 205, 77, 177, 103, 33, 15, 103, 45, 147,
+                250, 167, 129, 184, 165, 217, 84, 183, 159, 1, 88, 249, 227, 150,
             ]
         });
     }
@@ -239,6 +253,7 @@ mod tests {
         assert_eq!(data[35], 0); // trigger condition default
         assert!(data[33..35].iter().all(|&b| b == 0)); // max_ts / trigger None
         assert!(data[36..40].iter().all(|&b| b == 0)); // remaining None
+        assert!(data[40..42].iter().all(|&b| b == 0)); // velocity builder fields None
     }
 
     #[test]

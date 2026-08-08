@@ -149,22 +149,18 @@ The guard's margin wallet is a 2-of-2 (`user` + `co_authority`) — see §8.5.
   Jupiter closes are not yet expressed as a signed instruction — the guard holds
   those as pending state only. The full co-signed loop for breach protection
   still needs its safety-net build to close.
-- **No frontend/dashboard yet** — guard state is readable on-chain but there is
-  no UI or latency chart.
+- **Dashboard is a static scaffold** — the frontend exists with console/health/
+  activity components but no live on-chain state or latency chart yet.
 - **No measured latency benchmark** — the autonomous path is proven in an SBF
-  VM, but a real sub-50ms claim against a live L1 baseline is not yet measured.
+  VM and against the real Velocity program, but a real sub-50ms claim against
+  a live L1 baseline is not yet measured.
 - **No deployed devnet program** — the ER delegate/commit/undelegate round-trip
   is implemented as SDK hooks but not exercised against a live MagicBlock
   rollup.
 - **Drift reduce adapter covers reduce-only orders (hard-coded)** — top-up and
   arbitrary-position orders are structurally impossible (the serializer writes
   `reduce_only=true`); a zero-size reduce escalates. Drift `market_index` +
-  `subaccount_id` are pinned in guard state at init. The Drift venue CPI is
-  **not yet exercised against a live protocol** — the e2e tick test runs
-  against a mock Drift program that models the delegate-PDA signer invariant,
-  not Drift's deployed program.
-- **Mock venue in tests** — the e2e CPI runs against a mock Drift program that
-  models the delegate-PDA signer invariant, not the real protocol deployment.
+  `subaccount_id` are pinned in guard state at init.
 
 ## Roadmap
 
@@ -175,7 +171,7 @@ The guard's margin wallet is a 2-of-2 (`user` + `co_authority`) — see §8.5.
 - [x] Phase 3.5 — owner `Confirm` instruction to land the pending Jupiter instruction + commit nonce
 - [x] Phase 4 — verified Pyth `PriceUpdateV2` accessor (feed/staleness/confidence gates + 6dp scaling)
 - [x] Phase 6 — Drift reduce-only `place_perp_order` adapter + delegate-PDA mock e2e (autonomous tier, §8.7)
-- [ ] Phase 6.5 — Drift reduces against a real protocol (replace mock receiver in e2e tick tests)
+- [x] Phase 6.5 — live-protocol proof: autonomous reduce against the real Velocity (`vELoC1...`) program in LiteSVM with real mainnet account fixtures
 - [ ] Phase 5 — dashboard (real latency chart first, then state panels)
 - [ ] Deployment — devnet program, live ER delegation round-trip, latency benchmark
 

@@ -27,8 +27,9 @@ use std::path::PathBuf;
 
 /// Address where the guard `.so` is deployed for the test.
 const PROGRAM_ID: &str = "US517G5965aydkZ46HS38QLi7UQiSojurfbQfKCELFx";
-/// Real Drift Protocol program id — the mock is deployed at this address.
-const DRIFT_PROGRAM_ID: &str = "dRiftyHA39MWEi3m9aunc5MzRF1JYuBsbn6VPcn33UH";
+/// Real Velocity (Drift successor) program id — the mock is deployed at this
+/// address, matching the address the guard's drift adapter CPIs to.
+const DRIFT_PROGRAM_ID: &str = "vELoC1audYbSYVRXn1vPaV8Axoa9oU6BYmNGZZBDZ1P";
 const CLOCK_SYSVAR: &str = "SysvarC1ock11111111111111111111111111111111";
 const RENT_SYSVAR: &str = "SysvarRent111111111111111111111111111111111";
 const SYSTEM_PROGRAM: &str = "11111111111111111111111111111111";
@@ -38,8 +39,9 @@ const GUARD_SEED: &[u8] = b"guard";
 /// Marker the mock Drift program writes into the user account on a reduce.
 const REDUCED_MARKER: [u8; 6] = *b"REDUCE";
 
-/// Byte offset of `User.delegate` in Drift's zero-copy `User` layout.
-const DELEGATE_OFFSET: usize = 32;
+/// Byte offset of `User.delegate` in Drift's zero-copy `User` layout:
+/// 8-byte Anchor discriminator + `authority: Pubkey` (32) => 40.
+const DELEGATE_OFFSET: usize = 40;
 
 /// litesvm boots the clock at `MAINNET_DEFAULT_SLOT` (~435M), but the guard
 /// initializes `last_check_slot` to 0. A tick arriving at that real slot is
