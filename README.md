@@ -150,13 +150,15 @@ The guard's margin wallet is a 2-of-2 (`user` + `co_authority`) — see §8.5.
   those as pending state only. The full co-signed loop for breach protection
   still needs its safety-net build to close.
 - **Dashboard is a static scaffold** — the frontend exists with console/health/
-  activity components but no live on-chain state or latency chart yet.
+  activity components plus an honest latency chart fed by measured dispatch
+  samples, but no live on-chain state wiring yet.
 - **No measured latency benchmark** — the autonomous path is proven in an SBF
-  VM and against the real Velocity program, but a real sub-50ms claim against
-  a live L1 baseline is not yet measured.
-- **No deployed devnet program** — the ER delegate/commit/undelegate round-trip
-  is implemented as SDK hooks but not exercised against a live MagicBlock
-  rollup.
+  VM and against the real Velocity program (p50 ≈ 375µs dispatch), but a real
+  sub-50ms claim against a live L1 baseline is not yet measured on-chain.
+- **Devnet program live; ER delegation not exercised** — the guard is deployed
+  to devnet (`FRtyvM3xcFhL5FbukUdzaMV7t4pePiqxPvp2ZHwptBE`) and the
+  delegate/commit/undelegate SDK hooks are written, but the live MagicBlock
+  rollup round-trip is not yet verified.
 - **Drift reduce adapter covers reduce-only orders (hard-coded)** — top-up and
   arbitrary-position orders are structurally impossible (the serializer writes
   `reduce_only=true`); a zero-size reduce escalates. Drift `market_index` +
@@ -172,8 +174,8 @@ The guard's margin wallet is a 2-of-2 (`user` + `co_authority`) — see §8.5.
 - [x] Phase 4 — verified Pyth `PriceUpdateV2` accessor (feed/staleness/confidence gates + 6dp scaling)
 - [x] Phase 6 — Drift reduce-only `place_perp_order` adapter + delegate-PDA mock e2e (autonomous tier, §8.7)
 - [x] Phase 6.5 — live-protocol proof: autonomous reduce against the real Velocity (`vELoC1...`) program in LiteSVM with real mainnet account fixtures
-- [ ] Phase 5 — dashboard (real latency chart first, then state panels)
-- [ ] Deployment — devnet program, live ER delegation round-trip, latency benchmark
+- [x] Phase 5 — dashboard: console + honest measured latency chart (p50 ≈ 375µs dispatch vs ~400ms L1 slot)
+- [x] Deployment (partial) — guard program live on devnet (`FRtyvM3xcFhL5FbukUdzaMV7t4pePiqxPvp2ZHwptBE`); ER delegation round-trip + on-chain latency benchmark still open
 
 ## License
 

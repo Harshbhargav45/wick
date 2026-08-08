@@ -128,17 +128,15 @@ fn synthetic_user(delegate: Address) -> Vec<u8> {
     data[sp + 32..sp + 34].copy_from_slice(&0u16.to_le_bytes());
     data[sp + 34] = 0; // balance_type = Deposit
     data[sp + 35] = 0; // open_orders
-    // perp_positions[0]: long on perp market 0. base_asset_amount@+8 = size,
-    // market_index@+76 = 0.
+                       // perp_positions[0]: long on perp market 0. base_asset_amount@+8 = size,
+                       // market_index@+76 = 0.
     let pp = PERP_POSITIONS_OFFSET;
     data[pp + 8..pp + 16].copy_from_slice(&PERP_BASE_ASSET_AMOUNT.to_le_bytes());
     data[pp + PERP_POSITION_MARKET_INDEX_OFFSET..pp + PERP_POSITION_MARKET_INDEX_OFFSET + 2]
         .copy_from_slice(&0u16.to_le_bytes());
     // next_order_id = 1 (fresh user).
-    data[NEXT_ORDER_ID_OFFSET..NEXT_ORDER_ID_OFFSET + 4]
-        .copy_from_slice(&1u32.to_le_bytes());
-    data[DELEGATE_OFFSET + 32..DELEGATE_OFFSET + 34]
-        .copy_from_slice(&[0, 0]); // padding stays zero
+    data[NEXT_ORDER_ID_OFFSET..NEXT_ORDER_ID_OFFSET + 4].copy_from_slice(&1u32.to_le_bytes());
+    data[DELEGATE_OFFSET + 32..DELEGATE_OFFSET + 34].copy_from_slice(&[0, 0]); // padding stays zero
     data
 }
 
@@ -177,8 +175,11 @@ fn set_drift_accounts(
         rent_epoch: 0,
     };
 
-    svm.set_account(state_addr, mk(read_fixture("velocity_state.bin"), state_addr))
-        .unwrap();
+    svm.set_account(
+        state_addr,
+        mk(read_fixture("velocity_state.bin"), state_addr),
+    )
+    .unwrap();
     svm.set_account(
         perp_addr,
         mk(read_fixture("velocity_perp_market_0.bin"), perp_addr),
@@ -211,7 +212,14 @@ fn set_drift_accounts(
     )
     .unwrap();
 
-    (state_addr, user_addr, sol_oracle_addr, usdc_oracle_addr, spot_addr, perp_addr)
+    (
+        state_addr,
+        user_addr,
+        sol_oracle_addr,
+        usdc_oracle_addr,
+        spot_addr,
+        perp_addr,
+    )
 }
 
 #[test]
@@ -226,7 +234,8 @@ fn autonomous_tick_places_reduce_with_real_velocity_program() {
     svm.add_program(program_id, &read_so("target/deploy/wick_guard.so"))
         .unwrap();
     // REAL Velocity program — decompressed from the vendored gzip fixture.
-    svm.add_program(drift_id, &decompress_velocity_so()).unwrap();
+    svm.add_program(drift_id, &decompress_velocity_so())
+        .unwrap();
 
     let owner_kp = Keypair::new();
     let owner = owner_kp.pubkey();
@@ -276,6 +285,7 @@ fn autonomous_tick_places_reduce_with_real_velocity_program() {
     // --- Warp the clock so Velocity's markets are freshly posted. ---
     svm.warp_to_slot(TICK_SLOT);
 
+    #[allow(clippy::too_many_arguments)]
     fn build_tick(
         program_id: Address,
         guard_pda: Address,
@@ -314,7 +324,16 @@ fn autonomous_tick_places_reduce_with_real_velocity_program() {
     // Warmup tick at TICK_SLOT: guard cold-start (last_check_slot=0) so this is
     // judged stale and only rolls in the freshness anchor.
     let warm_ix = build_tick(
-        program_id, guard_pda, clock, state, user, oracle_sol, oracle_usdc, spot, perp, drift_id,
+        program_id,
+        guard_pda,
+        clock,
+        state,
+        user,
+        oracle_sol,
+        oracle_usdc,
+        spot,
+        perp,
+        drift_id,
         bump,
     );
     svm.send_transaction(Transaction::new(
@@ -327,7 +346,16 @@ fn autonomous_tick_places_reduce_with_real_velocity_program() {
     // Dispatch tick: last_check_slot == TICK_SLOT ⇒ fresh; breach ⇒
     // TopUp→cap→PartialClose ⇒ autonomous real-velocity reduce.
     let tick = build_tick(
-        program_id, guard_pda, clock, state, user, oracle_sol, oracle_usdc, spot, perp, drift_id,
+        program_id,
+        guard_pda,
+        clock,
+        state,
+        user,
+        oracle_sol,
+        oracle_usdc,
+        spot,
+        perp,
+        drift_id,
         bump,
     );
     let tx = Transaction::new(
@@ -356,7 +384,11 @@ fn autonomous_tick_places_reduce_with_real_velocity_program() {
     assert_eq!(next_id, 2, "real velocity must record the reduce order");
     let order0 = ORDERS_OFFSET;
     assert_eq!(user_after.data[order0 + 86], 1, "order must be Open");
-    assert_eq!(user_after.data[order0 + 91], 1, "reduce of a long must be Short");
+    assert_eq!(
+        user_after.data[order0 + 91],
+        1,
+        "reduce of a long must be Short"
+    );
     assert_eq!(user_after.data[order0 + 92], 1, "order must be reduce-only");
 }
 

@@ -103,8 +103,7 @@ fn synthetic_user(delegate: Address) -> Vec<u8> {
     data[pp + 8..pp + 16].copy_from_slice(&PERP_BASE_ASSET_AMOUNT.to_le_bytes());
     data[pp + PERP_POSITION_MARKET_INDEX_OFFSET..pp + PERP_POSITION_MARKET_INDEX_OFFSET + 2]
         .copy_from_slice(&0u16.to_le_bytes());
-    data[NEXT_ORDER_ID_OFFSET..NEXT_ORDER_ID_OFFSET + 4]
-        .copy_from_slice(&1u32.to_le_bytes());
+    data[NEXT_ORDER_ID_OFFSET..NEXT_ORDER_ID_OFFSET + 4].copy_from_slice(&1u32.to_le_bytes());
     data
 }
 
@@ -159,7 +158,14 @@ fn set_velocity_accounts(
     )
     .unwrap();
 
-    (state_addr, user_addr, sol_oracle_addr, usdc_oracle_addr, spot_addr, perp_addr)
+    (
+        state_addr,
+        user_addr,
+        sol_oracle_addr,
+        usdc_oracle_addr,
+        spot_addr,
+        perp_addr,
+    )
 }
 
 #[test]
@@ -174,7 +180,8 @@ fn measure_autonomous_tick_dispatch_latency() {
     let mut svm = LiteSVM::new().with_sigverify(false);
     svm.add_program(program_id, &read_so("target/deploy/wick_guard.so"))
         .unwrap();
-    svm.add_program(drift_id, &decompress_velocity_so()).unwrap();
+    svm.add_program(drift_id, &decompress_velocity_so())
+        .unwrap();
 
     let owner_kp = Keypair::new();
     let owner = owner_kp.pubkey();
@@ -196,7 +203,11 @@ fn measure_autonomous_tick_dispatch_latency() {
         data: init_data(bump),
     };
     let h = svm.latest_blockhash();
-    let tx = Transaction::new(&[&owner_kp], Message::new_with_blockhash(&[init_ix], Some(&owner), &h), h);
+    let tx = Transaction::new(
+        &[&owner_kp],
+        Message::new_with_blockhash(&[init_ix], Some(&owner), &h),
+        h,
+    );
     svm.send_transaction(tx).expect("InitGuard failed");
 
     // --- UpdatePosition: underwater position that a breach tick must reduce ---
@@ -213,7 +224,11 @@ fn measure_autonomous_tick_dispatch_latency() {
         data: upd,
     };
     let h = svm.latest_blockhash();
-    let tx = Transaction::new(&[&owner_kp], Message::new_with_blockhash(&[upd_ix], Some(&owner), &h), h);
+    let tx = Transaction::new(
+        &[&owner_kp],
+        Message::new_with_blockhash(&[upd_ix], Some(&owner), &h),
+        h,
+    );
     svm.send_transaction(tx).expect("UpdatePosition failed");
 
     // --- Real Velocity accounts (oracles at their mainnet pubkeys) ---
@@ -238,9 +253,9 @@ fn measure_autonomous_tick_dispatch_latency() {
                 AccountMeta::new(guard_pda, false),            // [4] authority = guard PDA
                 AccountMeta::new_readonly(oracle_sol, false),  // [5] perp oracle
                 AccountMeta::new_readonly(oracle_usdc, false), // [6] spot oracle
-                AccountMeta::new_readonly(spot, false),         // [7] spot market 0
-                AccountMeta::new_readonly(perp, false),         // [8] perp market 0
-                AccountMeta::new_readonly(drift_id, false),     // [9] CPI target
+                AccountMeta::new_readonly(spot, false),        // [7] spot market 0
+                AccountMeta::new_readonly(perp, false),        // [8] perp market 0
+                AccountMeta::new_readonly(drift_id, false),    // [9] CPI target
             ],
             data,
         }
@@ -248,7 +263,11 @@ fn measure_autonomous_tick_dispatch_latency() {
 
     let build_tx = |blockhash| {
         let ix = build_tick();
-        Transaction::new(&[&owner_kp], Message::new_with_blockhash(&[ix], Some(&owner), &blockhash), blockhash)
+        Transaction::new(
+            &[&owner_kp],
+            Message::new_with_blockhash(&[ix], Some(&owner), &blockhash),
+            blockhash,
+        )
     };
 
     // Warmup tick (cold-start freshness anchor) — not measured.
@@ -290,11 +309,7 @@ fn measure_autonomous_tick_dispatch_latency() {
     }
     std::fs::write(&out, json).expect("write latency samples");
 
-    println!(
-        "wrote {} samples -> {}",
-        samples.len(),
-        out.display()
-    );
+    println!("wrote {} samples -> {}", samples.len(), out.display());
     println!("p50={p50}us p99={p99}us min={min}us max={max}us (L1 slot baseline ~400ms)");
 
     // The core claim: the median dispatch is far under the 50ms target.
@@ -307,7 +322,10 @@ fn measure_autonomous_tick_dispatch_latency() {
 fn send_timed(
     svm: &mut LiteSVM,
     tx: Transaction,
-) -> (Result<(), litesvm::types::FailedTransactionMetadata>, Duration) {
+) -> (
+    Result<(), litesvm::types::FailedTransactionMetadata>,
+    Duration,
+) {
     let start = Instant::now();
     let res = svm.send_transaction(tx);
     let dt = start.elapsed();
