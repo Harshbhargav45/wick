@@ -15,9 +15,11 @@ Existing perp protocols generally require the position **owner's signature** on
 every state change, which makes truly autonomous protection architecturally
 impossible there. Wick does not fake autonomy:
 
-- **Autonomous tier** (FlashTrade): the guard PDA *is* the position owner. Once
-  the guard PDA is delegated to a MagicBlock Ephemeral Rollup, it signs and
-  executes protective actions itself — this is the sub-50ms path.
+- **Autonomous tier** (Drift perps): the guard PDA *is* the position
+  delegate. It signs a reduce-only order itself and executes protective
+  actions autonomously on breach — the sub-50ms path. (Legacy FlashTrade
+  `close_position` CPI remains as `flash.rs`, winding down in favor of
+  Drift.)
 - **Co-signed tier** (Jupiter): the guard builds the owner-signed instruction
   and holds it as *pending*; the owner's signature is what lands it. The guard
   never claims to be faster than it is.
@@ -41,7 +43,8 @@ selector, and one nonce/replay model.
     │   │                        #   dispatch regimes (§8.1–8.4)
     │   ├── account.rs           # deterministic wire-format serialization
     │   ├── delegation.rs        # MagicBlock ER delegate/commit/undelegate (§8.6)
-    │   ├── flash.rs             # FlashTrade close_position CPI adapter (§8.7)
+    │   ├── flash.rs             # FlashTrade close_position CPI adapter (§8.7.1, legacy)
+    │   ├── drift.rs             # Drift reduce-only place_perp_order CPI adapter (§8.7.2)
     │   └── error.rs             # WickError
     ├── tests/
     │   ├── init.rs              # litesvm e2e: InitGuard → DepositMargin
@@ -74,14 +77,16 @@ cd program
 cargo test --features no-entrypoint --all-targets
 ```
 
-This runs 56 unit tests + 3 litesvm integration tests:
+This runs 62 unit tests + 3 litesvm integration tests:
 
-- **56 unit tests** — fixed-point health engine, breach detection, partial-close
+- **62 unit tests** — fixed-point health engine, breach detection, partial-close
   solver, action selection precedence + caps, 2-of-2 withdraw matrix, tick
   freshness/degraded mode, nonce semantics, serialization round-trips, Jupiter
   safety-net serialization + co-signed build persistence, the owner `Confirm`
-  commit path + its rejection matrix, and the verified Pyth `PriceUpdateV2`
-  accessor (feed/staleness/confidence gates + 6dp scaling).
+  commit path + its rejection matrix, the verified Pyth `PriceUpdateV2`
+  accessor (feed/staleness/confidence gates + 6dp scaling), and the Drift
+  adapter (program ID, discriminator, reduce-only wire layout, direction
+  mapping, missing-account rejection).
 - **1 litesvm integration test** (`init.rs`) — `InitGuard` CPI-create + deposit.
 - **2 litesvm e2e tests** (`tick.rs`):
   - *Autonomous*: an underwater position on a breach tick triggers the guard
@@ -125,11 +130,13 @@ The guard's margin wallet is a 2-of-2 (`user` + `co_authority`) — see §8.5.
 
 ## Demo narrative
 
-1. Open a position on FlashTrade with the guard PDA as owner, enroll it via
-   `InitGuard` + `UpdatePosition`, delegate the PDA to the Ephemeral Rollup.
+1. Open a position on Drift with the guard PDA set as `User.delegate`, enroll
+   it via `InitGuard` + `UpdatePosition` with the pinned market/sub-account,
+   delegate the PDA to the Ephemeral Rollup.
 2. Feed a breach price tick.
-3. The guard evaluates health → selects a protective action → CPIs
-   `close_position` signed by its own PDA seeds, exiting before liquidation.
+3. The guard evaluates health → selects a protective action → CPIs a
+   reduce-only `place_perp_order` signed by its own PDA (delegate) seeds,
+   exiting before liquidation.
 4. Show the measured latency against the L1 baseline.
 5. Explain honestly why Jupiter is co-signed (owner-signature requirement), not
    autonomous.
@@ -149,9 +156,17 @@ The guard's margin wallet is a 2-of-2 (`user` + `co_authority`) — see §8.5.
 - **No deployed devnet program** — the ER delegate/commit/undelegate round-trip
   is implemented as SDK hooks but not exercised against a live MagicBlock
   rollup.
-- **Flash adapter covers `close_position` only** — top-up and true partial-close
-  (fractional) CPI variants are not implemented; a partial-close/take-profit
-  currently resolves to a protective full close.
+- **Drift reduce adapter covers reduce-only orders (hard-coded)** — top-up and
+  arbitrary-position orders are structurally impossible (the serializer writes
+  `reduce_only=true`); a zero-size reduce escalates. Drift `market_index` +
+  `subaccount_id` are pinned in guard state at init. The Drift venue CPI is
+  **not yet exercised against a live protocol** — the e2e tick test still runs
+  against the mock Flash program that models the owner-signer invariant, not
+  Drift's deployed program.
+- **Flash adapter covers `close_position` only (legacy)** — winding down in
+  favor of Drift; top-up and true partial-close (fractional) CPI variants are
+  not implemented here; a partial-close/take-profit resolves to a protective
+  full close.
 - **Mock venue in tests** — the e2e CPI runs against a mock Flash program that
   models the owner-signer invariant, not the real protocol deployment.
 
@@ -163,6 +178,8 @@ The guard's margin wallet is a 2-of-2 (`user` + `co_authority`) — see §8.5.
 - [x] Phase 3 — Jupiter co-signed safety-net adapter (build + persist the owner-signed instruction)
 - [x] Phase 3.5 — owner `Confirm` instruction to land the pending Jupiter instruction + commit nonce
 - [x] Phase 4 — verified Pyth `PriceUpdateV2` accessor (feed/staleness/confidence gates + 6dp scaling)
+- [x] Phase 6 — Drift reduce-only `place_perp_order` adapter (autonomous tier, §8.7.2)
+- [ ] Phase 6.5 — Drift reduces against a real protocol (replace mock receiver in e2e tick tests)
 - [ ] Phase 5 — dashboard (real latency chart first, then state panels)
 - [ ] Deployment — devnet program, live ER delegation round-trip, latency benchmark
 

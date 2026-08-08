@@ -33,11 +33,11 @@ fn read_wick_program() -> Vec<u8> {
     })
 }
 
-/// Build the InitGuard payload: discriminator 0, bump, then the 146-byte
+/// Build the InitGuard payload: discriminator 0, bump, then the 150-byte
 /// policy blob (see `processor::parse_policy`).
 fn init_data(bump: u8) -> Vec<u8> {
     let mut data = vec![0u8, bump];
-    let mut blob = vec![0u8; 146];
+    let mut blob = vec![0u8; 150];
     blob[0] = 0; // venue = none (Phase 1 litesvm test exercises the non-venue path)
     blob[1..33].copy_from_slice(&[9u8; 32]); // co_authority
     blob[33] = 1; // authority_req = CoSigned
@@ -48,6 +48,8 @@ fn init_data(bump: u8) -> Vec<u8> {
     blob[98..114].copy_from_slice(&1_000_000u128.to_le_bytes()); // cap_partial_close
     blob[114..130].copy_from_slice(&5_000_000u128.to_le_bytes()); // cap_daily
     blob[130..146].copy_from_slice(&u128::MAX.to_le_bytes()); // no take_profit
+    blob[146..148].copy_from_slice(&0u16.to_le_bytes()); // drift_market_index (venue none)
+    blob[148..150].copy_from_slice(&0u16.to_le_bytes()); // drift_subaccount_id (venue none)
     data.extend_from_slice(&blob);
     data
 }

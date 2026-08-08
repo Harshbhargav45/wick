@@ -10,6 +10,7 @@
 
 pub mod account;
 pub mod delegation;
+pub mod drift;
 pub mod error;
 pub mod flash;
 pub mod instruction;

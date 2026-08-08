@@ -339,3 +339,85 @@ delegate(ctx):
       - delegated_account, buffer_account, delegation_record, owning_program, payer, system_program
     -> CPI into DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh (verified program ID, Section 2)
 ```
+
+### 8.7 Venue adapters — Flash (legacy) and Drift
+
+The guard's venue adapters are the only code path that constructs a
+venue-side CPI. Every adapter re-derives its accounts from the tail of the
+`OnPriceTick` account list and serializes **its own** instruction bytes, so
+the exact wire format is pinned in one place and covered by byte-level unit
+tests (no foreign serialize produced at runtime).
+
+#### 8.7.1 FlashTrade (legacy, winding down)
+
+`flash.rs` encodes `global:close_position` from Flash's audited
+`flash-perpetuals` source:
+
+```text
+discriminator   sha256("global:close_position")[..8]
+params          ClosePositionParams { price: u64 }   (anchor serialized)
+accounts(12):   owner(SIGNER,WRITE), receiving_account(WRITE),
+                transfer_authority, perpetuals, pool(WRITE), position(WRITE),
+                custody(WRITE), custody_oracle, collateral_custody(WRITE),
+                collateral_custody_oracle, collateral_custody_token_account,
+                token_program
+```
+
+Two guards use it:
+
+- **Co-signed** (`signer_seeds == []`): the venue requires the position
+  owner's signature; supplied in the outer transaction. No autonomous claim.
+- **Autonomous** (`signer_seeds == [guard_seeds]`) — the guard PDA *is* the
+  position owner, so it signs `close_position` with its own PDA seeds.
+
+`close_position` closes the whole position, so both partial-close and
+take-profit actions resolve to a conservative full close.
+
+#### 8.7.2 Drift (autonomous tier, hard reduce-only)
+
+Drift perps are the Flash successor for the autonomous tier. `drift.rs`
+encodes `place_perp_order` from the `velocity-exchange/protocol-v2` source:
+
+```text
+data = 8-byte discr + 32-byte OrderParams (borsh, optionals None):
+  [8]  order_type              = Market             (ORDER_TYPE_MARKET=0)
+  [9]  market_type             = Perp              (MARKET_TYPE_PERP=1)
+  [10] direction               = Long(0)/Short(1)  (reduces vs. guarded side)
+  [11] user_order_id           = 0
+  [12..20] base_asset_amount   (u64 LE)
+  [20..28] price               (u64 LE)
+  [28..30] market_index        (u16 LE)   ← pinned in guard state at init
+  [30] reduce_only = true                ← hard-coded in the serializer
+  [31..40] post_only / notifications    (== None/0)
+accounts: state(ro) → user(w, crate::processor) → authority(Signer) → [remaining…]
+```
+
+- **Program ID:** `dRiftyHA39MWEi3m9aunc5MzRF1JYuBsbn6VPcn33UH` (pinned by
+  byte-exact test `drift_program_id_is_drift`, verified against
+  `wrap_drift::declare_id!`).
+- **Account order** (verified from source): `state` (`Box<Account<State>>`,
+  readonly) → `user` (`AccountLoader<User>`, writable, PDA
+  `["user", authority, sub_account_id.to_le_bytes()]`) → `authority`
+  (`Signer`, signer+readonly in metas) → remaining perp accounts (market,
+  oracle, perp/spot maps…) appended in SDK order.
+- **Delegation model** (verified from `available via can_sign_for_user` in
+  `instructions/constraints.rs`): the venue owner sets the **guard PDA as
+  `User.delegate`** off-chain; the guard PDA signs as `authority`. Drift
+  guarantees delegates **cannot withdraw funds**, but does **not** scope
+  order placement — the hard reduce-only edit is what prevents
+  sticky/full-position orders.
+- **Market + sub-account pinning:** `market_index` and `drift_subaccount_id`
+  are recorded in guard state at `InitGuard` (fields `drift_market_index` /
+  `drift_subaccount_id`, appended to the 342-byte wire layout); the reduce
+  path uses the pinned market, never a tick-supplied value. The operator
+  derives the user PDA from the pinned sub-account id.
+- **Execution** (`execute_drift_autonomous`): Long position (`size ≥ 0`)
+  reduces with `PositionDirection::Short`; short reduces with `Long`.
+  `base_asset_amount = |watched size| × fraction_bps / 10_000` (10_000 for a
+  full take-profit close); a zero-size reduce escalates rather than idle.
+  `price` = the guard's current breach/take-profit price. CPI is signed as
+  the guard PDA (the `delegate`) via the same `seeds!("guard",
+  venue_owner, bump)` seeds as the Flash path.
+- **InvalidInstruction on missing accounts** — the adapter/handlers reject
+  a tick that omits the required state/user/authority slice
+  (`accounts.get(2..)`), so a malformed tick cannot silently skip the reduce.

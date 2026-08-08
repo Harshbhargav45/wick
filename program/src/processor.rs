@@ -22,6 +22,7 @@ use pinocchio_system::instructions::CreateAccount;
 
 use crate::account::{GuardState, PendingIx, GUARD_DATA_LEN};
 use crate::delegation;
+use crate::drift::{DriftPlaceOrderAccounts, ReduceDirection, ReduceOrderParams, VENUE_DRIFT};
 use crate::error::WickError;
 use crate::flash::{ClosePositionAccounts, ClosePositionParams, VENUE_FLASH};
 use crate::instruction::WickInstruction;
@@ -61,9 +62,11 @@ fn parse_amount(data: &[u8]) -> Result<u128, WickError> {
 ///   [98..114] cap_partial_close (u128 LE)
 ///   [114..130] cap_daily (u128 LE)
 ///   [130..146] take_profit (u128 LE; u128::MAX = none)
-const INIT_PAYLOAD_LEN: usize = 146;
+///   [146..148] drift_market_index (u16 LE; venue = VENUE_DRIFT)
+///   [148..150] drift_subaccount_id (u16 LE; venue = VENUE_DRIFT)
+const INIT_PAYLOAD_LEN: usize = 150;
 
-fn parse_policy(payload: &[u8]) -> Result<(VenuePolicy, [u8; 32], u8), WickError> {
+fn parse_policy(payload: &[u8]) -> Result<(VenuePolicy, [u8; 32], u8, u16, u16), WickError> {
     if payload.len() != INIT_PAYLOAD_LEN {
         return Err(WickError::InvalidInstruction);
     }
@@ -100,7 +103,23 @@ fn parse_policy(payload: &[u8]) -> Result<(VenuePolicy, [u8; 32], u8), WickError
             Some(take_profit)
         },
     };
-    Ok((policy, co_authority, payload[0]))
+    let drift_market_index = u16::from_le_bytes(
+        payload[146..148]
+            .try_into()
+            .map_err(|_| WickError::InvalidInstruction)?,
+    );
+    let drift_subaccount_id = u16::from_le_bytes(
+        payload[148..150]
+            .try_into()
+            .map_err(|_| WickError::InvalidInstruction)?,
+    );
+    Ok((
+        policy,
+        co_authority,
+        payload[0],
+        drift_market_index,
+        drift_subaccount_id,
+    ))
 }
 
 // -------------------------------------------------------------------------
@@ -142,7 +161,8 @@ fn init_guard(program_id: &Address, accounts: &[AccountView], data: &[u8]) -> Pr
     // Init payload: [0] bump (u8) then the policy blob.
     let bump = *data.get(1).ok_or(WickError::InvalidInstruction)?;
     let payload = data.get(2..).ok_or(WickError::InvalidInstruction)?;
-    let (policy, co_authority, venue) = parse_policy(payload)?;
+    let (policy, co_authority, venue, drift_market_index, drift_subaccount_id) =
+        parse_policy(payload)?;
 
     // The guard PDA is derived from `b"guard" || owner_pubkey || bump`. The
     // owner pubkey is supplied as a signed account, so an attacker cannot
@@ -181,6 +201,8 @@ fn init_guard(program_id: &Address, accounts: &[AccountView], data: &[u8]) -> Pr
         pending_ix: None,
         degraded: false,
         stale_streak: 0,
+        drift_market_index,
+        drift_subaccount_id,
     };
     store_guard(guard, &state)?;
     Ok(())
@@ -447,6 +469,9 @@ fn execute_autonomous(
         // the owner's to sign (§8.4 CoSigned); autonomy here is not possible.
         return Err(WickError::UnsupportedVenueAction);
     }
+    if state.venue == VENUE_DRIFT {
+        return execute_drift_autonomous(state, action, accounts, bump);
+    }
     if state.venue != VENUE_FLASH {
         return Err(WickError::UnsupportedVenueAction);
     }
@@ -477,6 +502,65 @@ fn execute_autonomous(
         }
         Action::EscalateManualReview => Ok(VenueOutcome::Escalate),
     }
+}
+
+/// Execute a Drift perp reduce in the autonomous tier.
+///
+/// The guard signs `place_perp_order` as the venue owner's *delegate* on the
+/// configured Drift sub-account (stored at init). Drift guarantees delegates
+/// cannot withdraw funds, but it does not scope order placement on its side —
+/// `reduce_only` is therefore forced by the adapter's serialization, and the
+/// perp market being reduced is the one pinned in guard state at init.
+fn execute_drift_autonomous(
+    state: &GuardState,
+    action: Action,
+    accounts: &[AccountView],
+    bump: u8,
+) -> Result<VenueOutcome, WickError> {
+    // Reduce fraction: a TakeProfit closes the watched size in full; a Partial
+    // only shrinks the position by `fraction_bps` (already capped in §8.2).
+    let fraction_bps: u128 = match action {
+        Action::PartialClose { fraction_bps } => fraction_bps,
+        Action::TakeProfit => 10_000,
+        Action::TopUp { .. } | Action::EscalateManualReview => {
+            return Err(WickError::UnsupportedVenueAction)
+        }
+    };
+
+    let venue_accounts = accounts.get(2..).ok_or(WickError::InvalidInstruction)?;
+    let adapter = DriftPlaceOrderAccounts::from_account_views(venue_accounts)?;
+
+    // Reduce against the current position: a long reduces by selling (Drift
+    // PositionDirection::Short), a short by buying (PositionDirection::Long).
+    // `place_perp_order` signs as the `delegate` the venue owner set for
+    // `state.drift_subaccount_id`, so the guard never adds exposure and the
+    // `reduce_only` flag is forced by `ReduceOrderParams`'s serializer.
+    let direction = if state.size >= 0 {
+        ReduceDirection::Short
+    } else {
+        ReduceDirection::Long
+    };
+    // fraction of watched magnitude, carry in u128 then narrow.
+    let abs_size = state.size.unsigned_abs();
+    let reduce = abs_size.saturating_mul(fraction_bps) / 10_000;
+    let reduce_size = u64::try_from(reduce).map_err(|_| WickError::MathOverflow)?;
+    if reduce_size == 0 {
+        return Ok(VenueOutcome::Escalate);
+    }
+    let price = u64::try_from(state.current_price).map_err(|_| WickError::MathOverflow)?;
+    let params = ReduceOrderParams {
+        market_index: state.drift_market_index,
+        direction,
+        base_asset_amount: reduce_size,
+        price,
+    };
+
+    let bump_bytes = [bump];
+    let seeds = seeds!(GUARD_SEED, &state.venue_owner[..], &bump_bytes);
+    adapter
+        .invoke(&params, &[Signer::from(&seeds)])
+        .map_err(|_| WickError::VenueCpi)?;
+    Ok(VenueOutcome::Executed)
 }
 
 // -------------------------------------------------------------------------
@@ -628,14 +712,18 @@ mod tests {
         payload[98..114].copy_from_slice(&2_000u128.to_le_bytes());
         payload[114..130].copy_from_slice(&5_000u128.to_le_bytes());
         payload[130..146].copy_from_slice(&60_000_000u128.to_le_bytes());
+        payload[146..148].copy_from_slice(&9u16.to_le_bytes());
+        payload[148..150].copy_from_slice(&3u16.to_le_bytes());
 
-        let (policy, co, venue) = parse_policy(&payload).unwrap();
+        let (policy, co, venue, market_index, subaccount_id) = parse_policy(&payload).unwrap();
         assert_eq!(venue, 1);
         assert_eq!(policy.authority, AuthorityRequirement::CoSigned);
         assert_eq!(policy.maintenance_bps, 500);
         assert_eq!(policy.caps.daily_total_usd, 5_000);
         assert_eq!(policy.take_profit, Some(60_000_000));
         assert_eq!(co, [9u8; 32]);
+        assert_eq!(market_index, 9);
+        assert_eq!(subaccount_id, 3);
     }
 
     #[test]
@@ -739,6 +827,8 @@ mod tests {
             pending_ix: None,
             degraded: false,
             stale_streak: 0,
+            drift_market_index: 0,
+            drift_subaccount_id: 0,
         };
         let mut buf = vec![0u8; GUARD_DATA_LEN];
         state.write_into(&mut buf).unwrap();
@@ -780,6 +870,8 @@ mod tests {
             pending_ix: None,
             degraded: false,
             stale_streak: 0,
+            drift_market_index: 0,
+            drift_subaccount_id: 0,
         };
         let mut buf = vec![0u8; GUARD_DATA_LEN];
         state.write_into(&mut buf).unwrap();
@@ -1435,6 +1527,57 @@ mod tests {
         let state = GuardState::from_bytes(guard.data()).unwrap();
         assert_eq!(state.pending, Some(Action::EscalateManualReview));
         // Nonce NOT committed — the venue action never landed.
+        assert_eq!(state.nonce, 0);
+    }
+
+    #[test]
+    fn tick_drift_missing_venue_accounts_rejected() {
+        // Autonomous Drift venue — the tick passes no venue adapter accounts
+        // (state/user/authority + remaining). The adapter must reject rather
+        // than silently no-op or advance the nonce. Use TakeProfit (fires
+        // before the liquidity gate) so the reduce path is reached.
+        let state = GuardState {
+            venue: VENUE_DRIFT,
+            venue_owner: [9u8; 32],
+            co_authority: [5u8; 32],
+            authority_req: AuthorityRequirement::Autonomous,
+            policy: VenuePolicy {
+                maintenance_bps: 500,
+                trigger_buffer_bps: 500,
+                fee_bps: 10,
+                authority: AuthorityRequirement::Autonomous,
+                caps: ActionCaps {
+                    top_up_usd_per_action: u128::MAX,
+                    partial_close_usd_per_action: u128::MAX,
+                    daily_total_usd: u128::MAX,
+                },
+                take_profit: Some(49_000_000),
+            },
+            collateral: 100_000_000,
+            size: 100_000_000,
+            entry: 50_000_000,
+            current_price: 49_000_000,
+            nonce: 0,
+            last_check_slot: 0,
+            pending: None,
+            pending_ix: None,
+            degraded: false,
+            stale_streak: 0,
+            drift_market_index: 1,
+            drift_subaccount_id: 0,
+        };
+        let mut guard_data = vec![0u8; GUARD_DATA_LEN];
+        state.write_into(&mut guard_data).unwrap();
+        let guard = TestAccount::new(PROGRAM_ID, PROGRAM_ID, 100, &guard_data, false, true);
+        let clock = clock_account(20);
+
+        // TakeProfit is the top-priority action (fires before the liquidity
+        // gate), so it deterministically reaches the reduce path regardless of
+        // solver reachability.
+        let result = run_tick(&guard, &clock, &tick_data(49_000_000, 1, 0));
+        assert_eq!(result, Err(WickError::InvalidInstruction.into()));
+
+        let state = GuardState::from_bytes(guard.data()).unwrap();
         assert_eq!(state.nonce, 0);
     }
 

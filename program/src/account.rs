@@ -135,9 +135,12 @@ impl RouteConfig {
 //   [279..287] pending_ix expected_nonce (u64)
 //   [287..337] pending_ix data (50 bytes — owner-signed instruction built by
 //              the guard; see jupiter.rs, build-only boundary)
-// Total: 338
+//   [338..340] drift_market_index (u16 LE) — perp market the guard reduces (§8.7)
+//   [340..342] drift_subaccount_id (u16 LE) — Drift sub-account delegated to
+//              the guard (Drift user PDA seed `sub_account_id`)
+// Total: 342
 // -------------------------------------------------------------------------
-pub const GUARD_DATA_LEN: usize = 338;
+pub const GUARD_DATA_LEN: usize = 342;
 
 /// Max size of a guard-built owner-signed instruction payload (discriminator +
 /// `InstantCreateTpslParams`). Must match `jupiter::build_instant_tpsl_data`.
@@ -167,6 +170,8 @@ const G_STALE_STREAK_OFF: usize = 277;
 const G_PX_TAG_OFF: usize = 278;
 const G_PX_NONCE_OFF: usize = 279;
 const G_PX_DATA_OFF: usize = 287;
+const G_DRIFT_MARKET_OFF: usize = 338;
+const G_DRIFT_SUBACCOUNT_OFF: usize = 340;
 
 const NONE_PRICE: u128 = u128::MAX;
 
@@ -199,6 +204,10 @@ pub struct GuardState {
     pub pending_ix: Option<PendingIx>,
     pub degraded: bool,
     pub stale_streak: u8,
+    /// Drift perp market the guard watches/reduces (only for `venue = VENUE_DRIFT`).
+    pub drift_market_index: u16,
+    /// Drift sub-account whose delegate is the guard PDA (only for `venue = VENUE_DRIFT`).
+    pub drift_subaccount_id: u16,
 }
 
 impl GuardState {
@@ -299,6 +308,16 @@ impl GuardState {
             pending_ix,
             degraded: data[G_DEGRADED_OFF] == 1,
             stale_streak: data[G_STALE_STREAK_OFF],
+            drift_market_index: u16::from_le_bytes(
+                data[G_DRIFT_MARKET_OFF..G_DRIFT_MARKET_OFF + 2]
+                    .try_into()
+                    .map_err(|_| ())?,
+            ),
+            drift_subaccount_id: u16::from_le_bytes(
+                data[G_DRIFT_SUBACCOUNT_OFF..G_DRIFT_SUBACCOUNT_OFF + 2]
+                    .try_into()
+                    .map_err(|_| ())?,
+            ),
         })
     }
 
@@ -353,6 +372,10 @@ impl GuardState {
         }
         out[G_DEGRADED_OFF] = if self.degraded { 1 } else { 0 };
         out[G_STALE_STREAK_OFF] = self.stale_streak;
+        out[G_DRIFT_MARKET_OFF..G_DRIFT_MARKET_OFF + 2]
+            .copy_from_slice(&self.drift_market_index.to_le_bytes());
+        out[G_DRIFT_SUBACCOUNT_OFF..G_DRIFT_SUBACCOUNT_OFF + 2]
+            .copy_from_slice(&self.drift_subaccount_id.to_le_bytes());
         match self.pending_ix {
             None => out[G_PX_TAG_OFF] = 0,
             Some(px) => {
@@ -425,6 +448,8 @@ mod tests {
             }),
             degraded: true,
             stale_streak: 3,
+            drift_market_index: 7,
+            drift_subaccount_id: 2,
         };
         g.write_into(&mut buf).unwrap();
         let back = GuardState::from_bytes(&buf).unwrap();
@@ -451,6 +476,8 @@ mod tests {
         );
         assert!(back.degraded);
         assert_eq!(back.stale_streak, 3);
+        assert_eq!(back.drift_market_index, 7);
+        assert_eq!(back.drift_subaccount_id, 2);
     }
 
     #[test]
@@ -483,6 +510,8 @@ mod tests {
             pending_ix: None,
             degraded: false,
             stale_streak: 0,
+            drift_market_index: 0,
+            drift_subaccount_id: 0,
         };
         g.write_into(&mut buf).unwrap();
         let back = GuardState::from_bytes(&buf).unwrap();
@@ -491,6 +520,8 @@ mod tests {
         assert_eq!(back.pending_ix, None);
         assert!(!back.degraded);
         assert_eq!(back.stale_streak, 0);
+        assert_eq!(back.drift_market_index, 0);
+        assert_eq!(back.drift_subaccount_id, 0);
     }
 
     #[test]

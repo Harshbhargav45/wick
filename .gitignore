@@ -23,3 +23,6 @@ wallet.json
 node_modules/
 dist/
 .next/
+
+# opencode tooling state
+.opencode/
