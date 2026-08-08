@@ -1,16 +1,17 @@
 //! End-to-end litesvm test of the §7.2 critical path's autonomous branch.
 //!
-//! Proves the money claim for the demo: when the guard PDA is the Flash
-//! position owner, `OnPriceTick` → breach → `select_action` → autonomous
-//! dispatch CPI into Flash's `close_position` **signed by the guard PDA's own
-//! seeds** (the ER-delegation authority model, §8.4/§8.6). A mock Flash program
-//! models Flash's one invariant that matters here: `owner` (index 0) must be a
-//! signer. It stamps the position account so the test can assert the CPI
-//! landed.
+//! Proves the money claim for the demo: when the guard PDA is the Drift
+//! sub-account's delegate, `OnPriceTick` → breach → `select_action` →
+//! autonomous dispatch CPIs into Drift's `place_perp_order` **signed by the
+//! guard PDA's own seeds** (the ER-delegation authority model, §8.4/§8.6). A
+//! mock Drift program models Drift's one invariant that matters here: the
+//! order `authority` (index 2) must be a signer AND must equal the `delegate`
+//! stored in the user account (index 1), and the order must be reduce-only. It
+//! stamps the user account so the test can assert the CPI landed.
 //!
 //! Requires both `.so`s built first:
 //!   cargo build-sbf                          (in program/)
-//!   cargo build-sbf                          (in program/mocks/flash/)
+//!   cargo build-sbf                          (in program/mocks/drift/)
 
 use litesvm::LiteSVM;
 use solana_account::Account;
@@ -26,16 +27,19 @@ use std::path::PathBuf;
 
 /// Address where the guard `.so` is deployed for the test.
 const PROGRAM_ID: &str = "US517G5965aydkZ46HS38QLi7UQiSojurfbQfKCELFx";
-/// Real Flash Perpetuals program id — the mock is deployed at this address.
-const FLASH_PROGRAM_ID: &str = "FLASH6Lo6h3iasJKWDs2F8TkW2UKf3s15C8PMGuVfgBn";
+/// Real Drift Protocol program id — the mock is deployed at this address.
+const DRIFT_PROGRAM_ID: &str = "dRiftyHA39MWEi3m9aunc5MzRF1JYuBsbn6VPcn33UH";
 const CLOCK_SYSVAR: &str = "SysvarC1ock11111111111111111111111111111111";
 const RENT_SYSVAR: &str = "SysvarRent111111111111111111111111111111111";
 const SYSTEM_PROGRAM: &str = "11111111111111111111111111111111";
 
 const GUARD_SEED: &[u8] = b"guard";
 
-/// Marker the mock Flash program writes into the position on a close.
-const CLOSED_MARKER: [u8; 4] = *b"WICK";
+/// Marker the mock Drift program writes into the user account on a reduce.
+const REDUCED_MARKER: [u8; 6] = *b"REDUCE";
+
+/// Byte offset of `User.delegate` in Drift's zero-copy `User` layout.
+const DELEGATE_OFFSET: usize = 32;
 
 /// litesvm boots the clock at `MAINNET_DEFAULT_SLOT` (~435M), but the guard
 /// initializes `last_check_slot` to 0. A tick arriving at that real slot is
@@ -48,17 +52,17 @@ fn read_so(rel: &str) -> Vec<u8> {
     let mut so_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     so_path.push(rel);
     std::fs::read(&so_path).unwrap_or_else(|e| {
-        panic!("{so_path:?} not found ({e}). Run `cargo build-sbf` in program/ and program/mocks/flash/ first.")
+        panic!("{so_path:?} not found ({e}). Run `cargo build-sbf` in program/ and program/mocks/drift/ first.")
     })
 }
 
 /// InitGuard payload: discriminator 0, bump, then the 150-byte policy blob.
-/// Autonomous regime, venue = Flash, tiny top-up cap (forces PartialClose),
+/// Autonomous regime, venue = Drift, tiny top-up cap (forces PartialClose),
 /// maintenance at 50% (5000 bp) with 500 bp buffer — the solver test fixture.
 fn init_data(bump: u8) -> Vec<u8> {
     let mut data = vec![0u8, bump];
     let mut blob = vec![0u8; 150];
-    blob[0] = 1; // venue = Flash
+    blob[0] = 3; // venue = Drift
     blob[1..33].copy_from_slice(&[9u8; 32]); // co_authority
     blob[33] = 0; // authority_req = Autonomous
     blob[34..50].copy_from_slice(&5000u128.to_le_bytes()); // maintenance_bps
@@ -68,16 +72,31 @@ fn init_data(bump: u8) -> Vec<u8> {
     blob[98..114].copy_from_slice(&u128::MAX.to_le_bytes()); // cap_partial_close
     blob[114..130].copy_from_slice(&u128::MAX.to_le_bytes()); // cap_daily
     blob[130..146].copy_from_slice(&u128::MAX.to_le_bytes()); // no take_profit
-    blob[146..148].copy_from_slice(&0u16.to_le_bytes()); // drift_market_index (venue Flash)
-    blob[148..150].copy_from_slice(&0u16.to_le_bytes()); // drift_subaccount_id (venue Flash)
+    blob[146..148].copy_from_slice(&0u16.to_le_bytes()); // drift_market_index (perp market 0)
+    blob[148..150].copy_from_slice(&0u16.to_le_bytes()); // drift_subaccount_id
     data.extend_from_slice(&blob);
     data
 }
 
+/// Build the mock Drift `user` account: owned by the mock program, with its
+/// `delegate` field (offset 32) set to the guard PDA. This is the account the
+/// guard's `place_perp_order` CPI addresses as `user`.
+fn drift_user_account(drift_pubkey: Pubkey, delegate: Address) -> Account {
+    let mut data = vec![0u8; 96];
+    data[DELEGATE_OFFSET..DELEGATE_OFFSET + 32].copy_from_slice(delegate.as_ref());
+    Account {
+        lamports: 1_000_000,
+        data,
+        owner: drift_pubkey,
+        executable: false,
+        rent_epoch: 0,
+    }
+}
+
 #[test]
-fn autonomous_tick_cpis_close_position_signed_by_guard_pda() {
+fn autonomous_tick_cpis_place_perp_order_signed_by_guard_pda() {
     let program_id = Address::from_str_const(PROGRAM_ID);
-    let flash_id = Address::from_str_const(FLASH_PROGRAM_ID);
+    let drift_id = Address::from_str_const(DRIFT_PROGRAM_ID);
     let clock = Address::from_str_const(CLOCK_SYSVAR);
     let rent = Address::from_str_const(RENT_SYSVAR);
     let system = Address::from_str_const(SYSTEM_PROGRAM);
@@ -86,8 +105,8 @@ fn autonomous_tick_cpis_close_position_signed_by_guard_pda() {
     svm.add_program(program_id, &read_so("target/deploy/wick_guard.so"))
         .unwrap();
     svm.add_program(
-        flash_id,
-        &read_so("mocks/flash/target/deploy/mock_flash.so"),
+        drift_id,
+        &read_so("mocks/drift/target/deploy/mock_drift.so"),
     )
     .unwrap();
 
@@ -98,7 +117,7 @@ fn autonomous_tick_cpis_close_position_signed_by_guard_pda() {
     let seeds: &[&[u8]] = &[GUARD_SEED, owner.as_ref()];
     let (guard_pda, bump) = Address::find_program_address(seeds, &program_id);
 
-    // --- InitGuard (venue = Flash, Autonomous) ---
+    // --- InitGuard (venue = Drift, Autonomous) ---
     let init_ix = Instruction {
         program_id,
         accounts: vec![
@@ -131,56 +150,44 @@ fn autonomous_tick_cpis_close_position_signed_by_guard_pda() {
     let tx = Transaction::new(&[&owner_kp], msg, svm.latest_blockhash());
     svm.send_transaction(tx).expect("UpdatePosition failed");
 
-    // --- Flash accounts. The guard program passes these straight through the
-    // close_position CPI; the mock only touches `owner` (signer) and
-    // `position` (index 5). They must exist and be owned by the flash program
-    // for the write to be legal. ---
-    let flash_pubkey = Pubkey::from(flash_id.to_bytes());
-    let dummy_meta = Account {
+    // --- Drift accounts. The guard passes the tail (state/user/authority +
+    // remaining) straight through the place_perp_order CPI. The mock only
+    // touches `user` (delegate read + marker write) and `authority` (signer +
+    // delegate match). `user` must be owned by the mock program for the write
+    // to be legal, and its `delegate` field must be the guard PDA. ---
+    let drift_pubkey = Pubkey::from(drift_id.to_bytes());
+    let state_acc = Account {
         lamports: 1_000_000,
-        data: vec![],
-        owner: flash_pubkey,
+        data: vec![0u8; 64],
+        owner: drift_pubkey,
         executable: false,
         rent_epoch: 0,
     };
-    let position_acc = Account {
-        lamports: 1_000_000,
-        data: vec![0u8; 8],
-        owner: flash_pubkey,
-        executable: false,
-        rent_epoch: 0,
-    };
+    let user_acc = drift_user_account(drift_pubkey, guard_pda);
 
-    let position = Address::from([42u8; 32]);
-    let receiving = Address::from([11u8; 32]);
-    let transfer_authority = Address::from([12u8; 32]);
-    let perpetuals = Address::from([13u8; 32]);
-    let pool = Address::from([14u8; 32]);
-    let custody = Address::from([15u8; 32]);
-    let custody_oracle = Address::from([16u8; 32]);
-    let collateral_custody = Address::from([17u8; 32]);
-    let collateral_oracle = Address::from([18u8; 32]);
-    let collateral_token = Address::from([19u8; 32]);
-    let token_program = Address::from([20u8; 32]);
+    let state = Address::from([30u8; 32]);
+    let user = Address::from([31u8; 32]);
+    let remaining_a = Address::from([40u8; 32]); // perp market map
+    let remaining_b = Address::from([41u8; 32]); // oracle map
 
-    svm.set_account(position, position_acc).unwrap();
-    for a in [
-        receiving,
-        transfer_authority,
-        perpetuals,
-        pool,
-        custody,
-        custody_oracle,
-        collateral_custody,
-        collateral_oracle,
-        collateral_token,
-        token_program,
-    ] {
-        svm.set_account(a, dummy_meta.clone()).unwrap();
+    svm.set_account(state, state_acc).unwrap();
+    svm.set_account(user, user_acc).unwrap();
+    for a in [remaining_a, remaining_b] {
+        svm.set_account(
+            a,
+            Account {
+                lamports: 1_000_000,
+                data: vec![],
+                owner: drift_pubkey,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
     }
 
     // --- OnPriceTick: price $50 (entry), nonce 1. Underwater position →
-    // TopUp capped out → PartialClose → autonomous Flash close. ---
+    // TopUp capped out → PartialClose → autonomous Drift reduce. ---
     svm.warp_to_slot(TICK_SLOT); // fresh: TICK_SLOT - 0 <= MAX_TICK_AGE_SLOTS
     let mut tick = vec![7u8];
     tick.extend_from_slice(&50_000_000u128.to_le_bytes());
@@ -189,24 +196,17 @@ fn autonomous_tick_cpis_close_position_signed_by_guard_pda() {
     let tick_ix = Instruction {
         program_id,
         accounts: vec![
-            AccountMeta::new(guard_pda, false),      // [0] guard
-            AccountMeta::new_readonly(clock, false), // [1] clock
-            AccountMeta::new(guard_pda, false),      // [2] flash owner (guard PDA)
-            AccountMeta::new(receiving, false),      // [3] receiving_account
-            AccountMeta::new_readonly(transfer_authority, false),
-            AccountMeta::new_readonly(perpetuals, false),
-            AccountMeta::new(pool, false),
-            AccountMeta::new(position, false), // [7] position (mock stamps this)
-            AccountMeta::new(custody, false),
-            AccountMeta::new_readonly(custody_oracle, false),
-            AccountMeta::new(collateral_custody, false),
-            AccountMeta::new_readonly(collateral_oracle, false),
-            AccountMeta::new(collateral_token, false),
-            AccountMeta::new_readonly(token_program, false),
+            AccountMeta::new(guard_pda, false),            // [0] guard
+            AccountMeta::new_readonly(clock, false),       // [1] clock
+            AccountMeta::new_readonly(state, false),       // [2] Drift state (readonly)
+            AccountMeta::new(user, false), // [3] Drift user (delegate read + marker)
+            AccountMeta::new(guard_pda, false), // [4] authority (guard PDA — delegate)
+            AccountMeta::new_readonly(remaining_a, false), // [5] remaining (perp market map)
+            AccountMeta::new_readonly(remaining_b, false), // [6] remaining (oracle map)
             // The CPI target must be present as an account in the transaction
             // message, otherwise the runtime rejects the CPI with
             // `InstructionError::MissingAccount` ("Unknown program").
-            AccountMeta::new_readonly(flash_id, false),
+            AccountMeta::new_readonly(drift_id, false),
         ],
         data: tick,
     };
@@ -216,13 +216,13 @@ fn autonomous_tick_cpis_close_position_signed_by_guard_pda() {
     assert!(res.is_ok(), "OnPriceTick failed: {res:?}");
 
     // --- Assertions ---
-    // The mock Flash program stamped the position → the guard-PDA-signed
-    // close_position CPI really landed.
-    let position_after = svm.get_account(&position).expect("position missing");
+    // The mock Drift program stamped the user account → the guard-PDA-signed
+    // reduce-only place_perp_order CPI really landed.
+    let user_after = svm.get_account(&user).expect("user missing");
     assert_eq!(
-        &position_after.data[..4],
-        &CLOSED_MARKER,
-        "close_position CPI did not reach the venue"
+        &user_after.data[..6],
+        &REDUCED_MARKER,
+        "place_perp_order CPI did not reach the venue"
     );
 
     // §8.4: autonomous execution commits the nonce.
@@ -240,7 +240,7 @@ fn cosigned_tick_never_reaches_venue() {
     // A CoSigned guard must NOT CPI into the venue at all — no owner signature
     // is present, so the guard can only build + hold the action (§8.4).
     let program_id = Address::from_str_const(PROGRAM_ID);
-    let flash_id = Address::from_str_const(FLASH_PROGRAM_ID);
+    let drift_id = Address::from_str_const(DRIFT_PROGRAM_ID);
     let clock = Address::from_str_const(CLOCK_SYSVAR);
     let rent = Address::from_str_const(RENT_SYSVAR);
     let system = Address::from_str_const(SYSTEM_PROGRAM);
@@ -249,8 +249,8 @@ fn cosigned_tick_never_reaches_venue() {
     svm.add_program(program_id, &read_so("target/deploy/wick_guard.so"))
         .unwrap();
     svm.add_program(
-        flash_id,
-        &read_so("mocks/flash/target/deploy/mock_flash.so"),
+        drift_id,
+        &read_so("mocks/drift/target/deploy/mock_drift.so"),
     )
     .unwrap();
 
@@ -296,21 +296,12 @@ fn cosigned_tick_never_reaches_venue() {
     svm.send_transaction(tx).expect("UpdatePosition failed");
 
     // Tick with the SAME account list as the autonomous test — if the guard
-    // wrongly CPI'd, the mock would stamp the position.
+    // wrongly CPI'd, the mock would stamp the user account.
     svm.warp_to_slot(TICK_SLOT); // fresh: TICK_SLOT - 0 <= MAX_TICK_AGE_SLOTS
-    let position = Address::from([42u8; 32]);
-    let flash_pubkey = Pubkey::from(flash_id.to_bytes());
-    svm.set_account(
-        position,
-        Account {
-            lamports: 1_000_000,
-            data: vec![0u8; 8],
-            owner: flash_pubkey,
-            executable: false,
-            rent_epoch: 0,
-        },
-    )
-    .unwrap();
+    let drift_pubkey = Pubkey::from(drift_id.to_bytes());
+    let user = Address::from([31u8; 32]);
+    svm.set_account(user, drift_user_account(drift_pubkey, guard_pda))
+        .unwrap();
 
     let mut tick = vec![7u8];
     tick.extend_from_slice(&50_000_000u128.to_le_bytes());
@@ -321,18 +312,12 @@ fn cosigned_tick_never_reaches_venue() {
         accounts: vec![
             AccountMeta::new(guard_pda, false),
             AccountMeta::new_readonly(clock, false),
-            AccountMeta::new(guard_pda, false),
-            AccountMeta::new(Address::from([11u8; 32]), false),
-            AccountMeta::new_readonly(Address::from([12u8; 32]), false),
-            AccountMeta::new_readonly(Address::from([13u8; 32]), false),
-            AccountMeta::new(Address::from([14u8; 32]), false),
-            AccountMeta::new(position, false),
-            AccountMeta::new(Address::from([15u8; 32]), false),
-            AccountMeta::new_readonly(Address::from([16u8; 32]), false),
-            AccountMeta::new(Address::from([17u8; 32]), false),
-            AccountMeta::new_readonly(Address::from([18u8; 32]), false),
-            AccountMeta::new(Address::from([19u8; 32]), false),
-            AccountMeta::new_readonly(Address::from([20u8; 32]), false),
+            AccountMeta::new_readonly(Address::from([30u8; 32]), false), // state
+            AccountMeta::new(user, false),
+            AccountMeta::new(guard_pda, false), // authority (guard PDA)
+            AccountMeta::new_readonly(Address::from([40u8; 32]), false), // remaining
+            AccountMeta::new_readonly(Address::from([41u8; 32]), false), // remaining
+            AccountMeta::new_readonly(drift_id, false),
         ],
         data: tick,
     };
@@ -341,9 +326,9 @@ fn cosigned_tick_never_reaches_venue() {
     let res = svm.send_transaction(tx);
     assert!(res.is_ok(), "OnPriceTick failed: {res:?}");
 
-    // Venue never reached: position untouched, nonce not committed (§8.4).
-    let position_after = svm.get_account(&position).expect("position missing");
-    assert_ne!(&position_after.data[..4], &CLOSED_MARKER);
+    // Venue never reached: user untouched, nonce not committed (§8.4).
+    let user_after = svm.get_account(&user).expect("user missing");
+    assert_ne!(&user_after.data[..6], &REDUCED_MARKER);
     let guard_after = svm.get_account(&guard_pda).expect("guard missing");
     let nonce = u64::from_le_bytes(guard_after.data[243..251].try_into().unwrap());
     assert_eq!(nonce, 0, "CoSigned must not commit the nonce");

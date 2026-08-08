@@ -21,8 +21,8 @@ jobs:
       - name: Check formatting (guard)
         working-directory: program
         run: cargo fmt --check
-      - name: Check formatting (mock flash)
-        working-directory: program/mocks/flash
+      - name: Check formatting (mock drift)
+        working-directory: program/mocks/drift
         run: cargo fmt --check
 
   lint:
@@ -36,8 +36,8 @@ jobs:
       - name: Clippy (guard)
         working-directory: program
         run: cargo clippy --features no-entrypoint --all-targets -- -D warnings
-      - name: Clippy (mock flash)
-        working-directory: program/mocks/flash
+      - name: Clippy (mock drift)
+        working-directory: program/mocks/drift
         run: cargo clippy --all-targets -- -D warnings
 
   test:
@@ -66,8 +66,8 @@ jobs:
         working-directory: program
         run: cargo build-sbf
 
-      - name: Build mock flash SBF
-        working-directory: program/mocks/flash
+      - name: Build mock drift SBF
+        working-directory: program/mocks/drift
         run: cargo build-sbf
 
       - name: Run tests

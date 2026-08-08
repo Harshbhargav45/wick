@@ -24,7 +24,6 @@ use crate::account::{GuardState, PendingIx, GUARD_DATA_LEN};
 use crate::delegation;
 use crate::drift::{DriftPlaceOrderAccounts, ReduceDirection, ReduceOrderParams, VENUE_DRIFT};
 use crate::error::WickError;
-use crate::flash::{ClosePositionAccounts, ClosePositionParams, VENUE_FLASH};
 use crate::instruction::WickInstruction;
 use crate::jupiter::{build_tp_safety_net, VENUE_JUPITER};
 use crate::state::{
@@ -356,7 +355,7 @@ fn confirm_pending(program_id: &Address, accounts: &[AccountView], _data: &[u8])
 /// Account layout:
 ///   [0]    guard (writable, program-owned)
 ///   [1]    clock sysvar (readonly)
-///   [2..]  venue adapter accounts (only consumed for an autonomous Flash close)
+///   [2..]  venue adapter accounts (only consumed for an autonomous venue CPI)
 fn on_price_tick(program_id: &Address, accounts: &[AccountView], data: &[u8]) -> ProgramResult {
     let (guard, clock) = split_2(accounts)?;
     if !guard.owned_by(program_id) {
@@ -454,8 +453,8 @@ enum VenueOutcome {
 }
 
 /// Execute an action through the venue adapter in the autonomous tier. The
-/// guard PDA signs as the position owner — that is what ER delegation (§8.6)
-/// unlocks for sub-50ms execution.
+/// guard PDA signs as the position delegate/owner — that is what ER delegation
+/// (§8.6) unlocks for sub-50ms execution.
 fn execute_autonomous(
     state: &GuardState,
     action: Action,
@@ -469,39 +468,12 @@ fn execute_autonomous(
         // the owner's to sign (§8.4 CoSigned); autonomy here is not possible.
         return Err(WickError::UnsupportedVenueAction);
     }
-    if state.venue == VENUE_DRIFT {
-        return execute_drift_autonomous(state, action, accounts, bump);
-    }
-    if state.venue != VENUE_FLASH {
+    if state.venue != VENUE_DRIFT {
+        // No autonomous venue adapter for this venue tag. Reject so the tick
+        // escalates to manual review rather than silently no-oping.
         return Err(WickError::UnsupportedVenueAction);
     }
-    match action {
-        Action::PartialClose { .. } | Action::TakeProfit => {
-            // Flash's close_position closes the whole position, so both the
-            // guard's partial-close and take-profit resolve to a protective
-            // full close here. Conservative by design: exiting beats being
-            // liquidated.
-            let venue_accounts = accounts.get(2..).ok_or(WickError::InvalidInstruction)?;
-            let adapter = ClosePositionAccounts::from_account_views(venue_accounts)?;
-            let exit_price =
-                u64::try_from(state.current_price).map_err(|_| WickError::MathOverflow)?;
-            let params = ClosePositionParams { price: exit_price };
-
-            let bump_bytes = [bump];
-            let seeds = seeds!(GUARD_SEED, &state.venue_owner[..], &bump_bytes);
-            adapter
-                .invoke(&params, &[Signer::from(&seeds)])
-                .map_err(|_| WickError::VenueCpi)?;
-            Ok(VenueOutcome::Executed)
-        }
-        Action::TopUp { .. } => {
-            // No Flash collateral-add CPI in the adapter yet. Escalate rather
-            // than error so the tick's state progress (slot/nonce/snapshot)
-            // still persists.
-            Err(WickError::UnsupportedVenueAction)
-        }
-        Action::EscalateManualReview => Ok(VenueOutcome::Escalate),
-    }
+    execute_drift_autonomous(state, action, accounts, bump)
 }
 
 /// Execute a Drift perp reduce in the autonomous tier.
@@ -702,7 +674,7 @@ mod tests {
     #[test]
     fn parse_policy_roundtrip() {
         let mut payload = [0u8; INIT_PAYLOAD_LEN];
-        payload[0] = 1; // venue = Flash
+        payload[0] = VENUE_DRIFT; // venue = Drift
         payload[1..33].copy_from_slice(&[9u8; 32]); // co_authority
         payload[33] = 1; // CoSigned
         payload[34..50].copy_from_slice(&500u128.to_le_bytes());
@@ -716,7 +688,7 @@ mod tests {
         payload[148..150].copy_from_slice(&3u16.to_le_bytes());
 
         let (policy, co, venue, market_index, subaccount_id) = parse_policy(&payload).unwrap();
-        assert_eq!(venue, 1);
+        assert_eq!(venue, VENUE_DRIFT);
         assert_eq!(policy.authority, AuthorityRequirement::CoSigned);
         assert_eq!(policy.maintenance_bps, 500);
         assert_eq!(policy.caps.daily_total_usd, 5_000);

@@ -16,10 +16,8 @@ every state change, which makes truly autonomous protection architecturally
 impossible there. Wick does not fake autonomy:
 
 - **Autonomous tier** (Drift perps): the guard PDA *is* the position
-  delegate. It signs a reduce-only order itself and executes protective
-  actions autonomously on breach — the sub-50ms path. (Legacy FlashTrade
-  `close_position` CPI remains as `flash.rs`, winding down in favor of
-  Drift.)
+  delegate. It signs a hard reduce-only `place_perp_order` itself and executes
+  protective actions autonomously on breach — the sub-50ms path.
 - **Co-signed tier** (Jupiter): the guard builds the owner-signed instruction
   and holds it as *pending*; the owner's signature is what lands it. The guard
   never claims to be faster than it is.
@@ -43,13 +41,12 @@ selector, and one nonce/replay model.
     │   │                        #   dispatch regimes (§8.1–8.4)
     │   ├── account.rs           # deterministic wire-format serialization
     │   ├── delegation.rs        # MagicBlock ER delegate/commit/undelegate (§8.6)
-    │   ├── flash.rs             # FlashTrade close_position CPI adapter (§8.7.1, legacy)
-    │   ├── drift.rs             # Drift reduce-only place_perp_order CPI adapter (§8.7.2)
+    │   ├── drift.rs             # Drift hard reduce-only place_perp_order CPI adapter (§8.7)
     │   └── error.rs             # WickError
     ├── tests/
     │   ├── init.rs              # litesvm e2e: InitGuard → DepositMargin
     │   └── tick.rs              # litesvm e2e: autonomous + co-signed dispatch
-    └── mocks/flash/             # mock Flash program for e2e CPI testing
+    └── mocks/drift/             # mock Drift program for e2e CPI testing
 ```
 
 ## Prerequisites
@@ -65,8 +62,8 @@ selector, and one nonce/replay model.
 cd program
 cargo build-sbf
 
-# Mock Flash program (needed only for the e2e tick tests)
-cd program/mocks/flash
+# Mock Drift program (needed only for the e2e tick tests)
+cd program/mocks/drift
 cargo build-sbf
 ```
 
@@ -89,10 +86,13 @@ This runs 62 unit tests + 3 litesvm integration tests:
   mapping, missing-account rejection).
 - **1 litesvm integration test** (`init.rs`) — `InitGuard` CPI-create + deposit.
 - **2 litesvm e2e tests** (`tick.rs`):
-  - *Autonomous*: an underwater position on a breach tick triggers the guard
-    PDA to CPI `close_position` into (mock) Flash **signed by its own seeds**,
-    stamping the position and committing the nonce — the "beat the liquidator"
-    path, proven end-to-end against a real SBF VM.
+  - *Autonomous*: an underwater Drift position on a breach tick triggers the
+    guard PDA to CPI a hard reduce-only `place_perp_order` into (mock) Drift
+    **signed by its own delegate seeds**, stamping the position and committing
+    the nonce — the "beat the liquidator" path, proven end-to-end against a
+    real SBF VM. The mock Drift enforces the delegate invariant: the CPI
+    authority must be the account whose address is stored as `User.delegate`
+    *and* a signer — the test fails if either is violated.
   - *Co-signed*: the same breach never reaches the venue; the action is held
     as pending and the nonce does not advance until an owner signature exists.
     On Jupiter, the guard additionally **builds** the owner-signed
@@ -107,7 +107,7 @@ Linting / formatting (what CI enforces):
 cd program
 cargo fmt --check
 cargo clippy --features no-entrypoint --all-targets -- -D warnings
-cd program/mocks/flash
+cd program/mocks/drift
 cargo clippy --all-targets -- -D warnings
 ```
 
@@ -160,25 +160,21 @@ The guard's margin wallet is a 2-of-2 (`user` + `co_authority`) — see §8.5.
   arbitrary-position orders are structurally impossible (the serializer writes
   `reduce_only=true`); a zero-size reduce escalates. Drift `market_index` +
   `subaccount_id` are pinned in guard state at init. The Drift venue CPI is
-  **not yet exercised against a live protocol** — the e2e tick test still runs
-  against the mock Flash program that models the owner-signer invariant, not
-  Drift's deployed program.
-- **Flash adapter covers `close_position` only (legacy)** — winding down in
-  favor of Drift; top-up and true partial-close (fractional) CPI variants are
-  not implemented here; a partial-close/take-profit resolves to a protective
-  full close.
-- **Mock venue in tests** — the e2e CPI runs against a mock Flash program that
-  models the owner-signer invariant, not the real protocol deployment.
+  **not yet exercised against a live protocol** — the e2e tick test runs
+  against a mock Drift program that models the delegate-PDA signer invariant,
+  not Drift's deployed program.
+- **Mock venue in tests** — the e2e CPI runs against a mock Drift program that
+  models the delegate-PDA signer invariant, not the real protocol deployment.
 
 ## Roadmap
 
 - [x] Phase 1 — guard program, health engine, selector, solver, authority, serialization
-- [x] Phase 1.5 — FlashTrade `close_position` adapter + autonomous e2e proof
+- [x] Phase 1.5 — FlashTrade `close_position` adapter + autonomous e2e proof (retired, §8.7.1)
 - [x] CI (fmt, clippy, build-sbf, tests)
 - [x] Phase 3 — Jupiter co-signed safety-net adapter (build + persist the owner-signed instruction)
 - [x] Phase 3.5 — owner `Confirm` instruction to land the pending Jupiter instruction + commit nonce
 - [x] Phase 4 — verified Pyth `PriceUpdateV2` accessor (feed/staleness/confidence gates + 6dp scaling)
-- [x] Phase 6 — Drift reduce-only `place_perp_order` adapter (autonomous tier, §8.7.2)
+- [x] Phase 6 — Drift reduce-only `place_perp_order` adapter + delegate-PDA mock e2e (autonomous tier, §8.7)
 - [ ] Phase 6.5 — Drift reduces against a real protocol (replace mock receiver in e2e tick tests)
 - [ ] Phase 5 — dashboard (real latency chart first, then state panels)
 - [ ] Deployment — devnet program, live ER delegation round-trip, latency benchmark

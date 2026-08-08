@@ -1,7 +1,7 @@
 //! Jupiter Perps venue adapter — co-signed safety-net boundary (§8.7).
 //!
-//! Flash is the autonomous tier: Wick's guard PDA *is* the position owner and
-//! signs CPIs itself. Jupiter is the **co-signed** tier: every state change
+//! Drift is the autonomous tier: Wick's guard PDA *is* the position delegate
+//! and signs CPIs itself. Jupiter is the **co-signed** tier: every state change
 //! requires the position **owner**'s signature, and Jupiter's keeper-gated
 //! flows additionally require `keeper`/`apiKeeper` signer infrastructure that a
 //! guard neither has nor should fake. Wick therefore:
@@ -14,7 +14,7 @@
 //!
 //! This module owns the serialization that the client mirrors to reconstruct
 //! the owner-signed transaction, so it is the single source of truth for the
-//! Jupiter instruction shape — the same role `flash.rs` plays for the
+//! Jupiter instruction shape — the same role `drift.rs` plays for the
 //! autonomous tier, but build-only.
 //!
 //! Jupiter's safety-net instruction `instantCreateTpsl` (Anchor borsh):

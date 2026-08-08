@@ -1,7 +1,6 @@
 //! Drift Protocol venue adapter — autonomous hard reduce-only tier (§8.7).
 //!
-//! FlashTrade is winding down, so Wick's autonomous tier migrates to Drift
-//! perps. This module encodes the exact instruction data and account layout
+//! This module encodes the exact instruction data and account layout
 //! taken from the Drift `protocol-v2` source (`velocity-exchange/protocol-v2`):
 //!
 //! * Anchor 8-byte discriminator `sha256("global:place_perp_order")[..8]`.
@@ -117,10 +116,9 @@ impl ReduceOrderParams {
 /// `remaining_accounts` (perp market, oracle, spot markets, user maps) + 3 fixed.
 const MAX_DRIFT_ACCOUNTS: usize = 16;
 
-/// The accounts of Drift's `place_perp_order`, in exact order. Mirrors
-/// `flash.rs::ClosePositionAccounts`: the adapter is reconstructed from the tail
-/// of the `OnPriceTick` account list; the `remaining` slice is Drift's map-load
-/// accounts passed through unchanged.
+/// The accounts of Drift's `place_perp_order`, in exact order. The adapter is
+/// reconstructed from the tail of the `OnPriceTick` account list; the
+/// `remaining` slice is Drift's map-load accounts passed through unchanged.
 pub struct DriftPlaceOrderAccounts<'a> {
     pub state: &'a AccountView,
     pub user: &'a AccountView,

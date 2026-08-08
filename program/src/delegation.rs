@@ -1,7 +1,7 @@
 //! Ephemeral Rollup delegation hooks (§8.6).
 //!
 //! Wick's guard PDA can be delegated to the MagicBlock Ephemeral Rollup so the
-//! FlashTrade venue can execute sub-50ms autonomous guard checks on delegated
+//! Drift venue can execute sub-50ms autonomous guard checks on delegated
 //! state. These handlers wrap the Pinocchio-native
 //! `ephemeral-rollups-pinocchio` SDK:
 //!

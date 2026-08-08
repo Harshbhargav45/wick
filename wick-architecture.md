@@ -35,12 +35,12 @@ Whichever you pick, write it down in the repo README the moment you decide. Don'
 
 **Must be live, on stage, real (not mocked):**
 - Phase 1 — Pinocchio guard program, passing tests (account layout, 6A.1 math, authority checks).
-- Phase 2 — FlashAdapter, autonomous, one real measured sub-50ms action against the L1 baseline. This is your "beat the liquidator" claim — it needs to be true, not illustrated.
+- Phase 2 — DriftAdapter, autonomous, one real measured sub-50ms action against the L1 baseline. This is your "beat the liquidator" claim — it needs to be true, not illustrated.
 
 **Stretch — build if time allows, don't block the demo on it:**
 - Phase 3 (Jupiter) — if time is short, cut to **safety-net only**: `instant_create_tpsl` set at enrollment. Skip the live co-sign UX and keeper-queue race. Say "safety net is live; active co-sign is designed and partially wired" — a clean partial beats a live co-sign flow that stalls on stage.
-- Phase 4 (Pyth Lazer wiring) — check first whether Flash V2's own price stream is already sufficient for the demo before building a separate Lazer plugin integration. You may not need both.
-- Phase 5 (dashboard) — one real, honest latency chart (Flash sub-50ms vs. L1 baseline, actual measured samples) beats five polished-but-static panels. Build that one chart first; everything else in the dashboard is optional polish.
+- Phase 4 (Pyth Lazer wiring) — check first whether Drift's own price stream is already sufficient for the demo before building a separate Lazer plugin integration. You may not need both.
+- Phase 5 (dashboard) — one real, honest latency chart (Drift sub-50ms vs. L1 baseline, actual measured samples) beats five polished-but-static panels. Build that one chart first; everything else in the dashboard is optional polish.
 
 ---
 
@@ -48,9 +48,9 @@ Whichever you pick, write it down in the repo README the moment you decide. Don'
 
 Open with the finding, not the architecture:
 
-> "We went looking for a way to auto-protect Jupiter Perps positions and found something most teams miss: Jupiter's CPI client requires the position owner to sign every single state change — there's no delegated authority, verified straight from the account flags in the IDL-generated client source. A fully autonomous guard on Jupiter isn't a latency problem, it's architecturally impossible. So instead of faking it, we built two honest speed tiers — a truly autonomous sub-50ms guard on FlashTrade, and a co-signed safety net on Jupiter that never claims to be faster than it is."
+> "We went looking for a way to auto-protect Jupiter Perps positions and found something most teams miss: Jupiter's CPI client requires the position owner to sign every single state change — there's no delegated authority, verified straight from the account flags in the IDL-generated client source. A fully autonomous guard on Jupiter isn't a latency problem, it's architecturally impossible. So instead of faking it, we built two honest speed tiers — a truly autonomous sub-50ms guard on Drift (signed as the position delegate), and a co-signed safety net on Jupiter that never claims to be faster than it is."
 
-Then show the sub-50ms Flash action landing against the measured L1 baseline. That's your proof. Everything else supports it.
+Then show the sub-50ms Drift action landing against the measured L1 baseline. That's your proof. Everything else supports it.
 
 ---
 
@@ -60,7 +60,7 @@ Then show the sub-50ms Flash action landing against the measured L1 baseline. Th
 - Confirm you're pointed at the correct MagicBlock ER devnet RPC endpoint, not plain devnet — check this before writing any delegation code.
 - Confirm current Pinocchio crate version on crates.io/GitHub at build time (don't trust a remembered version).
 - Confirm `jup-perps-client` v1.2.0 is still current on crates.io.
-- Confirm FlashTrade V2 API access/keys work *before* the build starts, not discovered mid-build.
+- Confirm Drift `User.delegate` semantics on the target deployment before the build starts, not discovered mid-build.
 
 ---
 
@@ -70,7 +70,7 @@ Then show the sub-50ms Flash action landing against the measured L1 baseline. Th
 |---|---|---|---|---|
 | ER delegation path unclear for Pinocchio (Section 2 🔴) | High | Blocks Phase 1+ entirely | Discovery sprint → shim or keeper fallback | 4 hrs, hard stop |
 | Jupiter co-sign UX not finished in time | Medium | Weak/broken live demo segment | Cut to TP/SL-only safety net, say so explicitly | Decide by mid-build checkpoint |
-| Flash V2 API access/keys not confirmed early | Low-Medium | Build time wasted on setup | Confirm access before Phase 1 starts | Day 0 |
+| Drift `User.delegate` semantics not confirmed early | Low-Medium | Build time wasted on setup | Confirm delegate semantics before Phase 1 starts | Day 0 |
 | Dashboard scope creep | Medium | Time spent on polish instead of the one chart that matters | Build the honest latency chart first, everything else optional | Ongoing |
 | Team improvises which fallback was taken | Low | Confused/inconsistent demo narrative | Document decision in README the moment it's made | Immediate |
 
@@ -106,10 +106,10 @@ flowchart TD
     PL --> TICK
     VO --> TICK
 
-    DISPATCH -->|Autonomous| FLASH_CPI[Construct + CPI immediately]
+    DISPATCH -->|Autonomous| DRIFT_CPI[Construct + CPI immediately]
     DISPATCH -->|CoSigned| BUILD_IX[Build owner-signed instruction]
 
-    FLASH_CPI --> FLASH[FlashTrade L1 program]
+    DRIFT_CPI --> DRIFT[Drift L1 program]
     BUILD_IX --> CONFIRM[Frontend co-sign confirm]
     CONFIRM -->|owner signs| ENQUEUE[Jupiter keeper queue]
     ENQUEUE --> JUP[Jupiter Perps L1 program]
@@ -340,7 +340,7 @@ delegate(ctx):
     -> CPI into DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh (verified program ID, Section 2)
 ```
 
-### 8.7 Venue adapters — Flash (legacy) and Drift
+### 8.7 Venue adapters — Drift (autonomous) and Jupiter (co-signed)
 
 The guard's venue adapters are the only code path that constructs a
 venue-side CPI. Every adapter re-derives its accounts from the tail of the
@@ -348,30 +348,13 @@ venue-side CPI. Every adapter re-derives its accounts from the tail of the
 the exact wire format is pinned in one place and covered by byte-level unit
 tests (no foreign serialize produced at runtime).
 
-#### 8.7.1 FlashTrade (legacy, winding down)
+#### 8.7.1 FlashTrade (retired)
 
-`flash.rs` encodes `global:close_position` from Flash's audited
-`flash-perpetuals` source:
-
-```text
-discriminator   sha256("global:close_position")[..8]
-params          ClosePositionParams { price: u64 }   (anchor serialized)
-accounts(12):   owner(SIGNER,WRITE), receiving_account(WRITE),
-                transfer_authority, perpetuals, pool(WRITE), position(WRITE),
-                custody(WRITE), custody_oracle, collateral_custody(WRITE),
-                collateral_custody_oracle, collateral_custody_token_account,
-                token_program
-```
-
-Two guards use it:
-
-- **Co-signed** (`signer_seeds == []`): the venue requires the position
-  owner's signature; supplied in the outer transaction. No autonomous claim.
-- **Autonomous** (`signer_seeds == [guard_seeds]`) — the guard PDA *is* the
-  position owner, so it signs `close_position` with its own PDA seeds.
-
-`close_position` closes the whole position, so both partial-close and
-take-profit actions resolve to a conservative full close.
+The original `flash.rs` `close_position` adapter (`global:close_position`,
+12 accounts, owner-signed) was retired after Drift landed as the autonomous
+venue. `flash.rs`, `mocks/flash/`, the `VENUE_FLASH` path, and the Flash e2e
+tests were deleted in the Drift relaunch. §8.7.2 is now the sole autonomous
+adapter; the historical wire format is preserved in git history.
 
 #### 8.7.2 Drift (autonomous tier, hard reduce-only)
 
@@ -405,7 +388,11 @@ accounts: state(ro) → user(w, crate::processor) → authority(Signer) → [rem
   `User.delegate`** off-chain; the guard PDA signs as `authority`. Drift
   guarantees delegates **cannot withdraw funds**, but does **not** scope
   order placement — the hard reduce-only edit is what prevents
-  sticky/full-position orders.
+  sticky/full-position orders. The mock Drift in `mocks/drift/` models this
+  invariant faithfully: it reads `User.delegate` out of the user account and
+  rejects the CPI unless `authority.address() == delegate` **and**
+  `authority.is_signer()` — the autonomous e2e test fails if either holds
+  against the guard PDA.
 - **Market + sub-account pinning:** `market_index` and `drift_subaccount_id`
   are recorded in guard state at `InitGuard` (fields `drift_market_index` /
   `drift_subaccount_id`, appended to the 342-byte wire layout); the reduce
@@ -417,7 +404,7 @@ accounts: state(ro) → user(w, crate::processor) → authority(Signer) → [rem
   full take-profit close); a zero-size reduce escalates rather than idle.
   `price` = the guard's current breach/take-profit price. CPI is signed as
   the guard PDA (the `delegate`) via the same `seeds!("guard",
-  venue_owner, bump)` seeds as the Flash path.
+  venue_owner, bump)` seeds as the retired Flash path.
 - **InvalidInstruction on missing accounts** — the adapter/handlers reject
   a tick that omits the required state/user/authority slice
   (`accounts.get(2..)`), so a malformed tick cannot silently skip the reduce.
