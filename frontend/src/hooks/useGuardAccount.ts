@@ -1,112 +1,123 @@
-import { useEffect, useState } from 'react';
-import { Connection, PublicKey } from '@solana/web3.js';
+'use client';
 
-export interface GuardUIState {
-  healthFactor: number;
-  isPending: boolean;
-  isDegraded: boolean;
-  venue: string;
-  action: string | null;
-  lastCheckSlot: number;
+import { useEffect, useRef, useState } from 'react';
+import { Connection, PublicKey } from '@solana/web3.js';
+import {
+  GUARD_DATA_LEN,
+  VENUE_DRIFT,
+  VENUE_JUPITER,
+  decodeGuardState,
+  type GuardState,
+} from '@/lib/guard-layout';
+import { computeHealth, type Health } from '@/lib/guard-health';
+
+const POLL_INTERVAL_MS = 5_000;
+const DEFAULT_RPC = 'https://api.devnet.solana.com';
+
+export interface GuardSnapshot {
+  address: string;
+  state: GuardState;
+  health: Health;
+  venueLabel: string;
+  /** True when the guard can only build for the owner to co-sign (§8.4). */
+  isCoSigned: boolean;
+  /** A guard-built instruction is waiting on the owner's signature. */
+  awaitingConfirmation: boolean;
+  fetchedAt: number;
 }
 
-const GUARD_DATA_LEN = 342;
-const SCALE = 1_000_000;
+export type GuardStatus = 'config' | 'loading' | 'empty' | 'error' | 'ready';
 
-function parseProgramId(): { programId: PublicKey | null; error: string | null } {
-  const programIdStr = process.env.NEXT_PUBLIC_GUARD_PROGRAM_ID;
-  if (!programIdStr) return { programId: null, error: 'NEXT_PUBLIC_GUARD_PROGRAM_ID not set' };
+function venueLabel(venue: number, authority: string): string {
+  if (venue === VENUE_DRIFT) {
+    return authority === 'Autonomous' ? 'Drift · delegated' : 'Drift · co-signed';
+  }
+  if (venue === VENUE_JUPITER) return 'Jupiter · co-signed';
+  return `Venue ${venue}`;
+}
+
+function readConfig(): { programId: PublicKey | null; rpc: string; error: string | null } {
+  const rpc = process.env.NEXT_PUBLIC_SOLANA_RPC || DEFAULT_RPC;
+  const raw = process.env.NEXT_PUBLIC_GUARD_PROGRAM_ID;
+  if (!raw) {
+    return { programId: null, rpc, error: 'NEXT_PUBLIC_GUARD_PROGRAM_ID is not set' };
+  }
   try {
-    return { programId: new PublicKey(programIdStr), error: null };
+    return { programId: new PublicKey(raw), rpc, error: null };
   } catch {
-    return { programId: null, error: 'Invalid program ID' };
+    return { programId: null, rpc, error: `NEXT_PUBLIC_GUARD_PROGRAM_ID is not a valid pubkey` };
   }
 }
 
 export function useGuardAccount() {
-  const { programId, error: configError } = parseProgramId();
-  const [state, setState] = useState<GuardUIState | null>(null);
+  const { programId, rpc, error: configError } = readConfig();
+
+  const [snapshot, setSnapshot] = useState<GuardSnapshot | null>(null);
+  const [status, setStatus] = useState<GuardStatus>(configError ? 'config' : 'loading');
   const [error, setError] = useState<string | null>(configError);
+  const [nudge, setNudge] = useState(0);
+
+  const programIdKey = programId?.toBase58();
+  const inFlight = useRef(false);
 
   useEffect(() => {
-    if (!programId) return;
+    if (!programIdKey) return;
 
-    // Connect to devnet
-    const connection = new Connection('https://api.devnet.solana.com', 'confirmed');
+    const connection = new Connection(rpc, 'confirmed');
+    const key = new PublicKey(programIdKey);
+    let cancelled = false;
 
     const fetchState = async () => {
+      if (inFlight.current) return;
+      inFlight.current = true;
       try {
-        const accounts = await connection.getProgramAccounts(programId, {
+        const accounts = await connection.getProgramAccounts(key, {
           filters: [{ dataSize: GUARD_DATA_LEN }],
         });
+        if (cancelled) return;
 
         if (accounts.length === 0) {
-          setError('No guard accounts found');
+          setSnapshot(null);
+          setStatus('empty');
+          setError(null);
           return;
         }
 
-        const data = accounts[0].account.data;
+        const account = accounts[0]!;
+        const state = decodeGuardState(new Uint8Array(account.account.data));
+        const health = computeHealth(state);
+        const isCoSigned = state.authorityReq === 'CoSigned';
 
-        // Parse the byte layout based on account.rs
-        // G_VENUE_OFF = 1
-        const venueByte = data[1];
-        const venue = venueByte === 0 ? 'Drift · delegated' : venueByte === 1 ? 'Jupiter' : 'Unknown';
-
-        // COLLAT = 179
-        const collat = data.readBigUInt64LE(179); // simplified since it's u128 but JS can handle u64 easily if numbers are small
-        // SIZE = 195 (i128) - we will approximate for UI
-        const sizeData = data.readBigInt64LE(195);
-        const entryData = data.readBigUInt64LE(211);
-        const priceData = data.readBigUInt64LE(227);
-
-        const size = Number(sizeData) / SCALE;
-        const entry = Number(entryData) / SCALE;
-        const price = Number(priceData) / SCALE;
-
-        // Math matches state.rs
-        const pnl = size * (price - entry);
-        const equity = Number(collat) / SCALE + pnl;
-
-        // Assuming 500 bps (5%) maintenance for demo if we don't parse policy completely
-        const maintenanceBps = 500;
-        const required = Math.abs(size) * price * (maintenanceBps / 10000);
-
-        const healthFactor = required === 0 ? 99 : equity / required;
-
-        // Pending Tag = 259
-        const pendingTag = data[259];
-        const isPending = pendingTag !== 0;
-        let action: string | null = null;
-        if (pendingTag === 1) action = 'TopUp';
-        if (pendingTag === 2) action = 'PartialClose';
-        if (pendingTag === 3) action = 'TakeProfit';
-        if (pendingTag === 4) action = 'Escalate';
-
-        // Degraded = 276
-        const isDegraded = data[276] === 1;
-
-        // Slot = 251
-        const slot = Number(data.readBigUInt64LE(251));
-
-        setState({
-          healthFactor,
-          isPending,
-          isDegraded,
-          venue,
-          action,
-          lastCheckSlot: slot,
+        setSnapshot({
+          address: account.pubkey.toBase58(),
+          state,
+          health,
+          venueLabel: venueLabel(state.venue, state.authorityReq),
+          isCoSigned,
+          awaitingConfirmation: isCoSigned && state.pendingIxNonce !== null,
+          fetchedAt: Date.now(),
         });
+        setStatus('ready');
         setError(null);
       } catch (err) {
+        if (cancelled) return;
+        setStatus((prev) => (prev === 'ready' ? 'ready' : 'error'));
         setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        inFlight.current = false;
       }
     };
 
-    fetchState();
-    const interval = setInterval(fetchState, 5000);
+    void fetchState();
+    const interval = setInterval(fetchState, POLL_INTERVAL_MS);
 
-    return () => clearInterval(interval);
-  }, [programId]);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [programIdKey, rpc, nudge]);
 
-  return { state, error };
+  const refresh = () => setNudge((n) => n + 1);
+
+  return { snapshot, status, error, refresh, rpc, programId: programIdKey ?? null };
 }
