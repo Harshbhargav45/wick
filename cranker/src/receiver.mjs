@@ -41,7 +41,16 @@ export async function readWormholeProgramId(connection, receiverProgramId) {
   return new PublicKey(info.data.slice(41, 73));
 }
 
+let programsCache = null;
+
+/**
+ * Memoized: this opens a Connection and reads the receiver config PDA to
+ * resolve the Wormhole program id. Both are fixed for the life of the process,
+ * and redoing them every tick cost ~2s — enough to blow the guard's staleness
+ * window.
+ */
 export async function createReceiverPrograms() {
+  if (programsCache) return programsCache;
   const connection = new Connection(config.rpc, "confirmed");
   const wallet = new Wallet(crankerKeypair());
   const provider = new AnchorProvider(connection, wallet, {
@@ -55,7 +64,8 @@ export async function createReceiverPrograms() {
     config.receiverProgramId
   );
   const wormhole = new Program(WormholeIdl, wormholeProgramId, provider);
-  return { connection, provider, receiver, wormhole, wormholeProgramId };
+  programsCache = { connection, provider, receiver, wormhole, wormholeProgramId };
+  return programsCache;
 }
 
 async function buildEncodedVaaInstructions(wormhole, vaa) {
@@ -137,6 +147,13 @@ export async function buildPostUpdateInstructions(vaaBase64) {
     })
     .instruction();
 
+  // Both scratch accounts are per-tick. Left open they leak their rent every
+  // interval, so the caller closes them once the tick has read the price.
+  const reclaimRentIx = await receiver.methods
+    .reclaimRent()
+    .accounts({ priceUpdateAccount: priceUpdateKeypair.publicKey })
+    .instruction();
+
   return {
     initTx,
     verifyTx,
@@ -146,5 +163,6 @@ export async function buildPostUpdateInstructions(vaaBase64) {
     priceUpdateAccount: priceUpdateKeypair.publicKey,
     priceUpdateSigner: priceUpdateKeypair,
     close,
+    reclaimRentIx,
   };
 }
