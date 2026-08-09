@@ -8,17 +8,12 @@ export function BootSequence({ onComplete }: { onComplete: () => void }) {
   useEffect(() => {
     // Check reduced motion
     const prefersReduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-    if (prefersReduced) {
-      setIsBooting(false);
-      onComplete();
-      return;
-    }
 
     const timer = setTimeout(() => {
       setIsBooting(false);
       onComplete();
-    }, 1800); // 1.8s boot sequence per spec
-    
+    }, prefersReduced ? 0 : 1800); // 1.8s boot sequence per spec
+
     return () => clearTimeout(timer);
   }, [onComplete]);
 

@@ -149,9 +149,10 @@ The guard's margin wallet is a 2-of-2 (`user` + `co_authority`) — see §8.5.
   Jupiter closes are not yet expressed as a signed instruction — the guard holds
   those as pending state only. The full co-signed loop for breach protection
   still needs its safety-net build to close.
-- **Dashboard is a static scaffold** — the frontend exists with console/health/
-  activity components plus an honest latency chart fed by measured dispatch
-  samples, but no live on-chain state wiring yet.
+- **Dashboard is a static scaffold** — the frontend ships a landing page (`/`)
+  and a two-column console (`/console`) with health/stats/latency/activity
+  components, plus live on-chain polling for the deployed guard state, but the
+  console values still fall back to demo fixtures when no guard account exists.
 - **No measured latency benchmark** — the autonomous path is proven in an SBF
   VM and against the real Velocity program (p50 ≈ 375µs dispatch), but a real
   sub-50ms claim against a live L1 baseline is not yet measured on-chain.
@@ -175,6 +176,7 @@ The guard's margin wallet is a 2-of-2 (`user` + `co_authority`) — see §8.5.
 - [x] Phase 6 — Drift reduce-only `place_perp_order` adapter + delegate-PDA mock e2e (autonomous tier, §8.7)
 - [x] Phase 6.5 — live-protocol proof: autonomous reduce against the real Velocity (`vELoC1...`) program in LiteSVM with real mainnet account fixtures
 - [x] Phase 5 — dashboard: console + honest measured latency chart (p50 ≈ 375µs dispatch vs ~400ms L1 slot)
+- [x] Frontend redesign — Ember Circuit brand; landing page (`/`) + two-column console (`/console`) on the live guard account
 - [x] Deployment (partial) — guard program live on devnet (`FRtyvM3xcFhL5FbukUdzaMV7t4pePiqxPvp2ZHwptBE`); ER delegation round-trip + on-chain latency benchmark still open
 
 ## License

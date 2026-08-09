@@ -41,6 +41,7 @@ Whichever you pick, write it down in the repo README the moment you decide. Don'
 - Phase 3 (Jupiter) — if time is short, cut to **safety-net only**: `instant_create_tpsl` set at enrollment. Skip the live co-sign UX and keeper-queue race. Say "safety net is live; active co-sign is designed and partially wired" — a clean partial beats a live co-sign flow that stalls on stage.
 - Phase 4 (Pyth Lazer wiring) — check first whether Drift's own price stream is already sufficient for the demo before building a separate Lazer plugin integration. You may not need both.
 - Phase 5 (dashboard) — one real, honest latency chart (Drift sub-50ms vs. L1 baseline, actual measured samples) beats five polished-but-static panels. Build that one chart first; everything else in the dashboard is optional polish.
+- Phase 7 (frontend) — `/` is the brand landing (Ember Circuit, serif display, gradient hero, latency proof numbers from the measured sample set); `/console` is the two-column console (left rail: authority/venue/guard policy; right column: live guard, health, stats, latency, activity). The console reads the deployed guard account via `useGuardAccount` and falls back to honest fixtures when devnet has no account.
 
 ---
 

@@ -26,3 +26,6 @@ dist/
 
 # opencode tooling state
 .opencode/
+
+# brand-design preview artifacts
+.brand-preview/

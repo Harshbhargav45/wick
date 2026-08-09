@@ -1,5 +1,3 @@
-import styles from './Console.module.css';
-
 export function IgnitionMark({ className }: { className?: string }) {
   return (
     <svg 
