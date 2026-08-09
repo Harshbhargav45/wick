@@ -36,6 +36,8 @@ pub enum WickError {
     VenueCpi = 0xe,
     /// No owner-signed instruction is pending that the owner can confirm.
     NoPendingConfirm = 0xf,
+    /// The program is paused via RouteConfig kill-switch.
+    Paused = 0x10,
 }
 
 impl From<WickError> for ProgramError {

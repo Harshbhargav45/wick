@@ -74,9 +74,9 @@ cd program
 cargo test --features no-entrypoint --all-targets
 ```
 
-This runs 62 unit tests + 3 litesvm integration tests:
+This runs 61 unit tests + 4 litesvm integration tests:
 
-- **62 unit tests** — fixed-point health engine, breach detection, partial-close
+- **61 unit tests** — fixed-point health engine, breach detection, partial-close
   solver, action selection precedence + caps, 2-of-2 withdraw matrix, tick
   freshness/degraded mode, nonce semantics, serialization round-trips, Jupiter
   safety-net serialization + co-signed build persistence, the owner `Confirm`
@@ -115,14 +115,18 @@ cargo clippy --all-targets -- -D warnings
 
 `OnPriceTick` runs the §7.2 ordering:
 
-1. **Staleness** — reject ticks older than `MAX_TICK_AGE_SLOTS`; N consecutive
+1. **Price** — the mark is read from the Pyth `PriceUpdateV2` account at
+   account index `[3]` (verified feed ID, ≤60s age, ≤150bps confidence, 6dp
+   scaling); it is *never* taken from the tick payload, so a cranker cannot
+   feed the guard a fabricated price.
+2. **Staleness** — reject ticks older than `MAX_TICK_AGE_SLOTS`; N consecutive
    stale ticks flip the guard to `degraded` (surfaced to the frontend).
-2. **Health** — cross-multiplied equity-vs-maintenance check (no floats).
-3. **Nonce** — monotonic tick nonce; replayed/old nonces hard-reject.
-4. **Caps** — per-action + daily USD policy caps.
-5. **Select** — take-profit first, then top-up, then partial-close (bounded
+3. **Health** — cross-multiplied equity-vs-maintenance check (no floats).
+4. **Nonce** — monotonic tick nonce; replayed/old nonces hard-reject.
+5. **Caps** — per-action + daily USD policy caps.
+6. **Select** — take-profit first, then top-up, then partial-close (bounded
    binary-search solver), else escalate to manual review (never a silent no-op).
-6. **Dispatch** — Autonomous: construct + CPI immediately (nonce commits only on
+7. **Dispatch** — Autonomous: construct + CPI immediately (nonce commits only on
    a landed venue action). Co-Signed: hold the built instruction as pending
    (nonce commits only on the owner's L1 confirm).
 

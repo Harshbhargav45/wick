@@ -5,13 +5,23 @@
 //! * `InitGuard`    — [0] guard PDA (writable, created), [1] owner (signer),
 //!   [2] payer (signer, writable), [3] rent sysvar. Payload = [bump | policy
 //!   blob]; the PDA is derived from `b"guard"` || owner || bump.
-//! * `DepositMargin`— [0] guard (writable, program-owned), [1] owner (signer).
+//! * `DepositMargin`— [0] guard (writable, program-owned), [1] owner (signer),
+//!   [2] route_config (readonly, program-owned — kill-switch check).
 //!   Payload is the deposit `amount` (u128 LE). Credited to `collateral`.
 //! * `WithdrawMargin`— [0] guard (writable, program-owned), [1] owner
-//!   (signer), [2] co_authority (signer). Payload is `amount` (u128 LE).
-//!   Enforces the §8.5 2-of-2 rule.
+//!   (signer), [2] co_authority (signer), [3] route_config (readonly).
+//!   Payload is `amount` (u128 LE). Enforces the §8.5 2-of-2 rule.
 //! * `SetPaused`    — [0] route-config (writable, program-owned), [1] config
 //!   authority (signer). Payload is `paused` (u8).
+//! * `OnPriceTick`  — [0] guard (writable), [1] clock, [2] route_config
+//!   (readonly), [3] Pyth `PriceUpdateV2` (readonly, program-owned — the
+//!   authoritative price source), [4..] venue adapter accounts.
+//! * `UpdatePosition`— [0] guard (writable), [1] owner (signer),
+//!   [2] route_config (readonly).
+//! * `ConfirmYes`   — [0] guard (writable), [1] owner (signer),
+//!   [2] route_config (readonly).
+//! * `InitRouteConfig`— [0] config PDA (writable, created), [1] authority
+//!   (signer), [2] payer (signer, writable), [3] rent sysvar.
 
 use pinocchio::error::ProgramResult;
 use pinocchio::instruction::{cpi::Signer, seeds};
@@ -20,18 +30,27 @@ use pinocchio::{AccountView, Address};
 
 use pinocchio_system::instructions::CreateAccount;
 
-use crate::account::{GuardState, PendingIx, GUARD_DATA_LEN};
+use crate::account::{GuardState, PendingIx, GUARD_DATA_LEN, ROUTE_CONFIG_LEN};
 use crate::delegation;
 use crate::drift::{DriftPlaceOrderAccounts, ReduceDirection, ReduceOrderParams, VENUE_DRIFT};
 use crate::error::WickError;
 use crate::instruction::WickInstruction;
 use crate::jupiter::{build_tp_safety_net, VENUE_JUPITER};
+use crate::pyth::{pyth_price_to_scale6, read_price_no_older_than, SOL_USD_FEED_ID};
 use crate::state::{
     accept_tick, guard_act, select_action, track_tick_freshness, Action, ActionCaps,
     AuthorityRequirement, DispatchRegime, HealthSnapshot, RouteConfig, VenuePolicy,
 };
 
 const GUARD_SEED: &[u8] = b"guard";
+const ROUTE_CONFIG_SEED: &[u8] = b"route_config";
+
+/// Pyth pull-oracle gating (hours.md §7.1): a tick is only priced against a
+/// `PriceUpdateV2` no older than this many seconds, whose confidence is within
+/// this many basis points of the price. Tighter than the accessor's unit-test
+/// defaults; the guard never silently accepts a dead or wildly uncertain price.
+const PYTH_MAX_AGE_SECS: u64 = 60;
+const PYTH_MAX_CONF_BPS: u64 = 150;
 
 // -------------------------------------------------------------------------
 // Payload parsing
@@ -147,6 +166,23 @@ fn store_guard(account: &AccountView, state: &GuardState) -> Result<(), WickErro
         .map_err(|_| WickError::NotInitialized)
 }
 
+/// Check the RouteConfig kill-switch. Must be called at the top of every
+/// state-mutating instruction (§7). Returns `WickError::Paused` if the
+/// program is paused.
+fn check_not_paused(config_acc: &AccountView, program_id: &Address) -> Result<(), WickError> {
+    if !config_acc.owned_by(program_id) {
+        return Err(WickError::WrongAccountOwner);
+    }
+    let data = config_acc
+        .try_borrow()
+        .map_err(|_| WickError::NotInitialized)?;
+    let cfg = RouteConfig::from_bytes(&data).map_err(|_| WickError::NotInitialized)?;
+    if cfg.paused {
+        return Err(WickError::Paused);
+    }
+    Ok(())
+}
+
 // -------------------------------------------------------------------------
 // Handlers
 // -------------------------------------------------------------------------
@@ -208,7 +244,8 @@ fn init_guard(program_id: &Address, accounts: &[AccountView], data: &[u8]) -> Pr
 }
 
 fn deposit_margin(program_id: &Address, accounts: &[AccountView], data: &[u8]) -> ProgramResult {
-    let (guard, owner) = split_2(accounts)?;
+    let (guard, owner, route_config) = split_3(accounts)?;
+    check_not_paused(route_config, program_id)?;
     if !owner.is_signer() {
         return Err(WickError::MissingOwnerAuthority.into());
     }
@@ -228,7 +265,8 @@ fn deposit_margin(program_id: &Address, accounts: &[AccountView], data: &[u8]) -
 }
 
 fn withdraw_margin(program_id: &Address, accounts: &[AccountView], data: &[u8]) -> ProgramResult {
-    let (guard, owner, co_authority) = split_3(accounts)?;
+    let (guard, owner, co_authority, route_config) = split_4(accounts)?;
+    check_not_paused(route_config, program_id)?;
     let amount = parse_amount(data)?;
 
     let state = load_guard(guard, program_id)?;
@@ -288,7 +326,8 @@ fn set_paused(program_id: &Address, accounts: &[AccountView], data: &[u8]) -> Pr
 /// Account layout: [0] guard (writable, program-owned), [1] owner (signer).
 /// Data (after discriminator): collateral (u128), size (i128), entry (u128).
 fn update_position(program_id: &Address, accounts: &[AccountView], data: &[u8]) -> ProgramResult {
-    let (guard, owner) = split_2(accounts)?;
+    let (guard, owner, route_config) = split_3(accounts)?;
+    check_not_paused(route_config, program_id)?;
     if !owner.is_signer() {
         return Err(WickError::MissingOwnerAuthority.into());
     }
@@ -323,7 +362,8 @@ fn update_position(program_id: &Address, accounts: &[AccountView], data: &[u8]) 
 /// Account layout: [0] guard (writable, program-owned), [1] owner (signer).
 /// Data (after discriminator): none — the pending instruction is on the guard.
 fn confirm_pending(program_id: &Address, accounts: &[AccountView], _data: &[u8]) -> ProgramResult {
-    let (guard, owner) = split_2(accounts)?;
+    let (guard, owner, route_config) = split_3(accounts)?;
+    check_not_paused(route_config, program_id)?;
     if !guard.owned_by(program_id) {
         return Err(WickError::WrongAccountOwner.into());
     }
@@ -348,30 +388,55 @@ fn confirm_pending(program_id: &Address, accounts: &[AccountView], _data: &[u8])
 // -------------------------------------------------------------------------
 
 /// OnPriceTick data layout (after the discriminator byte):
-///   [0..16]  price (u128 LE, 6-decimal scale)
-///   [16..24] tick nonce (u64 LE — monotonic, supplied by the tick source)
-///   [24]     guard PDA bump (needed to sign the autonomous venue CPI)
+///   [0..8]  tick nonce (u64 LE — monotonic, supplied by the tick source)
+///   [8]     guard PDA bump (needed to sign the autonomous venue CPI)
+///
+/// The price is NOT part of the tick payload: it is read from the Pyth
+/// `PriceUpdateV2` account at index [3] and gated on feed id, staleness and
+/// confidence (§7.1). A caller-supplied price is never trusted, so a cranker
+/// cannot nudge the guard's health math by posting an arbitrary number.
 ///
 /// Account layout:
 ///   [0]    guard (writable, program-owned)
 ///   [1]    clock sysvar (readonly)
-///   [2..]  venue adapter accounts (only consumed for an autonomous venue CPI)
+///   [2]    route_config (readonly, program-owned — kill-switch check)
+///   [3]    Pyth `PriceUpdateV2` (readonly, owned by the Pyth receiver program)
+///   [4..]  venue adapter accounts (only consumed for an autonomous venue CPI)
 fn on_price_tick(program_id: &Address, accounts: &[AccountView], data: &[u8]) -> ProgramResult {
-    let (guard, clock) = split_2(accounts)?;
+    let (guard, clock, route_config) = split_3(accounts)?;
+    let pyth_account = accounts.get(3).ok_or(WickError::InvalidInstruction)?;
+    check_not_paused(route_config, program_id)?;
     if !guard.owned_by(program_id) {
         return Err(WickError::WrongAccountOwner.into());
     }
-    let current_slot = Clock::from_account_view(clock)
-        .map_err(|_| WickError::InvalidInstruction)?
-        .slot;
+    let clock_sv = Clock::from_account_view(clock).map_err(|_| WickError::InvalidInstruction)?;
+    let current_slot = clock_sv.slot;
+    let now = clock_sv.unix_timestamp;
 
     let payload = data.get(1..).ok_or(WickError::InvalidInstruction)?;
-    if payload.len() < 25 {
+    if payload.len() < 9 {
         return Err(WickError::InvalidInstruction.into());
     }
-    let price = u128::from_le_bytes(payload[0..16].try_into().unwrap());
-    let tick_nonce = u64::from_le_bytes(payload[16..24].try_into().unwrap());
-    let bump = payload[24];
+    let tick_nonce = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+    let bump = payload[8];
+
+    // §7.1 — the authoritative price. The account must belong to the Pyth
+    // receiver program and carry a Full-verified SOL/USD update, no staler
+    // than `PYTH_MAX_AGE_SECS`, with confidence within `PYTH_MAX_CONF_BPS`.
+    let oracle_data = pyth_account
+        .try_borrow()
+        .map_err(|_| WickError::NotInitialized)?;
+    // SAFETY: `owner` is only read here; the account is not writable in this
+    // instruction, so the reference cannot be invalidated by an `assign`/`close`.
+    let pyth = read_price_no_older_than(
+        &oracle_data,
+        unsafe { pyth_account.owner() },
+        &SOL_USD_FEED_ID,
+        now,
+        PYTH_MAX_AGE_SECS,
+        PYTH_MAX_CONF_BPS,
+    )?;
+    let price = pyth_price_to_scale6(&pyth)?;
 
     let mut state = load_guard(guard, program_id)?;
 
@@ -403,13 +468,16 @@ fn on_price_tick(program_id: &Address, accounts: &[AccountView], data: &[u8]) ->
     };
 
     // §8.4 — two-regime authority dispatch.
-    let (regime, expected_nonce) = guard_act(&state.policy, state.nonce)?;
+    let (regime, expected_nonce) = guard_act(&state.policy, tick_nonce)?;
+    // Venue adapter accounts start at index 4 (after guard, clock,
+    // route_config, pyth oracle).
+    let venue_accounts = accounts.get(4..).unwrap_or(&[]);
     match regime {
         DispatchRegime::Autonomous => {
-            match execute_autonomous(&state, action, accounts, bump) {
+            match execute_autonomous(&state, action, venue_accounts, bump) {
                 Ok(VenueOutcome::Executed) => {
                     // Nonce commits only when the venue action actually lands.
-                    state.nonce = tick_nonce;
+                    state.nonce = expected_nonce;
                 }
                 Ok(VenueOutcome::Escalate) | Err(WickError::UnsupportedVenueAction) => {
                     state.pending = Some(Action::EscalateManualReview);
@@ -455,10 +523,13 @@ enum VenueOutcome {
 /// Execute an action through the venue adapter in the autonomous tier. The
 /// guard PDA signs as the position delegate/owner — that is what ER delegation
 /// (§8.6) unlocks for sub-50ms execution.
+///
+/// `venue_accounts` is the tail of the instruction's account list starting
+/// *after* the guard, clock, and route_config accounts.
 fn execute_autonomous(
     state: &GuardState,
     action: Action,
-    accounts: &[AccountView],
+    venue_accounts: &[AccountView],
     bump: u8,
 ) -> Result<VenueOutcome, WickError> {
     if state.venue == VENUE_JUPITER {
@@ -473,7 +544,7 @@ fn execute_autonomous(
         // escalates to manual review rather than silently no-oping.
         return Err(WickError::UnsupportedVenueAction);
     }
-    execute_drift_autonomous(state, action, accounts, bump)
+    execute_drift_autonomous(state, action, venue_accounts, bump)
 }
 
 /// Execute a Drift perp reduce in the autonomous tier.
@@ -486,7 +557,7 @@ fn execute_autonomous(
 fn execute_drift_autonomous(
     state: &GuardState,
     action: Action,
-    accounts: &[AccountView],
+    venue_accounts: &[AccountView],
     bump: u8,
 ) -> Result<VenueOutcome, WickError> {
     // Reduce fraction: a TakeProfit closes the watched size in full; a Partial
@@ -499,7 +570,6 @@ fn execute_drift_autonomous(
         }
     };
 
-    let venue_accounts = accounts.get(2..).ok_or(WickError::InvalidInstruction)?;
     let adapter = DriftPlaceOrderAccounts::from_account_views(venue_accounts)?;
 
     // Reduce against the current position: a long reduces by selling (Drift
@@ -602,7 +672,48 @@ pub fn process_instruction(
         WickInstruction::OnPriceTick => on_price_tick(program_id, accounts, data),
         WickInstruction::UpdatePosition => update_position(program_id, accounts, data),
         WickInstruction::ConfirmYes => confirm_pending(program_id, accounts, data),
+        WickInstruction::InitRouteConfig => init_route_config(program_id, accounts, data),
     }
+}
+
+/// Create the singleton RouteConfig PDA.
+///
+/// Account layout: [0] config PDA (writable, created), [1] authority (signer),
+/// [2] payer (signer, writable), [3] rent sysvar.
+/// Data (after discriminator): [0] bump.
+fn init_route_config(program_id: &Address, accounts: &[AccountView], data: &[u8]) -> ProgramResult {
+    let (config, authority, payer, rent) = split_4(accounts)?;
+    if !authority.is_signer() || !payer.is_signer() {
+        return Err(WickError::MissingOwnerAuthority.into());
+    }
+    let bump = *data.get(1).ok_or(WickError::InvalidInstruction)?;
+    let bump_bytes = [bump];
+    let seeds = seeds!(ROUTE_CONFIG_SEED, &bump_bytes);
+    let signer = Signer::from(&seeds);
+
+    if config.lamports() == 0 {
+        let create_account = CreateAccount::with_minimum_balance(
+            payer,
+            config,
+            ROUTE_CONFIG_LEN as u64,
+            program_id,
+            Some(rent),
+        )?;
+        create_account.invoke_signed(&[signer])?;
+    }
+    let cfg = RouteConfig {
+        authority: authority.address().to_bytes(),
+        paused: false,
+        _padding: [0u8; 31],
+    };
+    {
+        let mut out = config
+            .try_borrow_mut()
+            .map_err(|_| WickError::NotInitialized)?;
+        cfg.write_into(&mut out)
+            .map_err(|_| WickError::NotInitialized)?;
+    }
+    Ok(())
 }
 
 /// §8.5 The 2-of-2 authority check as a pure function so it can be unit-tested
@@ -850,14 +961,38 @@ mod tests {
         buf
     }
 
-    /// OnPriceTick payload: [7, price:16, nonce:8, bump:1].
-    fn tick_data(price: u128, nonce: u64, bump: u8) -> [u8; 26] {
-        let mut d = [0u8; 26];
+    /// OnPriceTick payload: [7, nonce:8, bump:1]. The price now comes from the
+    /// Pyth `PriceUpdateV2` fixture, never the payload (security: no caller-
+    /// supplied price).
+    fn tick_data(nonce: u64, bump: u8) -> [u8; 10] {
+        let mut d = [0u8; 10];
         d[0] = 7;
-        d[1..17].copy_from_slice(&price.to_le_bytes());
-        d[17..25].copy_from_slice(&nonce.to_le_bytes());
-        d[25] = bump;
+        d[1..9].copy_from_slice(&nonce.to_le_bytes());
+        d[9] = bump;
         d
+    }
+
+    /// A Pyth `PriceUpdateV2` account carrying `price6` in Wick's 6-decimal
+    /// scale, published fresh and with zero confidence, owned by the Pyth
+    /// receiver program. Mirrors the golden layout in `pyth::tests`.
+    /// With expo=-8, raw * 10^(expo+6) = raw * 10^-2 == price6 ⇒ raw = price6*100.
+    fn pyth_price_account(price6: u128) -> TestAccount {
+        let mut data = vec![0u8; 200];
+        data[..8].copy_from_slice(&crate::pyth::PRICE_UPDATE_V2_DISCRIMINATOR);
+        data[40] = 1; // Full verification
+        data[41..73].copy_from_slice(&crate::pyth::SOL_USD_FEED_ID);
+        data[73..81].copy_from_slice(&((price6 * 100) as i64).to_le_bytes()); // raw (i64)
+        data[81..89].copy_from_slice(&0u64.to_le_bytes()); // conf = 0
+        data[89..93].copy_from_slice(&(-8i32).to_le_bytes()); // exponent
+        data[93..101].copy_from_slice(&0i64.to_le_bytes()); // publish_time (now=0 in unit clock)
+        TestAccount::new(
+            Address::new_from_array([3u8; 32]), // mock address
+            crate::pyth::PYTH_RECEIVER_PROGRAM_ID,
+            0,
+            &data,
+            false,
+            false,
+        )
     }
 
     /// A Clock sysvar account reporting `slot`. Address must be CLOCK_ID or
@@ -868,6 +1003,24 @@ mod tests {
         TestAccount::new(
             CLOCK_ID,
             Address::new_from_array([0u8; 32]),
+            0,
+            &data,
+            false,
+            false,
+        )
+    }
+
+    fn route_config_account() -> TestAccount {
+        let cfg = RouteConfig {
+            authority: [0u8; 32],
+            paused: false,
+            _padding: [0u8; 31],
+        };
+        let mut data = vec![0u8; ROUTE_CONFIG_LEN];
+        cfg.write_into(&mut data).unwrap();
+        TestAccount::new(
+            Address::new_from_array([2u8; 32]), // mock address
+            PROGRAM_ID,
             0,
             &data,
             false,
@@ -896,7 +1049,8 @@ mod tests {
             false,
         );
 
-        let accounts = [guard.view, owner_acc.view];
+        let route_config = route_config_account();
+        let accounts = [guard.view, owner_acc.view, route_config.view];
         let data = [
             1u8, 0x2a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00,
@@ -924,7 +1078,8 @@ mod tests {
             false,
         );
 
-        let accounts = [guard.view, stranger.view];
+        let route_config = route_config_account();
+        let accounts = [guard.view, stranger.view, route_config.view];
         let data = [1u8, 42, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let result = process_instruction(&PROGRAM_ID, &accounts, &data);
         assert_eq!(result, Err(WickError::SignerKeyMismatch.into()));
@@ -949,7 +1104,8 @@ mod tests {
             false,
         );
 
-        let accounts = [guard.view, owner_acc.view];
+        let route_config = route_config_account();
+        let accounts = [guard.view, owner_acc.view, route_config.view];
         let data = [1u8, 42, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let result = process_instruction(&PROGRAM_ID, &accounts, &data);
         assert_eq!(result, Err(WickError::MissingOwnerAuthority.into()));
@@ -978,7 +1134,8 @@ mod tests {
             false,
         );
 
-        let accounts = [guard.view, owner_acc.view, co.view];
+        let route_config = route_config_account();
+        let accounts = [guard.view, owner_acc.view, co.view, route_config.view];
         let data = [2u8, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]; // Withdraw 10
         let result = process_instruction(&PROGRAM_ID, &accounts, &data);
         assert_eq!(result, Err(WickError::MissingCoAuthority.into()));
@@ -1010,7 +1167,8 @@ mod tests {
             false,
         );
 
-        let accounts = [guard.view, owner_acc.view, co.view];
+        let route_config = route_config_account();
+        let accounts = [guard.view, owner_acc.view, co.view, route_config.view];
         let data = [2u8, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]; // Withdraw 10
         let result = process_instruction(&PROGRAM_ID, &accounts, &data);
         assert!(result.is_ok());
@@ -1041,7 +1199,8 @@ mod tests {
             false,
         );
 
-        let accounts = [guard.view, owner_acc.view, co.view];
+        let route_config = route_config_account();
+        let accounts = [guard.view, owner_acc.view, co.view, route_config.view];
         // Withdraw u128::MAX — way over 100_000_000 collateral.
         let mut data = [2u8; 17];
         data[0] = 2;
@@ -1082,7 +1241,8 @@ mod tests {
             false,
         );
 
-        let accounts = [guard.view, owner_acc.view, co.view];
+        let route_config = route_config_account();
+        let accounts = [guard.view, owner_acc.view, route_config.view, co.view];
         let data = [2u8, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let result = process_instruction(&PROGRAM_ID, &accounts, &data);
         assert_eq!(result, Err(WickError::WrongAccountOwner.into()));
@@ -1249,13 +1409,18 @@ mod tests {
     // ------------------------------------------------------------------
 
     /// Drive one tick against a guard. `guard_acc` is the writable guard
-    /// account; a fresh clock account is created per call.
+    /// account; a fresh clock account is created per call. The price comes
+    /// from the Pyth oracle fixture, not the payload.
     fn run_tick(
         guard_acc: &TestAccount,
-        clock: &TestAccount,
+        slot: u64,
+        price: u128,
         data: &[u8],
     ) -> Result<(), pinocchio::error::ProgramError> {
-        let accounts = [guard_acc.view, clock.view];
+        let clock = clock_account(slot);
+        let route_config = route_config_account();
+        let pyth = pyth_price_account(price);
+        let accounts = [guard_acc.view, clock.view, route_config.view, pyth.view];
         process_instruction(&PROGRAM_ID, &accounts, data)
     }
 
@@ -1263,10 +1428,9 @@ mod tests {
     fn tick_cosigned_breach_stores_pending_without_advancing_nonce() {
         let guard_data = make_guard(AuthorityRequirement::CoSigned, 0, 0, 0);
         let guard = TestAccount::new(PROGRAM_ID, PROGRAM_ID, 100, &guard_data, false, true);
-        let clock = clock_account(20); // fresh: 20 - 0 <= 25
 
         // price 48m: pnl = 100m*(48m-50m)/1m = -200m, equity -100m, breach.
-        let result = run_tick(&guard, &clock, &tick_data(48_000_000, 1, 0));
+        let result = run_tick(&guard, 20, 48_000_000, &tick_data(1, 0));
         assert!(result.is_ok());
 
         let state = GuardState::from_bytes(guard.data()).unwrap();
@@ -1291,10 +1455,9 @@ mod tests {
             state.write_into(&mut guard_data).unwrap();
         }
         let guard = TestAccount::new(PROGRAM_ID, PROGRAM_ID, 100, &guard_data, false, true);
-        let clock = clock_account(20);
 
         // price 58m (> TP 55m): take-profit fires; equity 900m > req, TP wins.
-        let result = run_tick(&guard, &clock, &tick_data(58_000_000, 1, 0));
+        let result = run_tick(&guard, 20, 58_000_000, &tick_data(1, 0));
         assert!(result.is_ok());
 
         let state = GuardState::from_bytes(guard.data()).unwrap();
@@ -1337,7 +1500,8 @@ mod tests {
 
         // ConfirmYes discriminator = 9; no payload bytes needed.
         let data = [9u8];
-        let accounts = [guard.view, owner.view];
+        let route_config = route_config_account();
+        let accounts = [guard.view, owner.view, route_config.view];
         let result = process_instruction(&PROGRAM_ID, &accounts, &data);
         assert!(result.is_ok());
 
@@ -1370,7 +1534,8 @@ mod tests {
             false,
         );
 
-        let accounts = [guard.view, stranger.view];
+        let route_config = route_config_account();
+        let accounts = [guard.view, stranger.view, route_config.view];
         let result = process_instruction(&PROGRAM_ID, &accounts, &[9u8]);
         assert_eq!(result, Err(WickError::SignerKeyMismatch.into()));
         // Nonce untouched.
@@ -1399,7 +1564,8 @@ mod tests {
             false, // correct key but is_signer = false
             false,
         );
-        let accounts = [guard.view, owner_acc.view];
+        let route_config = route_config_account();
+        let accounts = [guard.view, owner_acc.view, route_config.view];
         let result = process_instruction(&PROGRAM_ID, &accounts, &[9u8]);
         assert_eq!(result, Err(WickError::MissingOwnerAuthority.into()));
     }
@@ -1416,7 +1582,8 @@ mod tests {
             true,
             false,
         );
-        let accounts = [guard.view, owner.view];
+        let route_config = route_config_account();
+        let accounts = [guard.view, owner.view, route_config.view];
         let result = process_instruction(&PROGRAM_ID, &accounts, &[9u8]);
         assert_eq!(result, Err(WickError::NoPendingConfirm.into()));
     }
@@ -1425,10 +1592,9 @@ mod tests {
     fn tick_healthy_updates_snapshot_no_action() {
         let guard_data = make_guard(AuthorityRequirement::CoSigned, 0, 0, 0);
         let guard = TestAccount::new(PROGRAM_ID, PROGRAM_ID, 100, &guard_data, false, true);
-        let clock = clock_account(20);
 
         // price 55m: equity 600m > req 5m — not liquidatable, TP unset.
-        let result = run_tick(&guard, &clock, &tick_data(55_000_000, 1, 0));
+        let result = run_tick(&guard, 20, 55_000_000, &tick_data(1, 0));
         assert!(result.is_ok());
 
         let state = GuardState::from_bytes(guard.data()).unwrap();
@@ -1442,10 +1608,9 @@ mod tests {
     fn tick_replayed_nonce_is_noop() {
         let guard_data = make_guard(AuthorityRequirement::CoSigned, 0, 5, 0);
         let guard = TestAccount::new(PROGRAM_ID, PROGRAM_ID, 100, &guard_data, false, true);
-        let clock = clock_account(20);
 
         // Breach price but nonce 5 == last nonce → hard reject (§8.2).
-        let result = run_tick(&guard, &clock, &tick_data(48_000_000, 5, 0));
+        let result = run_tick(&guard, 20, 48_000_000, &tick_data(5, 0));
         assert!(result.is_ok());
 
         let state = GuardState::from_bytes(guard.data()).unwrap();
@@ -1464,8 +1629,7 @@ mod tests {
         // Three stale ticks — each arrives >25 slots after the previous check
         // (a glitching stream). First two do nothing, the third flips degraded.
         for slot in [100u64, 130, 160] {
-            let clock = clock_account(slot);
-            let result = run_tick(&guard, &clock, &tick_data(48_000_000, 1, 0));
+            let result = run_tick(&guard, slot, 48_000_000, &tick_data(1, 0));
             assert!(result.is_ok());
         }
         let state = GuardState::from_bytes(guard.data()).unwrap();
@@ -1476,8 +1640,7 @@ mod tests {
 
         // A tick arriving within 25 slots of the last check is fresh and
         // clears the streak and the degraded flag (§8.1.3).
-        let clock = clock_account(165); // 165 - 160 = 5 → fresh
-        let result = run_tick(&guard, &clock, &tick_data(48_000_000, 1, 0));
+        let result = run_tick(&guard, 165, 48_000_000, &tick_data(1, 0)); // 165 - 160 = 5 → fresh
         assert!(result.is_ok());
         let state = GuardState::from_bytes(guard.data()).unwrap();
         assert_eq!(state.stale_streak, 0);
@@ -1491,9 +1654,7 @@ mod tests {
         // silently no-opping (§8.2 #4).
         let guard_data = make_guard(AuthorityRequirement::Autonomous, 0, 0, 0);
         let guard = TestAccount::new(PROGRAM_ID, PROGRAM_ID, 100, &guard_data, false, true);
-        let clock = clock_account(20);
-
-        let result = run_tick(&guard, &clock, &tick_data(48_000_000, 1, 0));
+        let result = run_tick(&guard, 20, 48_000_000, &tick_data(1, 0));
         assert!(result.is_ok());
 
         let state = GuardState::from_bytes(guard.data()).unwrap();
@@ -1541,12 +1702,11 @@ mod tests {
         let mut guard_data = vec![0u8; GUARD_DATA_LEN];
         state.write_into(&mut guard_data).unwrap();
         let guard = TestAccount::new(PROGRAM_ID, PROGRAM_ID, 100, &guard_data, false, true);
-        let clock = clock_account(20);
 
         // TakeProfit is the top-priority action (fires before the liquidity
         // gate), so it deterministically reaches the reduce path regardless of
         // solver reachability.
-        let result = run_tick(&guard, &clock, &tick_data(49_000_000, 1, 0));
+        let result = run_tick(&guard, 20, 49_000_000, &tick_data(1, 0));
         assert_eq!(result, Err(WickError::InvalidInstruction.into()));
 
         let state = GuardState::from_bytes(guard.data()).unwrap();
@@ -1567,9 +1727,64 @@ mod tests {
             false,
             false,
         );
-        let accounts = [guard.view, bad_clock.view];
-        let result = process_instruction(&PROGRAM_ID, &accounts, &tick_data(48_000_000, 1, 0));
+        let route_config = route_config_account();
+        let accounts = [guard.view, bad_clock.view, route_config.view];
+        let result = process_instruction(&PROGRAM_ID, &accounts, &tick_data(1, 0));
         assert_eq!(result, Err(WickError::InvalidInstruction.into()));
+    }
+
+    #[test]
+    fn tick_missing_pyth_oracle_rejected() {
+        // security: a tick without the authoritative Pyth `PriceUpdateV2`
+        // account must be rejected — a cranker cannot fall back to a
+        // caller-supplied price (the pre-Pyth behavior was the vuln).
+        let guard_data = make_guard(AuthorityRequirement::CoSigned, 0, 0, 0);
+        let guard = TestAccount::new(PROGRAM_ID, PROGRAM_ID, 100, &guard_data, false, true);
+        let clock = clock_account(20);
+        let route_config = route_config_account();
+        // No Pyth account: accounts end after [guard, clock, route_config].
+        let accounts = [guard.view, clock.view, route_config.view];
+        let result = process_instruction(&PROGRAM_ID, &accounts, &tick_data(1, 0));
+        assert_eq!(result, Err(WickError::InvalidInstruction.into()));
+        let state = GuardState::from_bytes(guard.data()).unwrap();
+        assert_eq!(state.nonce, 0);
+        assert_eq!(
+            state.last_check_slot, 0,
+            "no state mutated by rejected tick"
+        );
+    }
+
+    #[test]
+    fn tick_foreign_oracle_account_rejected() {
+        // security: a PriceUpdateV2-shaped account owned by something other
+        // than the Pyth receiver program must not price the tick.
+        let guard_data = make_guard(AuthorityRequirement::CoSigned, 0, 0, 0);
+        let guard = TestAccount::new(PROGRAM_ID, PROGRAM_ID, 100, &guard_data, false, true);
+        let clock = clock_account(20);
+        let route_config = route_config_account();
+        // Valid layout bytes, but owned by the guard program (attacker on the
+        // fixture frame) — the accessor's owner gate must reject.
+        let mut data = vec![0u8; 200];
+        data[..8].copy_from_slice(&crate::pyth::PRICE_UPDATE_V2_DISCRIMINATOR);
+        data[40] = 1;
+        data[41..73].copy_from_slice(&crate::pyth::SOL_USD_FEED_ID);
+        data[73..81].copy_from_slice(&((49_000_000u128 * 100) as i64).to_le_bytes());
+        data[81..89].copy_from_slice(&0u64.to_le_bytes());
+        data[89..93].copy_from_slice(&(-8i32).to_le_bytes());
+        data[93..101].copy_from_slice(&0i64.to_le_bytes());
+        let imposter = TestAccount::new(
+            Address::new_from_array([3u8; 32]),
+            PROGRAM_ID, // not the Pyth receiver program
+            0,
+            &data,
+            false,
+            false,
+        );
+        let accounts = [guard.view, clock.view, route_config.view, imposter.view];
+        let result = process_instruction(&PROGRAM_ID, &accounts, &tick_data(1, 99));
+        assert_eq!(result, Err(WickError::WrongAccountOwner.into()));
+        let state = GuardState::from_bytes(guard.data()).unwrap();
+        assert_eq!(state.nonce, 0);
     }
 
     #[test]
@@ -1591,7 +1806,8 @@ mod tests {
             true,
             false,
         );
-        let accounts = [guard.view, owner_acc.view];
+        let route_config = route_config_account();
+        let accounts = [guard.view, owner_acc.view, route_config.view];
         let result = process_instruction(&PROGRAM_ID, &accounts, &data);
         assert!(result.is_ok());
 
@@ -1609,7 +1825,8 @@ mod tests {
             true,
             false,
         );
-        let accounts = [guard.view, stranger.view];
+        let route_config = route_config_account();
+        let accounts = [guard.view, stranger.view, route_config.view];
         let result = process_instruction(&PROGRAM_ID, &accounts, &data);
         assert_eq!(result, Err(WickError::SignerKeyMismatch.into()));
     }

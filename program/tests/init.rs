@@ -24,6 +24,7 @@ const RENT_SYSVAR: &str = "SysvarRent111111111111111111111111111111111";
 const SYSTEM_PROGRAM: &str = "11111111111111111111111111111111";
 
 const GUARD_SEED: &[u8] = b"guard";
+const ROUTE_CONFIG_SEED: &[u8] = b"route_config";
 
 fn read_wick_program() -> Vec<u8> {
     let mut so_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -101,11 +102,29 @@ fn init_guard_and_deposit() {
     // --- Deposit 1_000_000_000 ---
     let mut deposit_data = vec![1u8]; // discriminator
     deposit_data.extend_from_slice(&1_000_000_000u128.to_le_bytes());
+    // Derive + init the singleton RouteConfig (required by every guard ix).
+    let (route_config, bump) = Address::find_program_address(&[ROUTE_CONFIG_SEED], &program_id);
+    let rc_ix = Instruction {
+        program_id,
+        accounts: vec![
+            AccountMeta::new(route_config, false),
+            AccountMeta::new_readonly(owner, true),
+            AccountMeta::new(owner, true),
+            AccountMeta::new_readonly(rent_sysvar, false),
+            AccountMeta::new_readonly(system_program, false),
+        ],
+        data: vec![10u8, bump],
+    };
+    let rc_msg = Message::new_with_blockhash(&[rc_ix], Some(&owner), &svm.latest_blockhash());
+    let rc_tx = Transaction::new(&[&owner_kp], rc_msg, svm.latest_blockhash());
+    svm.send_transaction(rc_tx).expect("InitRouteConfig failed");
+
     let deposit_ix = Instruction {
         program_id,
         accounts: vec![
             AccountMeta::new(guard_pda, false),
             AccountMeta::new_readonly(owner, true),
+            AccountMeta::new_readonly(route_config, false),
         ],
         data: deposit_data,
     };

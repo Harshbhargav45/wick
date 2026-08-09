@@ -86,7 +86,7 @@ The inline diagram shown in chat covers the overview. This is the same flow with
 ```mermaid
 flowchart TD
     subgraph Inputs["Price inputs"]
-        PL[Pyth Lazer ticks, ~1ms]
+        PL[Pyth PriceUpdateV2 pull, authoritative tick price]
         VO[Venue oracle aggregate]
     end
 

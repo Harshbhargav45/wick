@@ -171,11 +171,13 @@ pub enum DispatchRegime {
 ///
 /// The nonce commit rule lives here so it is unit-testable: only the Autonomous
 /// branch may advance `nonce`; the CoSigned branch defers it to the confirm step.
-pub fn guard_act(policy: &VenuePolicy, nonce: u64) -> Result<(DispatchRegime, u64), WickError> {
-    let expected_nonce = nonce.checked_add(1).ok_or(WickError::MathOverflow)?;
+pub fn guard_act(
+    policy: &VenuePolicy,
+    tick_nonce: u64,
+) -> Result<(DispatchRegime, u64), WickError> {
     match policy.authority {
-        AuthorityRequirement::Autonomous => Ok((DispatchRegime::Autonomous, expected_nonce)),
-        AuthorityRequirement::CoSigned => Ok((DispatchRegime::CoSigned, expected_nonce)),
+        AuthorityRequirement::Autonomous => Ok((DispatchRegime::Autonomous, tick_nonce)),
+        AuthorityRequirement::CoSigned => Ok((DispatchRegime::CoSigned, tick_nonce)),
     }
 }
 
@@ -464,16 +466,16 @@ mod tests {
             ..base
         };
 
-        // Autonomous: execute now, nonce = old + 1.
+        // Autonomous: execute now, nonce = tick_nonce.
         let (regime, expected) = guard_act(&auth_auto, 7).unwrap();
         assert_eq!(regime, DispatchRegime::Autonomous);
-        assert_eq!(expected, 8);
+        assert_eq!(expected, 7);
 
-        // CoSigned: defer, nonce = old + 1 but must NOT be committed by the
+        // CoSigned: defer, nonce = tick_nonce but must NOT be committed by the
         // build step (§8.4) — the confirm step commits it later.
         let (regime, expected) = guard_act(&auth_co, 7).unwrap();
         assert_eq!(regime, DispatchRegime::CoSigned);
-        assert_eq!(expected, 8);
+        assert_eq!(expected, 7);
     }
 
     #[test]

@@ -52,6 +52,19 @@ const RENT_SYSVAR: &str = "SysvarRent111111111111111111111111111111111";
 const SYSTEM_PROGRAM: &str = "11111111111111111111111111111111";
 
 const GUARD_SEED: &[u8] = b"guard";
+const ROUTE_CONFIG_SEED: &[u8] = b"route_config";
+
+/// Pyth pull-oracle constants mirrored from `crate::pyth`: the receiver
+/// program, the PriceUpdateV2 discriminator, and the SOL/USD feed id.
+const WICK_PYTH_PROGRAM: Pubkey = Pubkey::new_from_array([
+    12, 183, 250, 187, 82, 247, 166, 72, 187, 91, 49, 125, 154, 1, 139, 144, 87, 203, 2, 71, 116,
+    250, 254, 1, 230, 196, 223, 152, 204, 56, 88, 129,
+]);
+const WICK_PYTH_DISCRIMINATOR: [u8; 8] = [34, 241, 35, 99, 157, 126, 244, 205];
+const SOL_USD_FEED_ID: [u8; 32] = [
+    239, 13, 139, 111, 218, 44, 235, 164, 29, 161, 93, 64, 149, 209, 218, 57, 42, 13, 47, 142, 208,
+    198, 199, 188, 15, 76, 250, 200, 194, 128, 181, 109,
+];
 
 /// Clock slot to run the dispatch at: just past both fixtures' oracle
 /// `posted_slot` (~438,024,296) so Velocity's money math sees fresh markets.
@@ -110,6 +123,61 @@ fn init_data(bump: u8) -> Vec<u8> {
     blob[148..150].copy_from_slice(&0u16.to_le_bytes()); // sub_account_id 0
     data.extend_from_slice(&blob);
     data
+}
+
+/// Derive the singleton RouteConfig PDA: the program seeds it
+/// `[b"route_config", bump]`, so the canonical bump append matches.
+fn route_config_pda(program_id: Address) -> (Address, u8) {
+    Address::find_program_address(&[ROUTE_CONFIG_SEED], &program_id)
+}
+
+/// Initialize the singleton RouteConfig via `InitRouteConfig` (disc 10).
+fn init_route_config(
+    svm: &mut LiteSVM,
+    program_id: Address,
+    rent: Address,
+    system: Address,
+    owner_kp: &Keypair,
+    owner: Address,
+) -> Address {
+    let (config, bump) = route_config_pda(program_id);
+    let ix = Instruction {
+        program_id,
+        accounts: vec![
+            AccountMeta::new(config, false),
+            AccountMeta::new_readonly(owner, true),
+            AccountMeta::new(owner, true),
+            AccountMeta::new_readonly(rent, false),
+            AccountMeta::new_readonly(system, false),
+        ],
+        data: vec![10u8, bump],
+    };
+    let msg = Message::new_with_blockhash(&[ix], Some(&owner), &svm.latest_blockhash());
+    let tx = Transaction::new(&[owner_kp], msg, svm.latest_blockhash());
+    svm.send_transaction(tx).expect("InitRouteConfig failed");
+    config
+}
+
+/// A Pyth `PriceUpdateV2` account (SOL/USD, Full-verified) carrying `price6`
+/// in Wick's 6-decimal scale, owned by the Pyth receiver program. With
+/// expo=-8, raw * 10^(expo+6) == price6 ⇒ raw = price6*100. publish_time 0 is
+/// fresh against the guard's `now` gate; confidence 0 ≤ 150bps.
+fn pyth_account(price6: u128) -> Account {
+    let mut data = vec![0u8; 200];
+    data[..8].copy_from_slice(&WICK_PYTH_DISCRIMINATOR);
+    data[40] = 1; // Full verification
+    data[41..73].copy_from_slice(&SOL_USD_FEED_ID);
+    data[73..81].copy_from_slice(&((price6 * 100) as i64).to_le_bytes()); // raw
+    data[81..89].copy_from_slice(&0u64.to_le_bytes()); // conf
+    data[89..93].copy_from_slice(&(-8i32).to_le_bytes()); // expo
+    data[93..101].copy_from_slice(&0i64.to_le_bytes()); // publish_time
+    Account {
+        lamports: 1_000_000,
+        data,
+        owner: WICK_PYTH_PROGRAM,
+        executable: false,
+        rent_epoch: 0,
+    }
 }
 
 /// Build the synthetic real-layout Velocity `User` (4496 bytes). The
@@ -260,6 +328,9 @@ fn autonomous_tick_places_reduce_with_real_velocity_program() {
     let tx = Transaction::new(&[&owner_kp], msg, svm.latest_blockhash());
     svm.send_transaction(tx).expect("InitGuard failed");
 
+    // --- InitRouteConfig (kill-switch singleton, required by every guard ix) ---
+    let route_config = init_route_config(&mut svm, program_id, rent, system, &owner_kp, owner);
+
     // --- UpdatePosition: collateral $45, size 100, entry $50 (underwater) ---
     let mut upd = vec![8u8];
     upd.extend_from_slice(&45_000_000u128.to_le_bytes());
@@ -270,6 +341,7 @@ fn autonomous_tick_places_reduce_with_real_velocity_program() {
         accounts: vec![
             AccountMeta::new(guard_pda, false),
             AccountMeta::new_readonly(owner, true),
+            AccountMeta::new_readonly(route_config, false),
         ],
         data: upd,
     };
@@ -282,6 +354,10 @@ fn autonomous_tick_places_reduce_with_real_velocity_program() {
     let (state, user, oracle_sol, oracle_usdc, spot, perp) =
         set_drift_accounts(&mut svm, drift_pubkey, guard_pda);
 
+    // Pyth oracle at index [3] (authoritative price source).
+    let pyth = Address::from([50u8; 32]);
+    svm.set_account(pyth, pyth_account(50_000_000)).unwrap();
+
     // --- Warp the clock so Velocity's markets are freshly posted. ---
     svm.warp_to_slot(TICK_SLOT);
 
@@ -290,6 +366,8 @@ fn autonomous_tick_places_reduce_with_real_velocity_program() {
         program_id: Address,
         guard_pda: Address,
         clock: Address,
+        route_config: Address,
+        pyth: Address,
         state: Address,
         user: Address,
         oracle_sol: Address,
@@ -300,22 +378,23 @@ fn autonomous_tick_places_reduce_with_real_velocity_program() {
         bump: u8,
     ) -> Instruction {
         let mut data = vec![7u8];
-        data.extend_from_slice(&50_000_000u128.to_le_bytes());
         data.extend_from_slice(&1u64.to_le_bytes());
         data.push(bump);
         Instruction {
             program_id,
             accounts: vec![
-                AccountMeta::new(guard_pda, false),            // [0] guard
-                AccountMeta::new_readonly(clock, false),       // [1] clock
-                AccountMeta::new_readonly(state, false),       // [2] Real State
-                AccountMeta::new(user, false),                 // [3] Real User
-                AccountMeta::new(guard_pda, false),            // [4] authority = guard PDA
-                AccountMeta::new_readonly(oracle_sol, false),  // [5] perp oracle
-                AccountMeta::new_readonly(oracle_usdc, false), // [6] spot oracle
-                AccountMeta::new_readonly(spot, false),        // [7] spot market 0
-                AccountMeta::new_readonly(perp, false),        // [8] perp market 0
-                AccountMeta::new_readonly(drift_id, false),    // CPI target
+                AccountMeta::new(guard_pda, false),             // [0] guard
+                AccountMeta::new_readonly(clock, false),        // [1] clock
+                AccountMeta::new_readonly(route_config, false), // [2] RouteConfig
+                AccountMeta::new_readonly(pyth, false),         // [3] Pyth PriceUpdateV2
+                AccountMeta::new_readonly(state, false),        // [4] Real State
+                AccountMeta::new(user, false),                  // [5] Real User
+                AccountMeta::new(guard_pda, false),             // [6] authority = guard PDA
+                AccountMeta::new_readonly(oracle_sol, false),   // [7] perp oracle
+                AccountMeta::new_readonly(oracle_usdc, false),  // [8] spot oracle
+                AccountMeta::new_readonly(spot, false),         // [9] spot market 0
+                AccountMeta::new_readonly(perp, false),         // [10] perp market 0
+                AccountMeta::new_readonly(drift_id, false),     // [11] CPI target
             ],
             data,
         }
@@ -327,6 +406,8 @@ fn autonomous_tick_places_reduce_with_real_velocity_program() {
         program_id,
         guard_pda,
         clock,
+        route_config,
+        pyth,
         state,
         user,
         oracle_sol,
@@ -349,6 +430,8 @@ fn autonomous_tick_places_reduce_with_real_velocity_program() {
         program_id,
         guard_pda,
         clock,
+        route_config,
+        pyth,
         state,
         user,
         oracle_sol,

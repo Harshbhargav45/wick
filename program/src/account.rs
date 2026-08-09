@@ -367,9 +367,7 @@ impl GuardState {
         out[G_NONCE_OFF..G_NONCE_OFF + 8].copy_from_slice(&self.nonce.to_le_bytes());
         out[G_SLOT_OFF..G_SLOT_OFF + 8].copy_from_slice(&self.last_check_slot.to_le_bytes());
         out[G_PENDING_TAG_OFF] = tag;
-        if amt != 0 {
-            wr(out, G_PENDING_AMT_OFF, amt);
-        }
+        wr(out, G_PENDING_AMT_OFF, amt);
         out[G_DEGRADED_OFF] = if self.degraded { 1 } else { 0 };
         out[G_STALE_STREAK_OFF] = self.stale_streak;
         out[G_DRIFT_MARKET_OFF..G_DRIFT_MARKET_OFF + 2]

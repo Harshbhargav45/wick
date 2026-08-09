@@ -29,6 +29,8 @@ pub enum WickInstruction {
     /// expected nonce (§8.4 CoSigned / §8.7 Jupiter). Lands the Jupiter
     /// safety-net on L1 with the owner's signature (§3 Phase-3).
     ConfirmYes = 9,
+    /// Create the singleton RouteConfig PDA (kill-switch authority + pause flag).
+    InitRouteConfig = 10,
 }
 
 impl WickInstruction {
@@ -44,6 +46,7 @@ impl WickInstruction {
             7 => Some(Self::OnPriceTick),
             8 => Some(Self::UpdatePosition),
             9 => Some(Self::ConfirmYes),
+            10 => Some(Self::InitRouteConfig),
             _ => None,
         }
     }

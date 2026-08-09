@@ -35,6 +35,7 @@ const RENT_SYSVAR: &str = "SysvarRent111111111111111111111111111111111";
 const SYSTEM_PROGRAM: &str = "11111111111111111111111111111111";
 
 const GUARD_SEED: &[u8] = b"guard";
+const ROUTE_CONFIG_SEED: &[u8] = b"route_config";
 
 /// Marker the mock Drift program writes into the user account on a reduce.
 const REDUCED_MARKER: [u8; 6] = *b"REDUCE";
@@ -95,6 +96,77 @@ fn drift_user_account(drift_pubkey: Pubkey, delegate: Address) -> Account {
     }
 }
 
+/// Pyth pull-oracle constants mirrored from `crate::pyth` (the program is
+/// deployed at a fixed address; the SOL/USD feed id and PriceUpdateV2
+/// discriminator are read-only constants).
+const WICK_PYTH_PROGRAM: Pubkey = Pubkey::new_from_array([
+    12, 183, 250, 187, 82, 247, 166, 72, 187, 91, 49, 125, 154, 1, 139, 144, 87, 203, 2, 71, 116,
+    250, 254, 1, 230, 196, 223, 152, 204, 56, 88, 129,
+]);
+const WICK_PYTH_DISCRIMINATOR: [u8; 8] = [34, 241, 35, 99, 157, 126, 244, 205];
+const SOL_USD_FEED_ID: [u8; 32] = [
+    239, 13, 139, 111, 218, 44, 235, 164, 29, 161, 93, 64, 149, 209, 218, 57, 42, 13, 47, 142, 208,
+    198, 199, 188, 15, 76, 250, 200, 194, 128, 181, 109,
+];
+
+/// A Pyth `PriceUpdateV2` account (SOL/USD, Full-verified) carrying `price6`
+/// in Wick's 6-decimal scale, owned by the Pyth receiver program. With
+/// expo=-8, raw * 10^(expo+6) == price6 ⇒ raw = price6*100. publish_time 0 is
+/// fresh against the guard's `now` gate (max age 60s params; the clock's
+/// unix_timestamp in the litesvm fixture is small). Confidence 0 ≤ 150bps.
+fn pyth_account(price6: u128) -> Account {
+    let mut data = vec![0u8; 200];
+    data[..8].copy_from_slice(&WICK_PYTH_DISCRIMINATOR);
+    data[40] = 1; // Full verification
+    data[41..73].copy_from_slice(&SOL_USD_FEED_ID);
+    data[73..81].copy_from_slice(&((price6 * 100) as i64).to_le_bytes()); // raw
+    data[81..89].copy_from_slice(&0u64.to_le_bytes()); // conf
+    data[89..93].copy_from_slice(&(-8i32).to_le_bytes()); // expo
+    data[93..101].copy_from_slice(&0i64.to_le_bytes()); // publish_time
+    Account {
+        lamports: 1_000_000,
+        data,
+        owner: WICK_PYTH_PROGRAM,
+        executable: false,
+        rent_epoch: 0,
+    }
+}
+
+/// Derive the singleton RouteConfig PDA: the program seeds it
+/// `[b"route_config", bump]`, so the canonical bump append matches.
+fn route_config_pda(program_id: Address) -> (Address, u8) {
+    Address::find_program_address(&[ROUTE_CONFIG_SEED], &program_id)
+}
+
+/// Initialize the singleton RouteConfig via `InitRouteConfig` (disc 10).
+/// Layout: [0] config PDA (writable), [1] authority (signer), [2] payer
+/// (signer, writable), [3] rent sysvar. Data: [disc, bump].
+fn init_route_config(
+    svm: &mut LiteSVM,
+    program_id: Address,
+    rent: Address,
+    system: Address,
+    owner_kp: &Keypair,
+    owner: Address,
+) -> (Address, u8) {
+    let (config, bump) = route_config_pda(program_id);
+    let ix = Instruction {
+        program_id,
+        accounts: vec![
+            AccountMeta::new(config, false),
+            AccountMeta::new_readonly(owner, true),
+            AccountMeta::new(owner, true),
+            AccountMeta::new_readonly(rent, false),
+            AccountMeta::new_readonly(system, false),
+        ],
+        data: vec![10u8, bump],
+    };
+    let msg = Message::new_with_blockhash(&[ix], Some(&owner), &svm.latest_blockhash());
+    let tx = Transaction::new(&[owner_kp], msg, svm.latest_blockhash());
+    svm.send_transaction(tx).expect("InitRouteConfig failed");
+    (config, bump)
+}
+
 #[test]
 fn autonomous_tick_cpis_place_perp_order_signed_by_guard_pda() {
     let program_id = Address::from_str_const(PROGRAM_ID);
@@ -135,6 +207,9 @@ fn autonomous_tick_cpis_place_perp_order_signed_by_guard_pda() {
     let tx = Transaction::new(&[&owner_kp], msg, svm.latest_blockhash());
     svm.send_transaction(tx).expect("InitGuard failed");
 
+    // --- InitRouteConfig (kill-switch singleton, required by every guard ix) ---
+    let (route_config, _) = init_route_config(&mut svm, program_id, rent, system, &owner_kp, owner);
+
     // --- UpdatePosition: collateral $45, size 100, entry $50 (underwater) ---
     let mut upd = vec![8u8];
     upd.extend_from_slice(&45_000_000u128.to_le_bytes());
@@ -145,6 +220,7 @@ fn autonomous_tick_cpis_place_perp_order_signed_by_guard_pda() {
         accounts: vec![
             AccountMeta::new(guard_pda, false),
             AccountMeta::new_readonly(owner, true),
+            AccountMeta::new_readonly(route_config, false),
         ],
         data: upd,
     };
@@ -188,23 +264,29 @@ fn autonomous_tick_cpis_place_perp_order_signed_by_guard_pda() {
         .unwrap();
     }
 
-    // --- OnPriceTick: price $50 (entry), nonce 1. Underwater position →
-    // TopUp capped out → PartialClose → autonomous Drift reduce. ---
+    // --- Pyth account (authoritative price source at index [3]) ---
+    let pyth = Address::from([50u8; 32]);
+    svm.set_account(pyth, pyth_account(50_000_000)).unwrap();
+
+    // --- OnPriceTick: price reads from the Pyth oracle ($50 == entry), nonce
+    // 1. Underwater position → TopUp capped out → PartialClose → autonomous
+    // Drift reduce. Price is NOT in the payload (security: no caller price). ---
     svm.warp_to_slot(TICK_SLOT); // fresh: TICK_SLOT - 0 <= MAX_TICK_AGE_SLOTS
     let mut tick = vec![7u8];
-    tick.extend_from_slice(&50_000_000u128.to_le_bytes());
     tick.extend_from_slice(&1u64.to_le_bytes());
     tick.push(bump);
     let tick_ix = Instruction {
         program_id,
         accounts: vec![
-            AccountMeta::new(guard_pda, false),            // [0] guard
-            AccountMeta::new_readonly(clock, false),       // [1] clock
-            AccountMeta::new_readonly(state, false),       // [2] Drift state (readonly)
-            AccountMeta::new(user, false), // [3] Drift user (delegate read + marker)
-            AccountMeta::new(guard_pda, false), // [4] authority (guard PDA — delegate)
-            AccountMeta::new_readonly(remaining_a, false), // [5] remaining (perp market map)
-            AccountMeta::new_readonly(remaining_b, false), // [6] remaining (oracle map)
+            AccountMeta::new(guard_pda, false),             // [0] guard
+            AccountMeta::new_readonly(clock, false),        // [1] clock
+            AccountMeta::new_readonly(route_config, false), // [2] route_config
+            AccountMeta::new_readonly(pyth, false),         // [3] Pyth PriceUpdateV2
+            AccountMeta::new_readonly(state, false),        // [4] Drift state (readonly)
+            AccountMeta::new(user, false), // [5] Drift user (delegate read + marker)
+            AccountMeta::new(guard_pda, false), // [6] authority (guard PDA — delegate)
+            AccountMeta::new_readonly(remaining_a, false), // [7] remaining (perp market map)
+            AccountMeta::new_readonly(remaining_b, false), // [8] remaining (oracle map)
             // The CPI target must be present as an account in the transaction
             // message, otherwise the runtime rejects the CPI with
             // `InstructionError::MissingAccount` ("Unknown program").
@@ -281,6 +363,9 @@ fn cosigned_tick_never_reaches_venue() {
     let tx = Transaction::new(&[&owner_kp], msg, svm.latest_blockhash());
     svm.send_transaction(tx).expect("InitGuard failed");
 
+    // --- InitRouteConfig (kill-switch singleton, required by every guard ix) ---
+    let (route_config, _) = init_route_config(&mut svm, program_id, rent, system, &owner_kp, owner);
+
     let mut upd = vec![8u8];
     upd.extend_from_slice(&45_000_000u128.to_le_bytes());
     upd.extend_from_slice(&100_000_000i128.to_le_bytes());
@@ -290,6 +375,7 @@ fn cosigned_tick_never_reaches_venue() {
         accounts: vec![
             AccountMeta::new(guard_pda, false),
             AccountMeta::new_readonly(owner, true),
+            AccountMeta::new_readonly(route_config, false),
         ],
         data: upd,
     };
@@ -304,9 +390,11 @@ fn cosigned_tick_never_reaches_venue() {
     let user = Address::from([31u8; 32]);
     svm.set_account(user, drift_user_account(drift_pubkey, guard_pda))
         .unwrap();
+    // Pyth oracle at index [3] (authoritative price source).
+    let pyth = Address::from([50u8; 32]);
+    svm.set_account(pyth, pyth_account(50_000_000)).unwrap();
 
     let mut tick = vec![7u8];
-    tick.extend_from_slice(&50_000_000u128.to_le_bytes());
     tick.extend_from_slice(&1u64.to_le_bytes());
     tick.push(bump);
     let tick_ix = Instruction {
@@ -314,7 +402,9 @@ fn cosigned_tick_never_reaches_venue() {
         accounts: vec![
             AccountMeta::new(guard_pda, false),
             AccountMeta::new_readonly(clock, false),
-            AccountMeta::new_readonly(Address::from([30u8; 32]), false), // state
+            AccountMeta::new_readonly(route_config, false), // [2] route_config
+            AccountMeta::new_readonly(pyth, false),         // [3] Pyth PriceUpdateV2
+            AccountMeta::new_readonly(Address::from([30u8; 32]), false), // [4] state
             AccountMeta::new(user, false),
             AccountMeta::new(guard_pda, false), // authority (guard PDA)
             AccountMeta::new_readonly(Address::from([40u8; 32]), false), // remaining
