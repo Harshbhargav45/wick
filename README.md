@@ -172,7 +172,6 @@ The guard's margin wallet is a 2-of-2 (`user` + `co_authority`) — see §8.5.
 ## Roadmap
 
 - [x] Phase 1 — guard program, health engine, selector, solver, authority, serialization
-- [x] Phase 1.5 — FlashTrade `close_position` adapter + autonomous e2e proof (retired, §8.7.1)
 - [x] CI (fmt, clippy, build-sbf, tests)
 - [x] Phase 3 — Jupiter co-signed safety-net adapter (build + persist the owner-signed instruction)
 - [x] Phase 3.5 — owner `Confirm` instruction to land the pending Jupiter instruction + commit nonce
