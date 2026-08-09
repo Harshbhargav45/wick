@@ -6,7 +6,6 @@ export function BootSequence({ onComplete }: { onComplete: () => void }) {
   const [isBooting, setIsBooting] = useState(true);
 
   useEffect(() => {
-    // Check reduced motion
     const prefersReduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
     const timer = setTimeout(() => {

@@ -79,7 +79,7 @@ pub enum ReduceDirection {
 }
 
 /// A hard reduce-only perp market order — the only order this adapter builds.
-/// All-time Borsh `OrderParams` optional fields default to `None`.
+/// Every optional Borsh `OrderParams` field is serialized as `None`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReduceOrderParams {
     /// Perp market index to reduce.
@@ -106,7 +106,7 @@ impl ReduceOrderParams {
             ReduceDirection::Short => 1, // PositionDirection::Short
             ReduceDirection::Long => 0,  // PositionDirection::Long
         };
-        d[11] = 0; // user_order_ud (u8) = 0
+        d[11] = 0; // user_order_id (u8) = 0
         d[12..20].copy_from_slice(&self.base_asset_amount.to_le_bytes());
         d[20..28].copy_from_slice(&self.price.to_le_bytes());
         d[28..30].copy_from_slice(&self.market_index.to_le_bytes());
@@ -189,10 +189,9 @@ impl<'a> DriftPlaceOrderAccounts<'a> {
     /// `signer_seeds` must be the guard PDA seeds, which the user registered as
     /// the Drift `delegate` for that sub-account.
     pub fn invoke(&self, params: &ReduceOrderParams, signer_seeds: &[Signer]) -> ProgramResult {
-        // place_perp_order is a `Signer`-distinguished delegate order; Drift
-        // reduces regardless of `market_index` sign, relying on `reduce_only`
-        // we hard-set below. The order is placed as the guard, so the drift
-        // perp market being closed must be passed in `remaining`.
+        // The order is placed as the guard (the delegate), so the perp market
+        // being reduced has to arrive in `remaining`. `reduce_only` is forced
+        // by `try_to_data`, so this path can only ever shrink the position.
         let data = params.try_to_data()?;
         let metas = self.metas();
         let views = self.account_views();

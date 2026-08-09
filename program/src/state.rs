@@ -1,4 +1,4 @@
-//! On-chain state layouts for the Wick guard program (Phase 1, no venues yet).
+//! On-chain state layouts for the Wick guard program.
 //!
 //! All math §8.1 is defined here so unit tests can exercise it without needing
 //! a full account/instruction context.
@@ -29,7 +29,7 @@ pub enum ActionType {
     TakeProfit,
 }
 
-/// A resolved action ready to dispatch (venue-agnostic in Phase 1).
+/// A resolved action ready to dispatch (venue-agnostic).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
     TopUp { amount: u128 },
@@ -332,7 +332,7 @@ pub fn select_action(
 // On-chain account layouts
 // -------------------------------------------------------------------------
 
-/// Singleton program config — kill-switch + global pause (Phase 1 view).
+/// Singleton program config — kill-switch + global pause.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct RouteConfig {

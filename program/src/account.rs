@@ -1,4 +1,4 @@
-//! Wire-format serialization for Wick guard accounts (Phase 1).
+//! Wire-format serialization for Wick guard accounts.
 //!
 //! We deliberately do NOT cast `repr(C)` structs onto account data: struct
 //! padding and enum sizes are implementation-defined, and this is a `no_std`

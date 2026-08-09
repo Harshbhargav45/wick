@@ -1,4 +1,4 @@
-//! Pyth pull-oracle price accessor (§7.1 / Phase 4).
+//! Pyth pull-oracle price accessor (§7.1).
 //!
 //! Wick reads a verified price from a Pyth `PriceUpdateV2` account rather than
 //! trusting a caller-supplied series of prices. This is the **classic Pyth pull

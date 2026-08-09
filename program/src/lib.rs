@@ -1,11 +1,10 @@
 //! Wick — autonomous onchain liquidation-protection layer for Solana perps.
 //!
-//! Phase 1: the Pinocchio guard program (no venues wired yet). This crate
-//! implements the account layout, the overflow-safe fixed-point health engine
-//! (§8.1), the action selector (§8.2), the bounded partial-close solver (§8.3),
-//! two-regime authority dispatch (§8.4), and the 2-of-2 co-authority checks
-//! (§8.5). Venue adapters (Drift autonomous / Jupiter co-signed) land in
-//! later phases.
+//! The Pinocchio guard program: account layout, the overflow-safe fixed-point
+//! health engine (§8.1), the action selector (§8.2), the bounded partial-close
+//! solver (§8.3), two-regime authority dispatch (§8.4), the 2-of-2
+//! co-authority checks (§8.5), and the venue adapters — Drift autonomous
+//! (§8.7) and Jupiter co-signed.
 
 #![no_std]
 

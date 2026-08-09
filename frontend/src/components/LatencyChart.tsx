@@ -90,7 +90,7 @@ export function LatencyChart() {
         </defs>
 
         {/* gridlines */}
-        {[0, 5, 10, (ds.lanes.sub_50ms_target_us / 1000), yMax / 1000].map((ms) => {
+        {Array.from(new Set([0, 5, 10, ds.lanes.sub_50ms_target_us / 1000, yMax / 1000])).map((ms) => {
           const gy = y(ms * 1000);
           return (
             <g key={ms}>

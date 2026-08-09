@@ -39,7 +39,7 @@ fn read_wick_program() -> Vec<u8> {
 fn init_data(bump: u8) -> Vec<u8> {
     let mut data = vec![0u8, bump];
     let mut blob = vec![0u8; 150];
-    blob[0] = 0; // venue = none (Phase 1 litesvm test exercises the non-venue path)
+    blob[0] = 0; // venue = none — this test exercises the non-venue path
     blob[1..33].copy_from_slice(&[9u8; 32]); // co_authority
     blob[33] = 1; // authority_req = CoSigned
     blob[34..50].copy_from_slice(&500u128.to_le_bytes()); // maintenance_bps

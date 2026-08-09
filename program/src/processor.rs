@@ -1,4 +1,4 @@
-//! Instruction dispatch and handlers (Phase 1).
+//! Instruction dispatch and handlers.
 //!
 //! Account layout per instruction:
 //!
