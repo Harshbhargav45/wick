@@ -33,8 +33,9 @@ use crate::error::WickError;
 /// Pyth Solana Receiver (pull oracle) program. Deployed at the same address on
 /// every SVM network.
 ///
-/// `rec5EKMGg6MxZYaMdyBfgwpo4d5rB9T1VQH5pJv5LtFJ` — verified against Pyth's
-/// contract-addresses doc.
+/// `rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ` — verified against the
+/// `@pythnetwork/pyth-solana-receiver` SDK's `DEFAULT_RECEIVER_PROGRAM_ID`
+/// (deployed on devnet + mainnet).
 pub const PYTH_RECEIVER_PROGRAM_ID: Address = Address::new_from_array([
     12, 183, 250, 187, 82, 247, 166, 72, 187, 91, 49, 125, 154, 1, 139, 144, 87, 203, 2, 71, 116,
     250, 254, 1, 230, 196, 223, 152, 204, 56, 88, 129,

@@ -38,6 +38,9 @@ pub enum WickError {
     NoPendingConfirm = 0xf,
     /// The program is paused via RouteConfig kill-switch.
     Paused = 0x10,
+    /// A tick nonce that skips ahead of `state.nonce + 1` — rejects the
+    /// cranker-DoS where a large nonce bakes every future tick as a replay.
+    NonceOutOfOrder = 0x11,
 }
 
 impl From<WickError> for ProgramError {

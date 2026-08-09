@@ -30,7 +30,7 @@ use pinocchio::{AccountView, Address};
 
 use pinocchio_system::instructions::CreateAccount;
 
-use crate::account::{GuardState, PendingIx, GUARD_DATA_LEN, ROUTE_CONFIG_LEN};
+use crate::account::{GuardState, PendingIx, ACCOUNT_VERSION, GUARD_DATA_LEN, ROUTE_CONFIG_LEN};
 use crate::delegation;
 use crate::drift::{DriftPlaceOrderAccounts, ReduceDirection, ReduceOrderParams, VENUE_DRIFT};
 use crate::error::WickError;
@@ -218,6 +218,20 @@ fn init_guard(program_id: &Address, accounts: &[AccountView], data: &[u8]) -> Pr
             Some(rent),
         )?;
         create_account.invoke_signed(&[signer])?;
+    } else {
+        // Re-init guard. The runtime only re-derives the PDA from the seeds
+        // during the `CreateAccount` CPI, so an already-funded account skips
+        // that check: without this branch an attacker could pass a *victim's*
+        // guard account with their own key as `owner` and overwrite its state
+        // (resetting nonce and collateral). An initialized account is refused;
+        // a live guard is only ever mutated by its own handlers.
+        if !guard.owned_by(program_id) {
+            return Err(WickError::WrongAccountOwner.into());
+        }
+        let data = guard.try_borrow().map_err(|_| WickError::NotInitialized)?;
+        if data.len() != GUARD_DATA_LEN || data[0] == ACCOUNT_VERSION {
+            return Err(WickError::AlreadyInitialized.into());
+        }
     }
 
     let state = GuardState {
@@ -439,6 +453,16 @@ fn on_price_tick(program_id: &Address, accounts: &[AccountView], data: &[u8]) ->
     let price = pyth_price_to_scale6(&pyth)?;
 
     let mut state = load_guard(guard, program_id)?;
+
+    // `OnPriceTick` is permissionless (any cranker may drive it), so the tick
+    // nonce is attacker-controlled. `select_action` only rejects nonces at or
+    // *below* the committed one, which leaves a denial-of-service: one tick
+    // carrying `u64::MAX` commits that nonce on the next landed action and
+    // every genuine tick afterwards looks like a replay, silently disarming
+    // the guard. The nonce may only ever step forward by one.
+    if tick_nonce > state.nonce.saturating_add(1) {
+        return Err(WickError::NonceOutOfOrder.into());
+    }
 
     // §8.1.3 — reject stale ticks, tracking the degraded streak. A rejected
     // tick is not "do nothing this tick": it updates the streak/flag so the
@@ -700,6 +724,18 @@ fn init_route_config(program_id: &Address, accounts: &[AccountView], data: &[u8]
             Some(rent),
         )?;
         create_account.invoke_signed(&[signer])?;
+    } else {
+        // Kill-switch takeover. `InitRouteConfig` is permissionless by design
+        // (whoever creates the singleton becomes its authority), so re-running
+        // it against the existing PDA would let anyone install themselves as
+        // the pause authority and clear `paused`. Initialization is one-shot.
+        if !config.owned_by(program_id) {
+            return Err(WickError::WrongAccountOwner.into());
+        }
+        let data = config.try_borrow().map_err(|_| WickError::NotInitialized)?;
+        if data.len() != ROUTE_CONFIG_LEN || data[0] == ACCOUNT_VERSION {
+            return Err(WickError::AlreadyInitialized.into());
+        }
     }
     let cfg = RouteConfig {
         authority: authority.address().to_bytes(),
@@ -1711,6 +1747,131 @@ mod tests {
 
         let state = GuardState::from_bytes(guard.data()).unwrap();
         assert_eq!(state.nonce, 0);
+    }
+
+    #[test]
+    fn tick_nonce_fast_forward_rejected() {
+        // security: the tick nonce is attacker-controlled (OnPriceTick is
+        // permissionless). A nonce far ahead of the committed one would, once
+        // committed by a landed action, make every genuine later tick look like
+        // a replay — silently disarming the guard. It must step by one.
+        let guard_data = make_guard(AuthorityRequirement::CoSigned, 0, 0, 0);
+        let guard = TestAccount::new(PROGRAM_ID, PROGRAM_ID, 100, &guard_data, false, true);
+
+        let result = run_tick(&guard, 20, 48_000_000, &tick_data(u64::MAX, 0));
+        assert_eq!(result, Err(WickError::NonceOutOfOrder.into()));
+
+        let state = GuardState::from_bytes(guard.data()).unwrap();
+        assert_eq!(state.nonce, 0);
+        assert_eq!(
+            state.last_check_slot, 0,
+            "a rejected tick must not mutate guard state"
+        );
+
+        // The next legal step (nonce + 1) is still accepted.
+        assert!(run_tick(&guard, 20, 48_000_000, &tick_data(1, 0)).is_ok());
+    }
+
+    #[test]
+    fn init_guard_rejects_reinitialization() {
+        // security: the runtime only re-derives the PDA from the seeds during
+        // the CreateAccount CPI, which an already-funded account skips. Without
+        // the initialized check an attacker could pass a victim's guard account
+        // with their own key as `owner` and overwrite its state, zeroing the
+        // nonce and collateral.
+        let victim_owner = addr(9);
+        let guard_data = sample_guard(victim_owner);
+        let guard = TestAccount::new(PROGRAM_ID, PROGRAM_ID, 100, &guard_data, false, true);
+
+        let attacker = TestAccount::new(
+            addr(66),
+            Address::new_from_array([0u8; 32]),
+            0,
+            &[],
+            true,
+            false,
+        );
+        let payer = TestAccount::new(
+            addr(67),
+            Address::new_from_array([0u8; 32]),
+            0,
+            &[],
+            true,
+            true,
+        );
+        let rent = TestAccount::new(
+            addr(68),
+            Address::new_from_array([0u8; 32]),
+            0,
+            &[],
+            false,
+            false,
+        );
+
+        // [0]=InitGuard, [1]=bump, then the policy blob.
+        let mut data = vec![0u8, 0u8];
+        data.extend_from_slice(&[0u8; INIT_PAYLOAD_LEN]);
+        data[2] = VENUE_DRIFT;
+        data[2 + 33] = 0; // Autonomous
+
+        let accounts = [guard.view, attacker.view, payer.view, rent.view];
+        let result = process_instruction(&PROGRAM_ID, &accounts, &data);
+        assert_eq!(result, Err(WickError::AlreadyInitialized.into()));
+
+        // The victim's guard is untouched: owner, collateral and nonce intact.
+        let state = GuardState::from_bytes(guard.data()).unwrap();
+        assert_eq!(state.venue_owner, victim_owner.to_bytes());
+        assert_eq!(state.collateral, 100_000_000);
+    }
+
+    #[test]
+    fn init_route_config_rejects_authority_takeover() {
+        // security: InitRouteConfig is permissionless by design (first caller
+        // becomes the pause authority), so re-running it against the existing
+        // singleton would let anyone install themselves as that authority and
+        // clear `paused`. Initialization is one-shot.
+        let cfg = RouteConfig {
+            authority: [3u8; 32],
+            paused: true,
+            _padding: [0u8; 31],
+        };
+        let mut buf = vec![0u8; ROUTE_CONFIG_LEN];
+        cfg.write_into(&mut buf).unwrap();
+        let config = TestAccount::new(PROGRAM_ID, PROGRAM_ID, 100, &buf, false, true);
+
+        let attacker = TestAccount::new(
+            addr(66),
+            Address::new_from_array([0u8; 32]),
+            0,
+            &[],
+            true,
+            false,
+        );
+        let payer = TestAccount::new(
+            addr(67),
+            Address::new_from_array([0u8; 32]),
+            0,
+            &[],
+            true,
+            true,
+        );
+        let rent = TestAccount::new(
+            addr(68),
+            Address::new_from_array([0u8; 32]),
+            0,
+            &[],
+            false,
+            false,
+        );
+
+        let accounts = [config.view, attacker.view, payer.view, rent.view];
+        let result = process_instruction(&PROGRAM_ID, &accounts, &[10u8, 0u8]);
+        assert_eq!(result, Err(WickError::AlreadyInitialized.into()));
+
+        // Authority and the armed kill-switch both survive.
+        let back = RouteConfig::from_bytes(config.data()).unwrap();
+        assert_eq!(back.authority, [3u8; 32]);
+        assert!(back.paused);
     }
 
     #[test]

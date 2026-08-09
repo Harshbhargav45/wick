@@ -119,10 +119,8 @@ flowchart TD
         GMW[deposit / withdraw: user + co_authority both required]
     end
 
-    FLASH_CPI -. top-up source .-> GMW
+    DRIFT_CPI -. top-up source .-> GMW
     BUILD_IX -. top-up source .-> GMW
-
-    input x: OwnedBlock -> "Wick Guard Auditor"
 ```
 
 ### 7.2 Critical-path sequence — what actually has to happen in order
@@ -349,19 +347,12 @@ venue-side CPI. Every adapter re-derives its accounts from the tail of the
 the exact wire format is pinned in one place and covered by byte-level unit
 tests (no foreign serialize produced at runtime).
 
-#### 8.7.1 FlashTrade (retired)
+#### 8.7.1 Drift / Velocity (autonomous tier, hard reduce-only)
 
-The original `flash.rs` `close_position` adapter (`global:close_position`,
-12 accounts, owner-signed) was retired after Drift landed as the autonomous
-venue. `flash.rs`, `mocks/flash/`, the `VENUE_FLASH` path, and the Flash e2e
-tests were deleted in the Drift relaunch. §8.7.2 is now the sole autonomous
-adapter; the historical wire format is preserved in git history.
-
-#### 8.7.2 Velocity (autonomous tier, hard reduce-only)
-
-Velocity perps (the successor to decommissioned Drift v2) are the Flash
-successor for the autonomous tier. `drift.rs` encodes `place_perp_order` from
-the `velocity-exchange/protocol-v2` source:
+Drift perps are the autonomous tier. The live program is **Velocity**
+(`velocity-exchange/protocol-v2`) — the successor to the decommissioned Drift
+v2 deployment, same ABI, new program ID. `drift.rs` encodes `place_perp_order`
+from that source:
 
 ```text
 data = 8-byte discr + 34-byte OrderParams (borsh, optionals None):
@@ -387,6 +378,9 @@ accounts: state(ro) → user(w, crate::processor) → authority(Signer) → [rem
   `["user", authority, sub_account_id.to_le_bytes()]`) → `authority`
   (`Signer`, signer+readonly in metas) → remaining perp accounts (market,
   oracle, perp/spot maps…) appended in SDK order.
+- **Jupiter (co-signed tier)** is the counterpart adapter: `jupiter.rs` builds
+  the owner-signed `instant_create_tpsl` safety net and the guard persists it as
+  `pending_ix`, never signing or submitting it (§8.4 CoSigned).
 - **Delegation model** (verified from `available via can_sign_for_user` in
   `instructions/constraints.rs`): the venue owner sets the **guard PDA as
   `User.delegate`** off-chain; the guard PDA signs as `authority`. Velocity
@@ -407,8 +401,7 @@ accounts: state(ro) → user(w, crate::processor) → authority(Signer) → [rem
   `base_asset_amount = |watched size| × fraction_bps / 10_000` (10_000 for a
   full take-profit close); a zero-size reduce escalates rather than idle.
   `price` = the guard's current breach/take-profit price. CPI is signed as
-  the guard PDA (the `delegate`) via the same `seeds!("guard",
-  venue_owner, bump)` seeds as the retired Flash path.
+  the guard PDA (the `delegate`) via `seeds!("guard", venue_owner, bump)`.
 - **InvalidInstruction on missing accounts** — the adapter/handlers reject
   a tick that omits the required state/user/authority slice
   (`accounts.get(2..)`), so a malformed tick cannot silently skip the reduce.
