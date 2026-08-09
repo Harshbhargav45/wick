@@ -37,7 +37,19 @@ const CLOCK_SYSVAR: &str = "SysvarC1ock11111111111111111111111111111111";
 const RENT_SYSVAR: &str = "SysvarRent111111111111111111111111111111111";
 const SYSTEM_PROGRAM: &str = "11111111111111111111111111111111";
 const GUARD_SEED: &[u8] = b"guard";
+const ROUTE_CONFIG_SEED: &[u8] = b"route_config";
 const TICK_SLOT: u64 = 438_024_310;
+
+/// Pyth pull-oracle constants mirrored from `crate::pyth`.
+const WICK_PYTH_PROGRAM: Pubkey = Pubkey::new_from_array([
+    12, 183, 250, 187, 82, 247, 166, 72, 187, 91, 49, 125, 154, 1, 139, 144, 87, 203, 2, 71, 116,
+    250, 254, 1, 230, 196, 223, 152, 204, 56, 88, 129,
+]);
+const WICK_PYTH_DISCRIMINATOR: [u8; 8] = [34, 241, 35, 99, 157, 126, 244, 205];
+const SOL_USD_FEED_ID: [u8; 32] = [
+    239, 13, 139, 111, 218, 44, 235, 164, 29, 161, 93, 64, 149, 209, 218, 57, 42, 13, 47, 142, 208,
+    198, 199, 188, 15, 76, 250, 200, 194, 128, 181, 109,
+];
 
 const USER_DISCRIMINATOR: [u8; 8] = [0x9f, 0x75, 0x5f, 0xe3, 0xef, 0x97, 0x3a, 0xec];
 const USER_SIZE: usize = 4496;
@@ -88,6 +100,58 @@ fn init_data(bump: u8) -> Vec<u8> {
     blob[148..150].copy_from_slice(&0u16.to_le_bytes());
     data.extend_from_slice(&blob);
     data
+}
+
+/// Derive the singleton RouteConfig PDA.
+fn route_config_pda(program_id: Address) -> (Address, u8) {
+    Address::find_program_address(&[ROUTE_CONFIG_SEED], &program_id)
+}
+
+/// Initialize the singleton RouteConfig via `InitRouteConfig` (disc 10).
+fn init_route_config(
+    svm: &mut LiteSVM,
+    program_id: Address,
+    rent: Address,
+    system: Address,
+    owner_kp: &Keypair,
+    owner: Address,
+) -> Address {
+    let (config, bump) = route_config_pda(program_id);
+    let ix = Instruction {
+        program_id,
+        accounts: vec![
+            AccountMeta::new(config, false),
+            AccountMeta::new_readonly(owner, true),
+            AccountMeta::new(owner, true),
+            AccountMeta::new_readonly(rent, false),
+            AccountMeta::new_readonly(system, false),
+        ],
+        data: vec![10u8, bump],
+    };
+    let msg = Message::new_with_blockhash(&[ix], Some(&owner), &svm.latest_blockhash());
+    let tx = Transaction::new(&[owner_kp], msg, svm.latest_blockhash());
+    svm.send_transaction(tx).expect("InitRouteConfig failed");
+    config
+}
+
+/// A Pyth `PriceUpdateV2` account (SOL/USD, Full-verified) carrying `price6`.
+/// With expo=-8, raw * 10^(expo+6) == price6 ⇒ raw = price6*100.
+fn pyth_account(price6: u128) -> Account {
+    let mut data = vec![0u8; 200];
+    data[..8].copy_from_slice(&WICK_PYTH_DISCRIMINATOR);
+    data[40] = 1; // Full verification
+    data[41..73].copy_from_slice(&SOL_USD_FEED_ID);
+    data[73..81].copy_from_slice(&((price6 * 100) as i64).to_le_bytes()); // raw
+    data[81..89].copy_from_slice(&0u64.to_le_bytes()); // conf
+    data[89..93].copy_from_slice(&(-8i32).to_le_bytes()); // expo
+    data[93..101].copy_from_slice(&0i64.to_le_bytes()); // publish_time
+    Account {
+        lamports: 1_000_000,
+        data,
+        owner: WICK_PYTH_PROGRAM,
+        executable: false,
+        rent_epoch: 0,
+    }
 }
 
 fn synthetic_user(delegate: Address) -> Vec<u8> {
@@ -210,6 +274,9 @@ fn measure_autonomous_tick_dispatch_latency() {
     );
     svm.send_transaction(tx).expect("InitGuard failed");
 
+    // --- InitRouteConfig (kill-switch singleton, required by every guard ix) ---
+    let route_config = init_route_config(&mut svm, program_id, rent, system, &owner_kp, owner);
+
     // --- UpdatePosition: underwater position that a breach tick must reduce ---
     let mut upd = vec![8u8];
     upd.extend_from_slice(&45_000_000u128.to_le_bytes());
@@ -220,6 +287,7 @@ fn measure_autonomous_tick_dispatch_latency() {
         accounts: vec![
             AccountMeta::new(guard_pda, false),
             AccountMeta::new_readonly(owner, true),
+            AccountMeta::new_readonly(route_config, false),
         ],
         data: upd,
     };
@@ -238,24 +306,28 @@ fn measure_autonomous_tick_dispatch_latency() {
 
     svm.warp_to_slot(TICK_SLOT);
 
+    let pyth = Address::new_from_array([50u8; 32]);
+    svm.set_account(pyth, pyth_account(50_000_000)).unwrap();
+
     let build_tick = || {
         let mut data = vec![7u8];
-        data.extend_from_slice(&50_000_000u128.to_le_bytes());
         data.extend_from_slice(&1u64.to_le_bytes());
         data.push(bump);
         Instruction {
             program_id,
             accounts: vec![
-                AccountMeta::new(guard_pda, false),            // [0] guard state
-                AccountMeta::new_readonly(clock, false),       // [1] clock
-                AccountMeta::new_readonly(state, false),       // [2] Real State
-                AccountMeta::new(user, false),                 // [3] Real User
-                AccountMeta::new(guard_pda, false),            // [4] authority = guard PDA
-                AccountMeta::new_readonly(oracle_sol, false),  // [5] perp oracle
-                AccountMeta::new_readonly(oracle_usdc, false), // [6] spot oracle
-                AccountMeta::new_readonly(spot, false),        // [7] spot market 0
-                AccountMeta::new_readonly(perp, false),        // [8] perp market 0
-                AccountMeta::new_readonly(drift_id, false),    // [9] CPI target
+                AccountMeta::new(guard_pda, false),             // [0] guard state
+                AccountMeta::new_readonly(clock, false),        // [1] clock
+                AccountMeta::new_readonly(route_config, false), // [2] RouteConfig
+                AccountMeta::new_readonly(pyth, false),         // [3] Pyth PriceUpdateV2
+                AccountMeta::new_readonly(state, false),        // [4] Real State
+                AccountMeta::new(user, false),                  // [5] Real User
+                AccountMeta::new(guard_pda, false),             // [6] authority = guard PDA
+                AccountMeta::new_readonly(oracle_sol, false),   // [7] perp oracle
+                AccountMeta::new_readonly(oracle_usdc, false),  // [8] spot oracle
+                AccountMeta::new_readonly(spot, false),         // [9] spot market 0
+                AccountMeta::new_readonly(perp, false),         // [10] perp market 0
+                AccountMeta::new_readonly(drift_id, false),     // [11] CPI target
             ],
             data,
         }
