@@ -6,6 +6,7 @@ import {
   GUARD_DATA_LEN,
   VENUE_DRIFT,
   VENUE_JUPITER,
+  VENUE_NONE,
   decodeGuardState,
   type GuardState,
 } from '@/lib/guard-layout';
@@ -32,11 +33,22 @@ export interface GuardSnapshot {
 
 export type GuardStatus = 'config' | 'loading' | 'empty' | 'error' | 'ready';
 
+/**
+ * The kill-switch account. `exists: false` is not the same as "running":
+ * `check_not_paused` rejects when the account is missing, so every
+ * state-mutating instruction fails until it is initialized.
+ */
+export interface RouteConfigState {
+  exists: boolean;
+  paused: boolean;
+}
+
 function venueLabel(venue: number, authority: string): string {
   if (venue === VENUE_DRIFT) {
     return authority === 'Autonomous' ? 'Drift · delegated' : 'Drift · co-signed';
   }
   if (venue === VENUE_JUPITER) return 'Jupiter · co-signed';
+  if (venue === VENUE_NONE) return 'No venue · watch only';
   return `Venue ${venue}`;
 }
 
@@ -60,7 +72,10 @@ export function useGuardAccount() {
   const [snapshot, setSnapshot] = useState<GuardSnapshot | null>(null);
   const [status, setStatus] = useState<GuardStatus>(configError ? 'config' : 'loading');
   const [error, setError] = useState<string | null>(configError);
-  const [paused, setPaused] = useState(false);
+  const [routeConfig, setRouteConfig] = useState<RouteConfigState>({
+    exists: false,
+    paused: false,
+  });
   const [nudge, setNudge] = useState(0);
 
   const programIdKey = programId?.toBase58();
@@ -104,7 +119,11 @@ export function useGuardAccount() {
         ]);
         if (cancelled) return;
 
-        setPaused(configInfo ? decodeRouteConfig(new Uint8Array(configInfo.data)).paused : false);
+        setRouteConfig(
+          configInfo
+            ? { exists: true, paused: decodeRouteConfig(new Uint8Array(configInfo.data)).paused }
+            : { exists: false, paused: false },
+        );
 
         if (!found) {
           setSnapshot(null);
@@ -154,7 +173,9 @@ export function useGuardAccount() {
     snapshot,
     status,
     error,
-    paused,
+    routeConfig,
+    /** Instructions are blocked when paused *or* when the config is missing. */
+    writesBlocked: !routeConfig.exists || routeConfig.paused,
     refresh,
     rpc,
     programId: programIdKey ?? null,

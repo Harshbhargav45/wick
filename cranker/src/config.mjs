@@ -1,6 +1,7 @@
 import "dotenv/config";
 import { PublicKey } from "@solana/web3.js";
 import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { Keypair } from "@solana/web3.js";
 
 export const config = {
@@ -24,10 +25,31 @@ export const config = {
   dryRun: (process.env.DRY_RUN ?? "1") !== "0",
 };
 
+/**
+ * dotenv does no shell expansion and keeps surrounding quotes, so a `.env`
+ * written with `~`, `$HOME`, or quotes reaches us verbatim. Normalize rather
+ * than fail on a path the user reasonably expected to work.
+ */
+function resolveKeypairPath(raw) {
+  const home = process.env.HOME ?? homedir();
+  return raw
+    .trim()
+    .replace(/^["']|["']$/g, "")
+    .replace(/^~(?=\/|$)/, home)
+    .replace(/\$\{?HOME\}?/g, home);
+}
+
 export function crankerKeypair() {
-  const path =
-    process.env.CRANKER_KEYPAIR ??
-    "/home/harsh/Downloads/outreach_pipeline/timekeeper/wallet.json";
-  const raw = JSON.parse(readFileSync(path, "utf8"));
+  const path = resolveKeypairPath(
+    process.env.CRANKER_KEYPAIR ?? "~/.config/solana/id.json"
+  );
+  let raw;
+  try {
+    raw = JSON.parse(readFileSync(path, "utf8"));
+  } catch (err) {
+    throw new Error(
+      `cannot read keypair at ${path} (${err.code ?? err.message}). Set CRANKER_KEYPAIR in cranker/.env`
+    );
+  }
   return Keypair.fromSecretKey(Uint8Array.from(raw));
 }

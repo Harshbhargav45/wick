@@ -14,16 +14,28 @@ const CLOCK_SYSVAR = new PublicKey(
   "SysvarC1ock11111111111111111111111111111111"
 );
 const GUARD_DATA_LEN = 342;
+const ACCOUNT_VERSION = 1;
+
+/** Guard byte offsets, mirroring program/src/account.rs. */
+const G_VENUE_OWNER_OFF = 2;
+const G_NONCE_OFF = 243;
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+/**
+ * The version badge is checked client-side rather than with a memcmp filter:
+ * the filter takes base58, where "1" is byte 0x00, so version 1 has to be
+ * encoded rather than written literally. Filtering here keeps it unambiguous.
+ */
 async function findGuards(connection, programId) {
   const accounts = await connection.getProgramAccounts(programId, {
-    filters: [{ dataSize: GUARD_DATA_LEN }, { memcmp: { offset: 0, bytes: "1" } }],
+    filters: [{ dataSize: GUARD_DATA_LEN }],
   });
-  return accounts;
+  return accounts.filter(
+    ({ account }) => account.data[0] === ACCOUNT_VERSION
+  );
 }
 
 async function sendAndConfirm(connection, tx, signers) {
@@ -50,8 +62,6 @@ async function main() {
     `[wick-cranker] dryRun=${config.dryRun} interval=${config.tickIntervalMs}ms`
   );
 
-  let nonce = 0n;
-
   while (true) {
     try {
       const guards = await findGuards(connection, config.wickProgramId);
@@ -65,8 +75,17 @@ async function main() {
 
       for (const { pubkey, account } of guards) {
         const { pda: routeConfig } = routeConfigPda();
-        const venueOwner = new PublicKey(account.data.slice(2, 34));
+        const venueOwner = new PublicKey(
+          account.data.slice(G_VENUE_OWNER_OFF, G_VENUE_OWNER_OFF + 32)
+        );
         const { bump } = guardPda(venueOwner);
+
+        // §8.2 — the guard accepts a tick only at exactly committed + 1, so the
+        // nonce is read from the account rather than counted locally. A local
+        // counter desyncs across restarts and on every CoSigned tick, where the
+        // nonce stays put until the owner confirms.
+        const committed = account.data.readBigUInt64LE(G_NONCE_OFF);
+        const nonce = committed + 1n;
 
         const { vaa } = await fetchLatestVaa();
         const plans = await buildPostUpdateInstructions(vaa);
@@ -121,7 +140,6 @@ async function main() {
         console.log(
           `[wick-cranker] tick sent nonce=${nonce} guard=${pubkey.toBase58()} post=${s3.slice(0, 8)} tick=${s4.slice(0, 8)}`
         );
-        nonce += 1n;
       }
     } catch (err) {
       console.error(`[wick-cranker] tick failed: ${err.message}`);

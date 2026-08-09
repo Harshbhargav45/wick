@@ -8,6 +8,7 @@
     "node": ">=18"
   },
   "scripts": {
+    "init": "node src/init.mjs",
     "start": "node src/index.mjs",
     "post-vaa": "node src/post-vaa.mjs"
   },

@@ -13,6 +13,8 @@ export const PENDING_IX_DATA_LEN = 50;
 export const SCALE = 1_000_000n;
 export const BPS_DENOM = 10_000n;
 
+/** No venue adapter: the guard watches and records but never dispatches. */
+export const VENUE_NONE = 0;
 export const VENUE_JUPITER = 2;
 export const VENUE_DRIFT = 3;
 

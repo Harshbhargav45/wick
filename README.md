@@ -159,6 +159,28 @@ cargo clippy --features no-entrypoint --all-targets -- -D warnings
 
 It prints the `PROGRAM_ID` to put in `frontend/.env.local`.
 
+### Initialize on-chain state
+
+A fresh deployment owns no accounts, and `check_not_paused` rejects every
+state-mutating instruction while `RouteConfig` is missing — so this step is
+required before the cranker or the console can do anything.
+
+```bash
+cd cranker
+cp .env.example .env                 # RPC, keypair path, program id
+npm install
+npm run init                         # RouteConfig + guard PDA + starting position
+```
+
+`init` is idempotent: it skips whatever already exists, so it is safe to re-run.
+Flags: `--venue drift|jupiter|none`, `--collateral`, `--size`, `--entry`,
+`--market-index`, `--subaccount-id`. It ends by printing the guard PDA and the
+two `frontend/.env.local` values.
+
+The devnet bring-up sets the co-authority to the owner's own key so a single
+keypair can complete the flow. That defeats the point of 2-of-2 withdrawal
+authority — a real deployment must pass a second, separately-held key.
+
 ### Run the console
 
 ```bash
@@ -178,12 +200,12 @@ state, not history, so nothing is backfilled.
 
 ```bash
 cd cranker
-cp .env.example .env                 # RPC, keypair path, guard + feed addresses
-npm install && npm start
+npm start                            # DRY_RUN=1 in .env simulates without sending
 ```
 
 It pulls a VAA from Hermes, posts a fully-verified `PriceUpdateV2` through the
-Pyth receiver, and drives `OnPriceTick`.
+Pyth receiver, and drives `OnPriceTick`. Set `DRY_RUN=0` to send real
+transactions.
 
 > Secrets stay out of git: `.env`, `*.pem`, `*.key`, and any `*keypair*.json`
 > are gitignored. Only `.env.example` templates are tracked.

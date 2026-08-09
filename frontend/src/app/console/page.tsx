@@ -18,7 +18,8 @@ import { latencyStats } from '@/lib/wick-data';
 import { cn } from '@/lib/utils';
 
 export default function ConsolePage() {
-  const { snapshot, status, error, paused, refresh, rpc, programId } = useGuardAccount();
+  const { snapshot, status, error, routeConfig, writesBlocked, refresh, rpc, programId } =
+    useGuardAccount();
   const events = useGuardEvents(snapshot);
   const { publicKey } = useWallet();
   const { tx, canSend, confirm } = useGuardActions({
@@ -59,10 +60,16 @@ export default function ConsolePage() {
       </header>
 
       <main className="mx-auto max-w-6xl px-4 py-8 sm:px-6">
-        {paused ? (
+        {routeConfig.paused ? (
           <p className="mb-6 rounded-md border border-risk/40 bg-risk/5 px-3 py-2 font-mono text-[11.5px] text-risk">
             Program paused — the RouteConfig kill-switch is on. Every state-mutating instruction
             rejects until the route authority resumes it.
+          </p>
+        ) : !routeConfig.exists ? (
+          <p className="mb-6 rounded-md border border-warning/40 bg-warning/5 px-3 py-2 font-mono text-[11.5px] text-warning">
+            RouteConfig is not initialized. The program checks it on every state-mutating
+            instruction, so writes will fail until it exists — run{' '}
+            <span className="text-foreground">node src/init.mjs</span> in cranker/.
           </p>
         ) : null}
         {status !== 'ready' || !snapshot ? (
@@ -98,7 +105,7 @@ export default function ConsolePage() {
                   staleStreak={snapshot.state.staleStreak}
                   nonce={snapshot.state.nonce}
                   pendingIxNonce={snapshot.state.pendingIxNonce}
-                  canConfirm={canSend && snapshot.isOwner && !paused}
+                  canConfirm={canSend && snapshot.isOwner && !writesBlocked}
                   onConfirm={confirm}
                   tx={tx}
                 />
