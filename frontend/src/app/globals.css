@@ -78,6 +78,21 @@
     color-scheme: dark;
   }
 
+  /* Raised planes and the strong hairline. Cards sit on `--surface`; a nested
+     plane (terminal chrome, table header) sits on `--surface-raised`.
+     `--border-strong` is the hover/emphasis rule against the base `--border`. */
+  :root {
+    --surface: var(--card);
+    --surface-raised: var(--secondary);
+    --border-strong: oklch(0.90 0.015 60);
+    --healthy: var(--success);
+    --risk: var(--danger);
+  }
+
+  .dark {
+    --border-strong: oklch(0.38 0.035 60);
+  }
+
   /* Legacy alias tokens from the previous design system — kept so existing
      components resolve cleanly during the redesign migration. */
   :root {
@@ -151,6 +166,11 @@
   --color-success: var(--success);
   --color-warning: var(--warning);
   --color-danger: var(--danger);
+  --color-surface: var(--surface);
+  --color-surface-raised: var(--surface-raised);
+  --color-border-strong: var(--border-strong);
+  --color-healthy: var(--healthy);
+  --color-risk: var(--risk);
 
   --font-sans: var(--font-sans);
   --font-serif: var(--font-serif);
@@ -197,4 +217,108 @@ a {
 .mono {
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
+}
+
+/* ============================================================
+   Motion + surface utilities
+   ============================================================ */
+
+@utility wick-grid {
+  background-size: 32px 32px;
+  background-image: radial-gradient(circle at 1px 1px, var(--border) 1px, transparent 0);
+}
+
+@utility wick-radial {
+  background: radial-gradient(
+    circle at 50% -20%,
+    color-mix(in oklab, var(--primary) 15%, transparent) 0%,
+    transparent 60%
+  );
+}
+
+@keyframes wick-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes wick-sweep {
+  from {
+    transform: translateX(-100px);
+  }
+  to {
+    transform: translateX(1400px);
+  }
+}
+
+@keyframes wick-pulse-dot {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+@keyframes wick-caret {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0;
+  }
+}
+
+.animate-fade-in {
+  animation: wick-fade-in 800ms var(--ease-settle) both;
+}
+
+.animate-pulse-dot {
+  animation: wick-pulse-dot 2.4s ease-in-out infinite;
+}
+
+.animate-caret {
+  animation: wick-caret 1s steps(1) infinite;
+}
+
+.animate-sweep {
+  animation: wick-sweep 3.4s linear infinite;
+}
+
+/* Reveal-on-scroll: the hook flips `data-visible`, the transition lives here so
+   a reduced-motion user gets the end state with no travel. */
+.reveal {
+  opacity: 0;
+  transform: translateY(14px);
+  transition:
+    opacity 700ms var(--ease-settle),
+    transform 700ms var(--ease-settle);
+}
+
+.reveal[data-visible='true'] {
+  opacity: 1;
+  transform: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  .reveal {
+    opacity: 1;
+    transform: none;
+  }
 }
