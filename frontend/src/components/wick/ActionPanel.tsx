@@ -2,6 +2,7 @@
 
 import type { Action } from '@/lib/guard-layout';
 import { describeActionText } from '@/lib/guard-events';
+import type { TxState } from '@/hooks/useGuardActions';
 import { cn } from '@/lib/utils';
 
 export function ActionPanel({
@@ -11,6 +12,9 @@ export function ActionPanel({
   staleStreak,
   nonce,
   pendingIxNonce,
+  canConfirm,
+  onConfirm,
+  tx,
 }: {
   action: Action | null;
   awaitingConfirmation: boolean;
@@ -18,6 +22,9 @@ export function ActionPanel({
   staleStreak: number;
   nonce: bigint;
   pendingIxNonce: bigint | null;
+  canConfirm: boolean;
+  onConfirm: () => void;
+  tx: TxState;
 }) {
   const escalated = action?.kind === 'EscalateManualReview';
   const tone = degraded || escalated ? 'risk' : action ? 'warning' : 'healthy';
@@ -101,6 +108,37 @@ export function ActionPanel({
           </div>
         ) : null}
       </dl>
+
+      {awaitingConfirmation ? (
+        <div className="mt-4 border-t border-border pt-4">
+          <button
+            type="button"
+            onClick={onConfirm}
+            disabled={!canConfirm || tx.kind === 'sending'}
+            className={cn(
+              'w-full rounded-md border px-4 py-2.5 font-mono text-[12px] tracking-[0.08em] transition-colors',
+              canConfirm && tx.kind !== 'sending'
+                ? 'border-warning/60 text-warning hover:bg-warning/10'
+                : 'cursor-not-allowed border-border text-muted-foreground',
+            )}
+          >
+            {tx.kind === 'sending' ? 'confirming…' : `confirm nonce ${pendingIxNonce?.toString()}`}
+          </button>
+          <p className="mt-2 text-[11.5px] leading-relaxed text-muted-foreground">
+            {canConfirm
+              ? 'Confirm only after the guard-built venue instruction has landed. This commits the nonce and clears the pending action.'
+              : 'Connect the owner wallet for this guard to co-sign.'}
+          </p>
+          {tx.kind === 'error' ? (
+            <p className="mt-2 font-mono text-[11px] break-all text-risk">{tx.message}</p>
+          ) : null}
+          {tx.kind === 'sent' ? (
+            <p className="mt-2 font-mono text-[11px] break-all text-healthy">
+              confirmed · {tx.signature.slice(0, 16)}…
+            </p>
+          ) : null}
+        </div>
+      ) : null}
     </div>
   );
 }

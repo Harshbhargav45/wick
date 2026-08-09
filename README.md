@@ -2,185 +2,271 @@
 
 **Autonomous on-chain liquidation protection for Solana perpetuals.**
 
-Wick is a Pinocchio (`no_std`) program that continuously monitors a leveraged
-perps position, evaluates risk with deterministic fixed-point arithmetic, and
-autonomously executes protective actions before liquidation — on venues that
-allow delegated authority. See [`wick-architecture.md`](./wick-architecture.md)
-for the full technical specification (health engine, action selection,
-authority dispatch, delegation).
+A leveraged perp position gets liquidated because nobody was watching at the
+moment it mattered. Wick is a Solana program that watches continuously, decides
+with deterministic fixed-point arithmetic, and acts before the liquidator does —
+on venues whose authority model actually permits it.
 
-## The core problem
+The guard is written in [Pinocchio](https://github.com/anza-xyz/pinocchio)
+(`no_std`, no Anchor) because the critical path is a latency budget, and every
+byte of deserialization on it is spend. See
+[`wick-architecture.md`](./wick-architecture.md) for the full specification;
+section numbers throughout this README refer to it.
 
-Existing perp protocols generally require the position **owner's signature** on
-every state change, which makes truly autonomous protection architecturally
-impossible there. Wick does not fake autonomy:
+## The honest version of the pitch
 
-- **Autonomous tier** (Drift perps): the guard PDA *is* the position
-  delegate. It signs a hard reduce-only `place_perp_order` itself and executes
-  protective actions autonomously on breach — the sub-50ms path.
-- **Co-signed tier** (Jupiter): the guard builds the owner-signed instruction
-  and holds it as *pending*; the owner's signature is what lands it. The guard
-  never claims to be faster than it is.
+Most perp protocols require the position **owner's signature** on every state
+change, which makes autonomous protection architecturally impossible there. Wick
+does not paper over that. It runs two tiers and tells you which one you are in:
 
-Both tiers share one guard architecture, one health engine, one action
-selector, and one nonce/replay model.
+- **Autonomous** (Drift/Velocity perps) — the guard PDA *is* the position
+  delegate. On breach it signs a hard reduce-only `place_perp_order` itself and
+  the action lands without the owner present. This is the fast path.
+- **Co-signed** (Jupiter) — the guard *builds* the owner-signed instruction and
+  holds it as pending. The owner's signature is what lands it. The guard never
+  claims to be faster than the human in this tier.
+
+Both tiers share one guard account, one health engine, one action selector, and
+one nonce/replay model. The difference is exactly one dispatch branch (§8.4).
+
+## Measured latency
+
+The guard's dispatch path, benchmarked in LiteSVM over 300 recorded dispatches
+(`program/tests/latency_bench.rs`, dataset at
+`frontend/public/latency-samples.json`):
+
+| | |
+|---|---|
+| p50 | **187 µs** |
+| p99 | 266 µs |
+| min / max | 178 µs / 1396 µs |
+| samples | 300 |
+
+For scale: a Solana L1 slot is ~400 ms, and the sub-50 ms lane Wick targets is
+50,000 µs — roughly **267× headroom** at p50. This is a VM-measured dispatch
+cost, *not* an end-to-end on-chain claim: it excludes network propagation,
+leader scheduling, and confirmation. The dashboard plots the recorded
+distribution rather than a marketing number, and the target line is drawn off
+scale on purpose.
 
 ## Repository structure
 
 ```
 .
-├── wick-architecture.md          # Technical specification + hackathon addendum
-├── .github/workflows/ci.yml     # fmt + clippy(-D warnings) + build-sbf + tests
-└── program/
-    ├── Cargo.toml               # wick-guard — Pinocchio program (no_std, BPF)
-    ├── src/
-    │   ├── lib.rs               # entrypoint, module wiring
-    │   ├── instruction.rs       # instruction discriminators
-    │   ├── processor.rs         # handlers + §7.2 critical path (on_price_tick)
-    │   ├── state.rs             # health engine, selector, partial-close solver,
-    │   │                        #   dispatch regimes (§8.1–8.4)
-    │   ├── account.rs           # deterministic wire-format serialization
-    │   ├── delegation.rs        # MagicBlock ER delegate/commit/undelegate (§8.6)
-    │   ├── drift.rs             # Drift hard reduce-only place_perp_order CPI adapter (§8.7)
-    │   └── error.rs             # WickError
-    ├── tests/
-    │   ├── init.rs              # litesvm e2e: InitGuard → DepositMargin
-    │   └── tick.rs              # litesvm e2e: autonomous + co-signed dispatch
-    └── mocks/drift/             # mock Drift program for e2e CPI testing
-```
-
-## Prerequisites
-
-- [Solana CLI](https://docs.anza.xyz/cli/) `≥ 4.0.3` (provides `cargo-build-sbf`)
-- Rust toolchain `1.89`+ (CI pins `1.97.1`)
-- Linux/macOS for `cargo build-sbf`
-
-## Build
-
-```bash
-# Guard program (produces program/target/deploy/wick_guard.so)
-cd program
-cargo build-sbf
-
-# Mock Drift program (needed only for the e2e tick tests)
-cd program/mocks/drift
-cargo build-sbf
-```
-
-## Test
-
-```bash
-cd program
-cargo test --features no-entrypoint --all-targets
-```
-
-This runs 61 unit tests + 4 litesvm integration tests:
-
-- **61 unit tests** — fixed-point health engine, breach detection, partial-close
-  solver, action selection precedence + caps, 2-of-2 withdraw matrix, tick
-  freshness/degraded mode, nonce semantics, serialization round-trips, Jupiter
-  safety-net serialization + co-signed build persistence, the owner `Confirm`
-  commit path + its rejection matrix, the verified Pyth `PriceUpdateV2`
-  accessor (feed/staleness/confidence gates + 6dp scaling), and the Drift
-  adapter (program ID, discriminator, reduce-only wire layout, direction
-  mapping, missing-account rejection).
-- **1 litesvm integration test** (`init.rs`) — `InitGuard` CPI-create + deposit.
-- **2 litesvm e2e tests** (`tick.rs`):
-  - *Autonomous*: an underwater Drift position on a breach tick triggers the
-    guard PDA to CPI a hard reduce-only `place_perp_order` into (mock) Drift
-    **signed by its own delegate seeds**, stamping the position and committing
-    the nonce — the "beat the liquidator" path, proven end-to-end against a
-    real SBF VM. The mock Drift enforces the delegate invariant: the CPI
-    authority must be the account whose address is stored as `User.delegate`
-    *and* a signer — the test fails if either is violated.
-  - *Co-signed*: the same breach never reaches the venue; the action is held
-    as pending and the nonce does not advance until an owner signature exists.
-    On Jupiter, the guard additionally **builds** the owner-signed
-    `instant_create_tpsl` safety-net instruction data and persists it beside the
-    expected nonce — the owner's signature is what lands it (§8.4/§8.7). The
-    owner then calls `Confirm` to record that the instruction landed on L1,
-    committing the expected nonce and clearing the pending state.
-
-Linting / formatting (what CI enforces):
-
-```bash
-cd program
-cargo fmt --check
-cargo clippy --features no-entrypoint --all-targets -- -D warnings
-cd program/mocks/drift
-cargo clippy --all-targets -- -D warnings
+├── wick-architecture.md      # Technical specification
+├── brand.md                  # Ember Circuit design tokens
+├── .github/workflows/ci.yml  # fmt + clippy(-D warnings) + build-sbf + tests
+├── program/                  # On-chain guard (Pinocchio, no_std, BPF)
+│   ├── src/
+│   │   ├── lib.rs            # entrypoint, module wiring
+│   │   ├── instruction.rs    # instruction discriminators
+│   │   ├── processor.rs      # handlers + §7.2 critical path (on_price_tick)
+│   │   ├── state.rs          # health engine, selector, partial-close solver,
+│   │   │                     #   dispatch regimes (§8.1–8.4)
+│   │   ├── account.rs        # deterministic byte-map serialization
+│   │   ├── pyth.rs           # verified PriceUpdateV2 accessor (§7.1)
+│   │   ├── drift.rs          # hard reduce-only place_perp_order CPI (§8.7)
+│   │   ├── jupiter.rs        # co-signed instant_create_tpsl safety net
+│   │   ├── delegation.rs     # MagicBlock ER delegate/commit/undelegate (§8.6)
+│   │   └── error.rs          # WickError
+│   ├── tests/                # LiteSVM e2e + real-fixture proofs
+│   └── mocks/drift/          # mock Drift program for e2e CPI testing
+├── cranker/                  # Off-chain tick driver (Node, ESM)
+│   └── src/                  # Hermes VAA fetch → post PriceUpdateV2 → OnPriceTick
+├── frontend/                 # Next.js 16 console + landing page
+│   └── src/
+│       ├── app/              # / (landing) and /console
+│       ├── components/wick/  # design-system components
+│       ├── hooks/            # guard polling, derived events, wallet, actions
+│       └── lib/              # account decoder, health math, instruction builders
+└── deploy/deploy-devnet.sh   # build + deploy + print the guard PDA params
 ```
 
 ## How it works (critical path)
 
-`OnPriceTick` runs the §7.2 ordering:
+`OnPriceTick` runs the §7.2 ordering. The order is the design:
 
-1. **Price** — the mark is read from the Pyth `PriceUpdateV2` account at
-   account index `[3]` (verified feed ID, ≤60s age, ≤150bps confidence, 6dp
-   scaling); it is *never* taken from the tick payload, so a cranker cannot
-   feed the guard a fabricated price.
-2. **Staleness** — reject ticks older than `MAX_TICK_AGE_SLOTS`; N consecutive
-   stale ticks flip the guard to `degraded` (surfaced to the frontend).
-3. **Health** — cross-multiplied equity-vs-maintenance check (no floats).
-4. **Nonce** — monotonic tick nonce; replayed/old nonces hard-reject.
-5. **Caps** — per-action + daily USD policy caps.
-6. **Select** — take-profit first, then top-up, then partial-close (bounded
-   binary-search solver), else escalate to manual review (never a silent no-op).
-7. **Dispatch** — Autonomous: construct + CPI immediately (nonce commits only on
-   a landed venue action). Co-Signed: hold the built instruction as pending
-   (nonce commits only on the owner's L1 confirm).
+1. **Price** — read from the Pyth `PriceUpdateV2` account at index `[3]`, gated
+   on feed ID, full verification, ≤60 s age and ≤150 bps confidence, scaled to
+   6dp. It is *never* taken from the tick payload, so a cranker cannot feed the
+   guard a fabricated price.
+2. **Staleness** — ticks older than `MAX_TICK_AGE_SLOTS` are rejected; 3
+   consecutive stale ticks flip the guard to `degraded`. A fresh tick clears
+   both the streak and the flag (§8.1.3).
+3. **Health** — cross-multiplied equity-vs-maintenance comparison. Fixed-point
+   throughout (`SCALE = 1_000_000`, `BPS_DENOM = 10_000`): no division, no
+   floats, no rounding surprises between the program and the UI.
+4. **Nonce** — monotonic tick nonce; replayed or stale nonces hard-reject.
+5. **Caps** — per-action and daily USD policy caps.
+6. **Select** — take-profit, then top-up, then partial-close (bounded
+   binary-search fraction solver in `[0, BPS_DENOM]`). If nothing inside the
+   caps restores the buffer it escalates to manual review — never a silent
+   no-op.
+7. **Dispatch** — *Autonomous*: build and CPI immediately; the nonce commits on
+   the landed venue action. *Co-signed*: persist the built instruction as
+   pending; the nonce commits only when the owner confirms on L1.
 
-The guard's margin wallet is a 2-of-2 (`user` + `co_authority`) — see §8.5.
+The guard's margin wallet is 2-of-2 (`owner` + `co_authority`) — see §8.5. A
+singleton `RouteConfig` PDA holds a kill-switch checked at the top of every
+state-mutating instruction.
 
-## Demo narrative
+## Instruction surface
 
-1. Open a position on Drift with the guard PDA set as `User.delegate`, enroll
-   it via `InitGuard` + `UpdatePosition` with the pinned market/sub-account,
-   delegate the PDA to the Ephemeral Rollup.
-2. Feed a breach price tick.
-3. The guard evaluates health → selects a protective action → CPIs a
-   reduce-only `place_perp_order` signed by its own PDA (delegate) seeds,
-   exiting before liquidation.
-4. Show the measured latency against the L1 baseline.
-5. Explain honestly why Jupiter is co-signed (owner-signature requirement), not
-   autonomous.
+| # | Instruction | Signer | Purpose |
+|---|---|---|---|
+| 0 | `InitGuard` | owner + payer | Create the guard PDA (`b"guard" \|\| owner`) and pin its policy |
+| 1 | `DepositMargin` | owner | Add collateral |
+| 2 | `WithdrawMargin` | owner **+** co-authority | 2-of-2 withdrawal (§8.5) |
+| 3 | `SetPaused` | route authority | Kill-switch |
+| 4 | `Delegate` | owner | Delegate the guard to the Ephemeral Rollup (§8.6) |
+| 5 | `CommitAndUndelegate` | owner | Commit state to L1 and exit the rollup |
+| 6 | `Commit` | owner | Commit state, stay delegated |
+| 7 | `OnPriceTick` | cranker | The §7.2 critical path |
+| 8 | `UpdatePosition` | owner | Enroll/refresh the watched position snapshot |
+| 9 | `ConfirmYes` | owner | Record that the co-signed instruction landed; commit the nonce |
+| 10 | `InitRouteConfig` | route authority | Create the singleton config |
+
+## Running it
+
+### Prerequisites
+
+- [Solana CLI](https://docs.anza.xyz/cli/) `≥ 4.0.3` (provides `cargo-build-sbf`)
+- Rust `1.89`+ (CI pins `1.97.1`), Linux or macOS
+- Node `20+` for the cranker and frontend
+
+### Build and test the program
+
+```bash
+cd program
+cargo build-sbf                                    # -> target/deploy/wick_guard.so
+cargo test --features no-entrypoint --all-targets
+
+cd mocks/drift && cargo build-sbf                  # only for the e2e tick tests
+```
+
+What CI enforces:
+
+```bash
+cargo fmt --check
+cargo clippy --features no-entrypoint --all-targets -- -D warnings
+```
+
+### Deploy to devnet
+
+```bash
+./deploy/deploy-devnet.sh            # add --smoke to print program metadata
+```
+
+It prints the `PROGRAM_ID` to put in `frontend/.env.local`.
+
+### Run the console
+
+```bash
+cd frontend
+cp .env.example .env.local           # set NEXT_PUBLIC_GUARD_PROGRAM_ID
+npm install && npm run dev
+```
+
+`/` is the landing page; `/console` attaches to a live guard. With a wallet
+connected it resolves *your* guard by PDA and enables the co-sign confirm; with
+no wallet it stays read-only. It renders explicit unconfigured / no-guard /
+error states rather than falling back to fake numbers, and the activity feed
+records only transitions it actually observes — the guard account holds current
+state, not history, so nothing is backfilled.
+
+### Run the cranker
+
+```bash
+cd cranker
+cp .env.example .env                 # RPC, keypair path, guard + feed addresses
+npm install && npm start
+```
+
+It pulls a VAA from Hermes, posts a fully-verified `PriceUpdateV2` through the
+Pyth receiver, and drives `OnPriceTick`.
+
+> Secrets stay out of git: `.env`, `*.pem`, `*.key`, and any `*keypair*.json`
+> are gitignored. Only `.env.example` templates are tracked.
+
+## Testing
+
+61 unit tests plus LiteSVM integration tests covering:
+
+- the fixed-point health engine, breach detection, and the partial-close solver
+- action-selection precedence and cap enforcement
+- the 2-of-2 withdraw matrix and nonce semantics
+- serialization round-trips for every account layout
+- the verified Pyth accessor — feed, staleness, confidence, 6dp scaling
+- the Drift adapter — program ID, discriminator, reduce-only wire layout,
+  direction mapping, missing-account rejection
+
+The end-to-end proofs are the interesting ones:
+
+- **Autonomous** (`tick.rs`) — an underwater Drift position on a breach tick
+  drives the guard PDA to CPI a hard reduce-only `place_perp_order` into mock
+  Drift **signed by its own delegate seeds**, stamping the position and
+  committing the nonce. The mock enforces the delegate invariant: the CPI
+  authority must be the account stored as `User.delegate` *and* a signer — the
+  test fails if either is violated.
+- **Co-signed** (`tick.rs`) — the same breach never reaches the venue. The
+  action is held pending, the nonce does not advance, and on Jupiter the guard
+  additionally builds and persists the owner-signed `instant_create_tpsl` data
+  beside the expected nonce. `Confirm` then commits it.
+- **Real protocol** (`real_drift.rs`) — the autonomous reduce runs against the
+  real Velocity (`vELoC1…`) program in LiteSVM using mainnet account fixtures,
+  not a mock.
+
+## Security notes
+
+- The guard PDA is a **delegate**, never an owner. Delegates cannot withdraw.
+- `reduce_only = true` is written by the serializer itself (`d[30] = 1`), so a
+  position-increasing order is not merely unused — it is unconstructible.
+- Re-initializing a funded guard account is refused, closing the path where an
+  attacker passes a victim's guard with their own key as `owner` to reset nonce
+  and collateral.
+- Account layouts are explicit byte maps with pinned offsets rather than
+  `repr(C)` casts, so BPF and the TypeScript decoder cannot disagree.
+- `frontend/src/lib/guard-layout.ts` and `guard-health.ts` mirror
+  `account.rs` and `state.rs` byte for byte and in bigint respectively — the UI
+  never disagrees with the program about whether a position is liquidatable.
 
 ## Known limitations
 
-- **Jupiter safety-net covers take-profit; defensive closes remain pending —**
-  the guard builds and persists the owner-signed `instant_create_tpsl` for
-  take-profit, and `Confirm` records the owner landing it. But defensive (breach)
-  Jupiter closes are not yet expressed as a signed instruction — the guard holds
-  those as pending state only. The full co-signed loop for breach protection
-  still needs its safety-net build to close.
-- **Dashboard is a static scaffold** — the frontend ships a landing page (`/`)
-  and a two-column console (`/console`) with health/stats/latency/activity
-  components, plus live on-chain polling for the deployed guard state, but the
-  console values still fall back to demo fixtures when no guard account exists.
-- **No measured latency benchmark** — the autonomous path is proven in an SBF
-  VM and against the real Velocity program (p50 ≈ 375µs dispatch), but a real
-  sub-50ms claim against a live L1 baseline is not yet measured on-chain.
-- **Devnet program live; ER delegation not exercised** — the guard is deployed
-  to devnet (`FRtyvM3xcFhL5FbukUdzaMV7t4pePiqxPvp2ZHwptBE`) and the
-  delegate/commit/undelegate SDK hooks are written, but the live MagicBlock
-  rollup round-trip is not yet verified.
-- **Drift reduce adapter covers reduce-only orders (hard-coded)** — top-up and
-  arbitrary-position orders are structurally impossible (the serializer writes
-  `reduce_only=true`); a zero-size reduce escalates. Drift `market_index` +
-  `subaccount_id` are pinned in guard state at init.
+Stated plainly, because a risk tool that oversells itself is worse than none:
+
+- **Jupiter defensive closes are not yet built as signed instructions.** The
+  take-profit safety net is built, persisted, and confirmable. Breach closes on
+  Jupiter are held as pending state only; that build path is still open.
+- **The sub-50 ms claim is VM-measured, not on-chain.** 187 µs p50 is real and
+  reproducible, but it is dispatch cost in LiteSVM — it excludes propagation and
+  confirmation.
+- **ER delegation is written but not round-tripped.** The guard is live on
+  devnet (`FRtyvM3xcFhL5FbukUdzaMV7t4pePiqxPvp2ZHwptBE`) and the
+  delegate/commit/undelegate hooks exist, but the live MagicBlock round trip is
+  unverified.
+- **The console is read + confirm.** It resolves the guard, decodes it, and can
+  land `ConfirmYes`. Init, deposit, and position enrollment are built as
+  instruction builders but not yet surfaced as forms.
+- **Drift market and sub-account are pinned at init** and cannot be changed
+  without re-initialization.
+- `npm audit` reports 3 moderate advisories, all transitive through
+  `@solana/web3.js → jayson → uuid`. The only offered fix downgrades web3.js to
+  `0.0.3`, so it is deliberately not applied.
 
 ## Roadmap
 
-- [x] Phase 1 — guard program, health engine, selector, solver, authority, serialization
-- [x] CI (fmt, clippy, build-sbf, tests)
-- [x] Phase 3 — Jupiter co-signed safety-net adapter (build + persist the owner-signed instruction)
-- [x] Phase 3.5 — owner `Confirm` instruction to land the pending Jupiter instruction + commit nonce
-- [x] Phase 4 — verified Pyth `PriceUpdateV2` accessor (feed/staleness/confidence gates + 6dp scaling)
-- [x] Phase 6 — Drift reduce-only `place_perp_order` adapter + delegate-PDA mock e2e (autonomous tier, §8.7)
-- [x] Phase 6.5 — live-protocol proof: autonomous reduce against the real Velocity (`vELoC1...`) program in LiteSVM with real mainnet account fixtures
-- [x] Phase 5 — dashboard: console + honest measured latency chart (p50 ≈ 375µs dispatch vs ~400ms L1 slot)
-- [x] Frontend redesign — Ember Circuit brand; landing page (`/`) + two-column console (`/console`) on the live guard account
-- [x] Deployment (partial) — guard program live on devnet (`FRtyvM3xcFhL5FbukUdzaMV7t4pePiqxPvp2ZHwptBE`); ER delegation round-trip + on-chain latency benchmark still open
+- [x] Guard program — health engine, selector, solver, authority dispatch, serialization
+- [x] CI — fmt, clippy, build-sbf, tests
+- [x] Jupiter co-signed safety net + owner `Confirm`
+- [x] Verified Pyth `PriceUpdateV2` accessor
+- [x] Drift reduce-only adapter + delegate-PDA e2e (autonomous tier)
+- [x] Live-protocol proof against real Velocity with mainnet fixtures
+- [x] Measured latency benchmark (187 µs p50) + honest dashboard chart
+- [x] Devnet deployment + cranker driving real price ticks
+- [x] Frontend — Ember Circuit brand, landing page, live console, wallet co-sign
+- [ ] Jupiter defensive-close instruction build
+- [ ] ER delegation round-trip on live MagicBlock
+- [ ] On-chain end-to-end latency measurement
 
 ## License
 

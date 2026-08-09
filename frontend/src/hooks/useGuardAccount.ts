@@ -9,7 +9,9 @@ import {
   decodeGuardState,
   type GuardState,
 } from '@/lib/guard-layout';
+import { decodeRouteConfig, guardPda, routeConfigPda } from '@/lib/guard-program';
 import { computeHealth, type Health } from '@/lib/guard-health';
+import { useWallet } from './useWallet';
 
 const POLL_INTERVAL_MS = 5_000;
 const DEFAULT_RPC = 'https://api.devnet.solana.com';
@@ -23,6 +25,8 @@ export interface GuardSnapshot {
   isCoSigned: boolean;
   /** A guard-built instruction is waiting on the owner's signature. */
   awaitingConfirmation: boolean;
+  /** True when the connected wallet is this guard's venue owner. */
+  isOwner: boolean;
   fetchedAt: number;
 }
 
@@ -51,50 +55,77 @@ function readConfig(): { programId: PublicKey | null; rpc: string; error: string
 
 export function useGuardAccount() {
   const { programId, rpc, error: configError } = readConfig();
+  const { publicKey } = useWallet();
 
   const [snapshot, setSnapshot] = useState<GuardSnapshot | null>(null);
   const [status, setStatus] = useState<GuardStatus>(configError ? 'config' : 'loading');
   const [error, setError] = useState<string | null>(configError);
+  const [paused, setPaused] = useState(false);
   const [nudge, setNudge] = useState(0);
 
   const programIdKey = programId?.toBase58();
+  const ownerKey = publicKey?.toBase58() ?? null;
   const inFlight = useRef(false);
 
   useEffect(() => {
     if (!programIdKey) return;
 
     const connection = new Connection(rpc, 'confirmed');
-    const key = new PublicKey(programIdKey);
+    const program = new PublicKey(programIdKey);
+    const owner = ownerKey ? new PublicKey(ownerKey) : null;
+    const [routeConfig] = routeConfigPda(program);
     let cancelled = false;
+
+    /**
+     * A connected wallet addresses its own guard directly by PDA. Without one
+     * the console is read-only, so it falls back to scanning program accounts
+     * for any guard to display.
+     */
+    const readGuard = async (): Promise<{ address: PublicKey; data: Uint8Array } | null> => {
+      if (owner) {
+        const [pda] = guardPda(program, owner);
+        const info = await connection.getAccountInfo(pda);
+        return info ? { address: pda, data: new Uint8Array(info.data) } : null;
+      }
+      const accounts = await connection.getProgramAccounts(program, {
+        filters: [{ dataSize: GUARD_DATA_LEN }],
+      });
+      const first = accounts[0];
+      return first ? { address: first.pubkey, data: new Uint8Array(first.account.data) } : null;
+    };
 
     const fetchState = async () => {
       if (inFlight.current) return;
       inFlight.current = true;
       try {
-        const accounts = await connection.getProgramAccounts(key, {
-          filters: [{ dataSize: GUARD_DATA_LEN }],
-        });
+        const [found, configInfo] = await Promise.all([
+          readGuard(),
+          connection.getAccountInfo(routeConfig),
+        ]);
         if (cancelled) return;
 
-        if (accounts.length === 0) {
+        setPaused(configInfo ? decodeRouteConfig(new Uint8Array(configInfo.data)).paused : false);
+
+        if (!found) {
           setSnapshot(null);
           setStatus('empty');
           setError(null);
           return;
         }
 
-        const account = accounts[0]!;
-        const state = decodeGuardState(new Uint8Array(account.account.data));
+        const state = decodeGuardState(found.data);
         const health = computeHealth(state);
         const isCoSigned = state.authorityReq === 'CoSigned';
+        const venueOwner = new PublicKey(state.venueOwner).toBase58();
 
         setSnapshot({
-          address: account.pubkey.toBase58(),
+          address: found.address.toBase58(),
           state,
           health,
           venueLabel: venueLabel(state.venue, state.authorityReq),
           isCoSigned,
           awaitingConfirmation: isCoSigned && state.pendingIxNonce !== null,
+          isOwner: ownerKey === venueOwner,
           fetchedAt: Date.now(),
         });
         setStatus('ready');
@@ -115,9 +146,17 @@ export function useGuardAccount() {
       cancelled = true;
       clearInterval(interval);
     };
-  }, [programIdKey, rpc, nudge]);
+  }, [programIdKey, rpc, ownerKey, nudge]);
 
   const refresh = () => setNudge((n) => n + 1);
 
-  return { snapshot, status, error, refresh, rpc, programId: programIdKey ?? null };
+  return {
+    snapshot,
+    status,
+    error,
+    paused,
+    refresh,
+    rpc,
+    programId: programIdKey ?? null,
+  };
 }

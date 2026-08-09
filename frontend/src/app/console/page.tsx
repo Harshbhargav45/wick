@@ -4,7 +4,10 @@ import Link from 'next/link';
 import { ArrowLeft, RefreshCw } from 'lucide-react';
 import { useGuardAccount } from '@/hooks/useGuardAccount';
 import { useGuardEvents } from '@/hooks/useGuardEvents';
+import { useGuardActions } from '@/hooks/useGuardActions';
+import { useWallet } from '@/hooks/useWallet';
 import { WickMark } from '@/components/wick/Logo';
+import { WalletButton } from '@/components/wick/WalletButton';
 import { HealthGauge } from '@/components/wick/HealthGauge';
 import { PositionPanel } from '@/components/wick/PositionPanel';
 import { PolicyPanel } from '@/components/wick/PolicyPanel';
@@ -15,8 +18,16 @@ import { latencyStats } from '@/lib/wick-data';
 import { cn } from '@/lib/utils';
 
 export default function ConsolePage() {
-  const { snapshot, status, error, refresh, programId } = useGuardAccount();
+  const { snapshot, status, error, paused, refresh, rpc, programId } = useGuardAccount();
   const events = useGuardEvents(snapshot);
+  const { publicKey } = useWallet();
+  const { tx, canSend, confirm } = useGuardActions({
+    programId,
+    guardAddress: snapshot?.address ?? null,
+    owner: publicKey,
+    rpc,
+    onDone: refresh,
+  });
 
   return (
     <div className="min-h-screen bg-background text-foreground">
@@ -34,6 +45,7 @@ export default function ConsolePage() {
 
           <div className="flex shrink-0 items-center gap-3">
             <StatusPill status={status} snapshot={snapshot} />
+            <WalletButton />
             <button
               type="button"
               onClick={refresh}
@@ -47,6 +59,12 @@ export default function ConsolePage() {
       </header>
 
       <main className="mx-auto max-w-6xl px-4 py-8 sm:px-6">
+        {paused ? (
+          <p className="mb-6 rounded-md border border-risk/40 bg-risk/5 px-3 py-2 font-mono text-[11.5px] text-risk">
+            Program paused — the RouteConfig kill-switch is on. Every state-mutating instruction
+            rejects until the route authority resumes it.
+          </p>
+        ) : null}
         {status !== 'ready' || !snapshot ? (
           <EmptyState status={status} error={error} programId={programId} />
         ) : (
@@ -80,6 +98,9 @@ export default function ConsolePage() {
                   staleStreak={snapshot.state.staleStreak}
                   nonce={snapshot.state.nonce}
                   pendingIxNonce={snapshot.state.pendingIxNonce}
+                  canConfirm={canSend && snapshot.isOwner && !paused}
+                  onConfirm={confirm}
+                  tx={tx}
                 />
 
                 <div className="rounded-xl border border-border bg-surface/40 p-5">
@@ -171,7 +192,7 @@ function EmptyState({
     },
     empty: {
       title: 'No guard found',
-      body: `The program is reachable but owns no PositionGuard account yet. Initialize one, then this console will attach to it.`,
+      body: 'The program is reachable but there is no PositionGuard at this address yet. Connect the owner wallet and initialize one — the guard PDA is derived from b"guard" || owner.',
     },
     error: {
       title: 'Cannot read guard state',
