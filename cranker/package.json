@@ -10,7 +10,10 @@
   "scripts": {
     "init": "node src/init.mjs",
     "start": "node src/index.mjs",
-    "post-vaa": "node src/post-vaa.mjs"
+    "rpc-check": "node src/rpc-check.mjs",
+    "post-vaa": "node src/post-vaa.mjs",
+    "delegate": "node src/delegate.mjs",
+    "test": "node --test test/"
   },
   "overrides": {
     "uuid": "8.3.2"

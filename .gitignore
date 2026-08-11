@@ -15,9 +15,21 @@ id.json
 keypair.json
 wallet.json
 *.env.local
+# ...except the secret-free templates. These are documentation: they carry the
+# variable names and the cluster/credential rules, never a value. Without this
+# exception `.env.*` swallows them and every operator has to rediscover the
+# configuration from the source.
+!.env.example
+!**/.env.example
 # Program/deploy keypairs (any naming) — never commit
 **/*-keypair.json
 *keypair*.json
+# Exported/plaintext secret material. `*.key` above does not match a key
+# pasted into a .txt, which is exactly how a Phantom import file slipped in.
+*secret*
+*private-key*
+*-key.txt
+phantom-import-key.txt
 
 # Node
 node_modules/
