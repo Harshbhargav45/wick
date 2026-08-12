@@ -169,8 +169,19 @@ export function useGuardAccount() {
       const accounts = await connection.getProgramAccounts(program, {
         filters: [{ dataSize: GUARD_DATA_LEN }],
       });
-      const first = accounts[0];
-      return first ? { address: first.pubkey, data: new Uint8Array(first.account.data) } : null;
+      // The dataSize filter matches any 416-byte program account, which may
+      // include delegated / partially-written accounts that do not decode.
+      // Try each candidate and take the first that passes the version check.
+      for (const acct of accounts) {
+        try {
+          const data = new Uint8Array(acct.account.data);
+          decodeGuardState(data); // validate, discard result
+          return { address: acct.pubkey, data };
+        } catch {
+          // Not a valid v3 guard — skip.
+        }
+      }
+      return null;
     };
 
     const fetchState = async () => {
@@ -251,8 +262,16 @@ export function useGuardAccount() {
         setError(null);
       } catch (err) {
         if (cancelled) return;
+        const raw = err instanceof Error ? err.message : String(err);
+        // Wrap decode failures with a hint — the most common cause is visiting
+        // the console without a wallet, where the fallback scan finds an
+        // account the decoder rejects.
+        const msg =
+          /expected \d+ bytes|unsupported account version|unknown pending/.test(raw)
+            ? `Guard decode failed (${raw}). Connect a wallet so the console reads your guard directly instead of scanning.`
+            : raw;
         setStatus((prev) => (prev === 'ready' ? 'ready' : 'error'));
-        setError(err instanceof Error ? err.message : String(err));
+        setError(msg);
       } finally {
         inFlight.current = false;
       }
