@@ -1,6 +1,7 @@
 'use client';
 
 import { formatBps, formatUsd } from '@/lib/guard-health';
+import type { DailyBudget } from '@/lib/guard-health';
 import type { GuardState } from '@/lib/guard-layout';
 import { VENUE_DRIFT } from '@/lib/guard-layout';
 
@@ -13,7 +14,7 @@ function Row({ label, value }: { label: string; value: string }) {
   );
 }
 
-export function PolicyPanel({ state }: { state: GuardState }) {
+export function PolicyPanel({ state, budget }: { state: GuardState; budget: DailyBudget }) {
   const { policy } = state;
 
   return (
@@ -42,8 +43,44 @@ export function PolicyPanel({ state }: { state: GuardState }) {
             label="Partial close / action"
             value={formatUsd(policy.caps.partialCloseUsdPerAction)}
           />
-          <Row label="Daily total" value={formatUsd(policy.caps.dailyTotalUsd)} />
+          <Row label="Daily total" value={formatUsd(budget.total)} />
         </dl>
+
+        {/* The daily cap is an accumulator, not a per-action ceiling — showing
+            only the limit would repeat the old bug where the dashboard read as
+            enforced while nothing tracked consumption. */}
+        <div className="mt-4 space-y-2">
+          <div className="flex items-baseline justify-between gap-3 text-[12px]">
+            <span className="text-muted-foreground">Spent today</span>
+            <span
+              className={`font-mono tabular-nums ${
+                budget.exhausted ? 'text-danger' : 'text-foreground'
+              }`}
+            >
+              {formatUsd(budget.spent)}
+            </span>
+          </div>
+          <div
+            className="h-1 w-full overflow-hidden rounded-full bg-border"
+            role="progressbar"
+            aria-label="Daily action budget consumed"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={Math.round(budget.used * 100)}
+          >
+            <div
+              className={`h-full rounded-full transition-[width] duration-500 ${
+                budget.exhausted ? 'bg-danger' : 'bg-accent'
+              }`}
+              style={{ width: `${Math.max(budget.used * 100, budget.spent > 0n ? 2 : 0)}%` }}
+            />
+          </div>
+          <p className="font-mono text-[10px] text-muted-foreground/70">
+            {budget.exhausted
+              ? 'budget exhausted — further actions escalate to manual review'
+              : `${formatUsd(budget.remaining)} remaining this epoch`}
+          </p>
+        </div>
       </div>
       {state.venue === VENUE_DRIFT ? (
         <div className="border-t border-border px-4 py-4">

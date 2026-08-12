@@ -65,7 +65,7 @@ export function LatencySection() {
           className="mt-10 rounded-xl border border-border bg-surface/40 p-4 sm:p-6"
           delay={80}
         >
-          <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-4 sm:flex sm:justify-between">
+          <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-3">
             <div className="min-w-0">
               <div className="truncate font-mono text-[11px] tracking-[0.2em] text-muted-foreground">
                 AUTONOMOUS DISPATCH LATENCY
@@ -87,7 +87,7 @@ export function LatencySection() {
                   aria-selected={tab === t}
                   onClick={() => setTab(t)}
                   className={cn(
-                    'rounded px-3 py-1.5 font-mono text-[11px] tracking-wider transition-all',
+                    'rounded px-2.5 py-2 font-mono text-[10.5px] tracking-wider transition-all sm:px-3 sm:py-1.5 sm:text-[11px]',
                     tab === t
                       ? 'bg-surface-raised text-foreground'
                       : 'text-muted-foreground hover:text-foreground',

@@ -1,8 +1,9 @@
 'use client';
 
 import { useState } from 'react';
-import { Connection, PublicKey, Transaction, type TransactionInstruction } from '@solana/web3.js';
+import { PublicKey, Transaction, type TransactionInstruction } from '@solana/web3.js';
 import { confirmYesIx, routeConfigPda } from '@/lib/guard-program';
+import { createFailoverConnection, rpcEndpoints } from '@/lib/rpc';
 import { sendWithWallet } from '@/lib/wallet';
 
 export type TxState =
@@ -22,10 +23,9 @@ export function useGuardActions(args: {
   programId: string | null;
   guardAddress: string | null;
   owner: PublicKey | null;
-  rpc: string;
   onDone?: () => void;
 }) {
-  const { programId, guardAddress, owner, rpc, onDone } = args;
+  const { programId, guardAddress, owner, onDone } = args;
   const [tx, setTx] = useState<TxState>({ kind: 'idle' });
 
   const canSend = Boolean(programId && guardAddress && owner);
@@ -43,7 +43,7 @@ export function useGuardActions(args: {
       const guard = new PublicKey(guardAddress);
       const [routeConfig] = routeConfigPda(program);
 
-      const connection = new Connection(rpc, 'confirmed');
+      const connection = createFailoverConnection(rpcEndpoints());
       const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
 
       const transaction = new Transaction({

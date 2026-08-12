@@ -130,26 +130,28 @@ export function HeroTerminal() {
         paused.current = false;
       }}
     >
-      <div className="flex items-center justify-between gap-3 border-b border-border bg-surface-raised/60 px-4 py-2.5">
+      <div className="flex items-center justify-between gap-3 border-b border-border bg-surface-raised/60 px-3 py-2 sm:px-4 sm:py-2.5">
         <div className="flex min-w-0 items-center gap-2.5">
-          <span className="flex shrink-0 gap-1.5" aria-hidden="true">
+          <span className="hidden shrink-0 gap-1.5 sm:flex" aria-hidden="true">
             <span className="h-2 w-2 rounded-full bg-border-strong" />
             <span className="h-2 w-2 rounded-full bg-border-strong" />
             <span className="h-2 w-2 rounded-full bg-border-strong" />
           </span>
-          <span className="truncate font-mono text-[11px] tracking-[0.2em] text-muted-foreground">
+          <span className="truncate font-mono text-[10px] tracking-[0.2em] text-muted-foreground sm:text-[11px]">
             WICK // AUTONOMOUS GUARD
           </span>
         </div>
-        <div className="flex shrink-0 items-center gap-3">
+        <div className="flex shrink-0 items-center gap-1 sm:gap-3">
           <span className="font-mono text-[10px] tracking-[0.24em] text-primary">{phase}</span>
+          {/* Revealing this on hover hides it entirely from touch, where there is no
+              hover state to reveal it with — so it stays visible below md. */}
           <button
             type="button"
             onClick={replay}
             aria-label="Replay guard sequence"
-            className="rounded p-1 text-muted-foreground opacity-0 transition-all hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100"
+            className="-mr-1 grid h-11 w-11 place-items-center rounded text-muted-foreground transition-all hover:text-foreground focus-visible:opacity-100 md:h-7 md:w-7 md:opacity-0 md:group-hover:opacity-100"
           >
-            <RotateCw className="h-3.5 w-3.5" />
+            <RotateCw className="h-4 w-4 md:h-3.5 md:w-3.5" />
           </button>
         </div>
       </div>
@@ -157,7 +159,7 @@ export function HeroTerminal() {
       <div
         ref={scrollRef}
         aria-live="polite"
-        className="flex h-[300px] flex-col justify-end overflow-hidden px-4 py-3.5 font-mono text-[12.5px] leading-[1.85] sm:h-[340px] sm:text-[13px]"
+        className="flex h-[248px] flex-col justify-end overflow-hidden px-3 py-3 font-mono text-[11.5px] leading-[1.85] sm:h-[340px] sm:px-4 sm:py-3.5 sm:text-[13px]"
       >
         {visible.map((line, i) => (
           <div key={`${runId}-${i}`} className={cn('flex gap-2.5 animate-fade-in', TONE[line.kind])}>
@@ -179,15 +181,19 @@ export function HeroTerminal() {
         ) : null}
       </div>
 
-      <dl className="grid grid-cols-3 border-t border-border bg-surface-raised/40 font-mono text-[11px]">
+      <dl className="grid grid-cols-3 border-t border-border bg-surface-raised/40 font-mono text-[10.5px] sm:text-[11px]">
         {[
           ['dispatch', `${latencyStats.p50Us}µs`],
           ['venue', 'Drift'],
           ['status', 'protected'],
         ].map(([k, v], i) => (
-          <div key={k} className={cn('px-4 py-3', i > 0 && 'border-l border-border')}>
-            <dt className="tracking-[0.18em] text-muted-foreground">{k}</dt>
-            <dd className={cn('mt-1', k === 'status' ? 'text-healthy' : 'text-foreground')}>{v}</dd>
+          <div key={k} className={cn('px-2.5 py-2.5 sm:px-4 sm:py-3', i > 0 && 'border-l border-border')}>
+            <dt className="truncate tracking-[0.1em] text-muted-foreground sm:tracking-[0.18em]">
+              {k}
+            </dt>
+            <dd className={cn('mt-1 truncate', k === 'status' ? 'text-healthy' : 'text-foreground')}>
+              {v}
+            </dd>
           </div>
         ))}
       </dl>

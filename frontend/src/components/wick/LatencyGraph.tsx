@@ -2,15 +2,24 @@
 
 import { useMemo, useRef, useState } from 'react';
 import { headroom, latency, latencyStats } from '@/lib/wick-data';
-import { usePrefersReducedMotion, useReveal } from '@/hooks/useWickMotion';
+import { useMediaQuery, usePrefersReducedMotion, useReveal } from '@/hooks/useWickMotion';
 import { cn } from '@/lib/utils';
 
-const W = 900;
 const H = 220;
-const PAD_L = 52;
 const PAD_R = 12;
 const PAD_T = 22;
 const PAD_B = 22;
+
+/**
+ * The chart scales to its container via `viewBox`, which means every length in
+ * here — including `fontSize` — is divided by the same factor. At 900 units wide
+ * on a 340px phone that is a 2.6× shrink, and a 10-unit label renders under 4px.
+ * Narrowing the viewBox on small screens keeps the type legible without a second
+ * chart implementation. The gutter follows, since the axis labels get wider
+ * relative to the plot.
+ */
+const NARROW = { w: 340, padL: 44, font: 12 };
+const WIDE = { w: 900, padL: 52, font: 10 };
 
 function tickLabel(us: number) {
   if (us === 0) return '0';
@@ -20,8 +29,11 @@ function tickLabel(us: number) {
 export function LatencyGraph({ className }: { className?: string }) {
   const { ref, visible } = useReveal<HTMLDivElement>(0.3);
   const reduced = usePrefersReducedMotion();
+  const narrow = useMediaQuery('(max-width: 639px)');
   const svgRef = useRef<SVGSVGElement | null>(null);
   const [hover, setHover] = useState<{ x: number; y: number; us: number; i: number } | null>(null);
+
+  const { w: W, padL: PAD_L, font: FONT } = narrow ? NARROW : WIDE;
 
   const { path, area, points, ticks } = useMemo(() => {
     const samples = latency.samples_us;
@@ -43,13 +55,13 @@ export function LatencyGraph({ className }: { className?: string }) {
       points: pts,
       ticks: [0, step, step * 2, yMax].map((us) => ({ us, y: y(us) })),
     };
-  }, []);
+  }, [W, PAD_L]);
 
-  const onMove = (e: React.MouseEvent<SVGSVGElement>) => {
+  const pick = (clientX: number) => {
     const svg = svgRef.current;
     if (!svg) return;
     const rect = svg.getBoundingClientRect();
-    const rel = ((e.clientX - rect.left) / rect.width) * W;
+    const rel = ((clientX - rect.left) / rect.width) * W;
     let nearest = points[0]!;
     for (const p of points) if (Math.abs(p.x - rel) < Math.abs(nearest.x - rel)) nearest = p;
     setHover(nearest);
@@ -63,8 +75,16 @@ export function LatencyGraph({ className }: { className?: string }) {
         className="w-full touch-none"
         role="img"
         aria-label={`Recorded dispatch latency: p50 ${latencyStats.p50Us} microseconds, p99 ${latencyStats.p99Us} microseconds across ${latencyStats.samples} dispatches.`}
-        onMouseMove={onMove}
+        onMouseMove={(e) => pick(e.clientX)}
         onMouseLeave={() => setHover(null)}
+        // Pointer events cover pen and touch too, so a tap-and-drag scrubs the
+        // series on mobile instead of leaving the readout unreachable.
+        onPointerDown={(e) => pick(e.clientX)}
+        onPointerMove={(e) => {
+          if (e.pointerType !== 'mouse') pick(e.clientX);
+        }}
+        onPointerUp={() => setHover(null)}
+        onPointerCancel={() => setHover(null)}
       >
         <defs>
           <linearGradient id="wick-lat" x1="0" y1="0" x2="0" y2="1">
@@ -89,7 +109,7 @@ export function LatencyGraph({ className }: { className?: string }) {
               y={t.y + 3.5}
               textAnchor="end"
               className="fill-muted-foreground font-mono"
-              fontSize="10"
+              fontSize={FONT}
             >
               {tickLabel(t.us)}
             </text>
@@ -106,8 +126,10 @@ export function LatencyGraph({ className }: { className?: string }) {
           strokeDasharray="6 6"
           opacity="0.8"
         />
-        <text x={PAD_L + 6} y={PAD_T - 14} className="fill-healthy font-mono" fontSize="10">
-          {latencyStats.targetMs}ms target — off scale, {headroom}× headroom
+        <text x={PAD_L + 6} y={PAD_T - 14} className="fill-healthy font-mono" fontSize={FONT}>
+          {narrow
+            ? `${headroom}× headroom`
+            : `${latencyStats.targetMs}ms target — off scale, ${headroom}× headroom`}
         </text>
 
         <path
@@ -149,8 +171,10 @@ export function LatencyGraph({ className }: { className?: string }) {
 
       {hover ? (
         <div
-          className="pointer-events-none absolute -translate-x-1/2 rounded-md border border-border bg-popover px-2.5 py-1.5 font-mono text-[11px] text-popover-foreground shadow-lg"
-          style={{ left: `${(hover.x / W) * 100}%`, top: 0 }}
+          className="pointer-events-none absolute -translate-x-1/2 rounded-md border border-border bg-popover px-2.5 py-1.5 font-mono text-[11px] whitespace-nowrap text-popover-foreground shadow-lg"
+          // Clamped so scrubbing to either end of the series does not push the
+          // readout outside the card.
+          style={{ left: `clamp(3rem, ${(hover.x / W) * 100}%, calc(100% - 3rem))`, top: 0 }}
         >
           <span className="text-primary">{hover.us}µs</span>
           <span className="ml-2 text-muted-foreground">#{hover.i + 1}</span>

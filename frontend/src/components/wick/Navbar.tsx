@@ -4,13 +4,15 @@ import { useState } from 'react';
 import Link from 'next/link';
 import { ArrowUpRight, Menu, X } from 'lucide-react';
 import { WickLogo } from './Logo';
+import { PoweredByMagicBlock } from './PoweredByMagicBlock';
 import { useScrolled } from '@/hooks/useWickMotion';
 import { cn } from '@/lib/utils';
 
 const LINKS = [
   { label: 'Guard', href: '/#guard' },
-  { label: 'Mechanism', href: '/#mechanism' },
   { label: 'Latency', href: '/#latency' },
+  { label: 'MagicBlock', href: '/#magicblock' },
+  { label: 'Mechanism', href: '/#mechanism' },
 ];
 
 export function Navbar() {
@@ -53,6 +55,7 @@ export function Navbar() {
           </div>
 
           <div className="flex shrink-0 items-center gap-3">
+            <PoweredByMagicBlock className="hidden lg:inline-flex" />
             <span className="hidden items-center gap-2 font-mono text-[11px] tracking-wider text-muted-foreground lg:flex">
               <span aria-hidden="true" className="h-1.5 w-1.5 rounded-full bg-healthy animate-pulse-dot" />
               devnet · drift delegated
@@ -103,6 +106,9 @@ export function Navbar() {
                   </Link>
                 </li>
               ))}
+              <li>
+                <PoweredByMagicBlock variant="inline" className="px-3 py-2.5" />
+              </li>
               <li>
                 <Link
                   href="/console"

@@ -12,7 +12,7 @@ export function Mechanism() {
       <div className="mx-auto max-w-6xl px-4 sm:px-6">
         <Reveal className="max-w-2xl">
           <span className="font-mono text-[11px] tracking-[0.24em] text-primary">
-            03 — MECHANISM
+            04 — MECHANISM
           </span>
           <h2 className="mt-4 font-serif text-4xl leading-tight text-foreground sm:text-5xl">
             One tick, eight stages

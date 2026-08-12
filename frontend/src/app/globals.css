@@ -228,6 +228,31 @@ a {
   }
 }
 
+/* Marquee: the track holds the card list twice, so translating by exactly half
+   its width lands on an identical frame and the loop has no visible seam. */
+@keyframes wick-marquee {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(-50%);
+  }
+}
+
+/* State moving through the delegation round trip: a dot expands off each node
+   and fades, so the rail reads as flow rather than four static bullets. */
+@keyframes wick-er-pulse {
+  0% {
+    opacity: 0.85;
+    transform: scale(1);
+  }
+  70%,
+  100% {
+    opacity: 0;
+    transform: scale(3.4);
+  }
+}
+
 .animate-fade-in {
   animation: wick-fade-in 800ms var(--ease-settle) both;
 }
@@ -242,6 +267,41 @@ a {
 
 .animate-sweep {
   animation: wick-sweep 3.4s linear infinite;
+}
+
+.animate-er-pulse {
+  animation: wick-er-pulse 1.9s var(--ease-settle) infinite;
+}
+
+/* The rail masks both edges so cards fade out rather than clipping at the
+   viewport edge. `--marquee-duration` is set per-instance. The fade is a share
+   of the rail, not a fixed 6rem — at 360px a fixed fade would eat both sides of
+   a 264px card and leave nothing legible in the middle. */
+.marquee {
+  overflow: hidden;
+  mask-image: linear-gradient(
+    to right,
+    transparent 0,
+    black clamp(1.5rem, 8vw, 6rem),
+    black calc(100% - clamp(1.5rem, 8vw, 6rem)),
+    transparent 100%
+  );
+}
+
+.marquee-track {
+  display: flex;
+  width: max-content;
+  animation: wick-marquee var(--marquee-duration, 40s) linear infinite;
+}
+
+.marquee-track[data-direction='reverse'] {
+  animation-direction: reverse;
+}
+
+/* Pausing on hover lets a reader stop a card to actually read it. */
+.marquee:hover .marquee-track,
+.marquee:focus-within .marquee-track {
+  animation-play-state: paused;
 }
 
 /* Reveal-on-scroll: the hook flips `data-visible`, the transition lives here so
@@ -272,5 +332,18 @@ a {
   .reveal {
     opacity: 1;
     transform: none;
+  }
+
+  /* The blanket rule above would run the marquee once at 0.01ms and leave the
+     track parked at -50%, hiding the first half of the cards. Cancel the
+     animation outright and let the rail scroll by hand instead. */
+  .marquee {
+    overflow-x: auto;
+    mask-image: none;
+  }
+
+  .marquee-track {
+    animation: none !important;
+    transform: none !important;
   }
 }

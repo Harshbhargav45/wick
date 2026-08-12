@@ -4,10 +4,14 @@
  * This mirrors `GuardState::from_bytes` in `program/src/account.rs` byte for
  * byte. The offsets below are the same constants the program uses; if the
  * on-chain layout changes, both sides have to move together.
+ *
+ * v2 appended the daily-spend accumulator. There is no v1 compatibility path —
+ * the program rejects v1 accounts outright, so decoding one here would be
+ * decoding something the chain no longer accepts.
  */
 
-export const ACCOUNT_VERSION = 1;
-export const GUARD_DATA_LEN = 342;
+export const ACCOUNT_VERSION = 2;
+export const GUARD_DATA_LEN = 366;
 export const PENDING_IX_DATA_LEN = 50;
 
 export const SCALE = 1_000_000n;
@@ -43,6 +47,8 @@ const G_PX_TAG_OFF = 278;
 const G_PX_NONCE_OFF = 279;
 const G_DRIFT_MARKET_OFF = 338;
 const G_DRIFT_SUBACCOUNT_OFF = 340;
+const G_DAILY_SPENT_OFF = 342;
+const G_DAILY_EPOCH_OFF = 358;
 
 /** `u128::MAX` — the sentinel the program uses for "no take-profit set". */
 const NONE_PRICE = (1n << 128n) - 1n;
@@ -88,6 +94,10 @@ export interface GuardState {
   staleStreak: number;
   driftMarketIndex: number;
   driftSubaccountId: number;
+  /** USD (6dp) already committed by guard actions in the current daily epoch. */
+  dailySpentUsd: bigint;
+  /** Slot the current daily epoch began; rolls over after DAILY_EPOCH_SLOTS. */
+  dailyEpochStartSlot: bigint;
 }
 
 function u128(data: Uint8Array, off: number): bigint {
@@ -178,5 +188,7 @@ export function decodeGuardState(data: Uint8Array): GuardState {
     staleStreak: data[G_STALE_STREAK_OFF]!,
     driftMarketIndex: u16(data, G_DRIFT_MARKET_OFF),
     driftSubaccountId: u16(data, G_DRIFT_SUBACCOUNT_OFF),
+    dailySpentUsd: u128(data, G_DAILY_SPENT_OFF),
+    dailyEpochStartSlot: u64(data, G_DAILY_EPOCH_OFF),
   };
 }

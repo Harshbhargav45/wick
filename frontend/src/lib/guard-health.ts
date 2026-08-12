@@ -13,8 +13,21 @@ export function computePnl(size: bigint, entry: bigint, current: bigint): bigint
   return (size * (current - entry)) / SCALE;
 }
 
-export function computeMarginRequired(absSize: bigint, marginBps: bigint): bigint {
-  return (absSize * marginBps) / BPS_DENOM;
+/**
+ * Maintenance margin required on `absSize` at `current`, scaled by `marginBps`.
+ *
+ * The basis is *notional* (`absSize * current`), not the raw unit count. Taking
+ * bps of a unit count yields units, which is then compared against equity in
+ * USD — a dimensional mismatch that makes the requirement price-independent and
+ * collapses it by a factor of `current`.
+ */
+export function computeMarginRequired(
+  absSize: bigint,
+  marginBps: bigint,
+  current: bigint,
+): bigint {
+  const notional = (absSize * current) / SCALE;
+  return (notional * marginBps) / BPS_DENOM;
 }
 
 export function equity(collateral: bigint, pnl: bigint): bigint {
@@ -47,9 +60,9 @@ export function computeHealth(state: GuardState): Health {
 
   const pnl = computePnl(size, entry, currentPrice);
   const eq = equity(collateral, pnl);
-  const marginRequired = computeMarginRequired(absSize, policy.maintenanceBps);
-  const triggerTarget = (marginRequired * (BPS_DENOM + policy.triggerBufferBps)) / BPS_DENOM;
   const notional = (absSize * currentPrice) / SCALE;
+  const marginRequired = computeMarginRequired(absSize, policy.maintenanceBps, currentPrice);
+  const triggerTarget = (marginRequired * (BPS_DENOM + policy.triggerBufferBps)) / BPS_DENOM;
 
   const liquidatable = eq < marginRequired;
   const breachingBuffer = !liquidatable && eq < triggerTarget;
@@ -68,6 +81,36 @@ export function computeHealth(state: GuardState): Health {
     factor,
     triggerFactor,
   };
+}
+
+/** Slots in one daily epoch — mirrors `state::DAILY_EPOCH_SLOTS`. */
+export const DAILY_EPOCH_SLOTS = 216_000n;
+
+export interface DailyBudget {
+  spent: bigint;
+  total: bigint;
+  remaining: bigint;
+  /** Fraction of the budget consumed, 0..1. Display only. */
+  used: number;
+  exhausted: boolean;
+}
+
+/**
+ * The daily action budget as of `currentSlot`.
+ *
+ * The accumulator on the account is only rolled over by the program on its next
+ * tick, so a guard whose epoch has already elapsed still reports the old
+ * `dailySpentUsd` on chain. Applying the same rollover rule here keeps the
+ * dashboard from showing a budget as spent when the next tick will reset it.
+ */
+export function dailyBudget(state: GuardState, currentSlot: bigint): DailyBudget {
+  const elapsed =
+    currentSlot > state.dailyEpochStartSlot ? currentSlot - state.dailyEpochStartSlot : 0n;
+  const spent = elapsed >= DAILY_EPOCH_SLOTS ? 0n : state.dailySpentUsd;
+  const total = state.policy.caps.dailyTotalUsd;
+  const remaining = total > spent ? total - spent : 0n;
+  const used = total === 0n ? 1 : Math.min(1, Number(spent) / Number(total));
+  return { spent, total, remaining, used, exhausted: remaining === 0n };
 }
 
 /** Fixed-point value (6dp) to a JS number. Display only. */

@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 
 /** Reveal-on-scroll. Fires once, then stops observing. */
 export function useReveal<T extends HTMLElement>(threshold = 0.1) {
@@ -50,18 +50,30 @@ export function useCountUp(end: number, startAnim: boolean, durationMs = 1000, d
 
 const REDUCED_QUERY = '(prefers-reduced-motion: reduce)';
 
-function subscribeReduced(onChange: () => void) {
-  const mq = window.matchMedia(REDUCED_QUERY);
-  mq.addEventListener('change', onChange);
-  return () => mq.removeEventListener('change', onChange);
+function subscribe(query: string) {
+  return (onChange: () => void) => {
+    const mq = window.matchMedia(query);
+    mq.addEventListener('change', onChange);
+    return () => mq.removeEventListener('change', onChange);
+  };
+}
+
+/**
+ * Matches a media query in JS, for the cases CSS cannot reach — an SVG
+ * `viewBox`, a prop, a element count. Prefer a Tailwind breakpoint class when
+ * the difference is purely presentational.
+ *
+ * The server snapshot is `false`, so the first paint is always the
+ * "unmatched" branch and the match lands on hydration.
+ */
+export function useMediaQuery(query: string) {
+  const subscribeToQuery = useMemo(() => subscribe(query), [query]);
+  const getSnapshot = useCallback(() => window.matchMedia(query).matches, [query]);
+  return useSyncExternalStore(subscribeToQuery, getSnapshot, () => false);
 }
 
 export function usePrefersReducedMotion() {
-  return useSyncExternalStore(
-    subscribeReduced,
-    () => window.matchMedia(REDUCED_QUERY).matches,
-    () => false,
-  );
+  return useMediaQuery(REDUCED_QUERY);
 }
 
 function subscribeScroll(onChange: () => void) {

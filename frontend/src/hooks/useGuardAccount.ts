@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import { Connection, PublicKey } from '@solana/web3.js';
+import { PublicKey } from '@solana/web3.js';
 import {
   GUARD_DATA_LEN,
   VENUE_DRIFT,
@@ -11,16 +11,18 @@ import {
   type GuardState,
 } from '@/lib/guard-layout';
 import { decodeRouteConfig, guardPda, routeConfigPda } from '@/lib/guard-program';
-import { computeHealth, type Health } from '@/lib/guard-health';
+import { computeHealth, dailyBudget, type DailyBudget, type Health } from '@/lib/guard-health';
+import { createFailoverConnection, redactRpc, rpcEndpoints } from '@/lib/rpc';
 import { useWallet } from './useWallet';
 
 const POLL_INTERVAL_MS = 5_000;
-const DEFAULT_RPC = 'https://api.devnet.solana.com';
 
 export interface GuardSnapshot {
   address: string;
   state: GuardState;
   health: Health;
+  /** Daily action budget, with the epoch rollover already applied (§8.2). */
+  budget: DailyBudget;
   venueLabel: string;
   /** True when the guard can only build for the owner to co-sign (§8.4). */
   isCoSigned: boolean;
@@ -52,21 +54,38 @@ function venueLabel(venue: number, authority: string): string {
   return `Venue ${venue}`;
 }
 
-function readConfig(): { programId: PublicKey | null; rpc: string; error: string | null } {
-  const rpc = process.env.NEXT_PUBLIC_SOLANA_RPC || DEFAULT_RPC;
+function readConfig(): {
+  programId: PublicKey | null;
+  endpoints: string[];
+  rpc: string;
+  error: string | null;
+} {
+  const endpoints = rpcEndpoints();
+  // Displayed, so it is the redacted head rather than the keyed URL itself.
+  const rpc = redactRpc(endpoints[0]);
   const raw = process.env.NEXT_PUBLIC_GUARD_PROGRAM_ID;
   if (!raw) {
-    return { programId: null, rpc, error: 'NEXT_PUBLIC_GUARD_PROGRAM_ID is not set' };
+    return {
+      programId: null,
+      endpoints,
+      rpc,
+      error: 'NEXT_PUBLIC_GUARD_PROGRAM_ID is not set',
+    };
   }
   try {
-    return { programId: new PublicKey(raw), rpc, error: null };
+    return { programId: new PublicKey(raw), endpoints, rpc, error: null };
   } catch {
-    return { programId: null, rpc, error: `NEXT_PUBLIC_GUARD_PROGRAM_ID is not a valid pubkey` };
+    return {
+      programId: null,
+      endpoints,
+      rpc,
+      error: `NEXT_PUBLIC_GUARD_PROGRAM_ID is not a valid pubkey`,
+    };
   }
 }
 
 export function useGuardAccount() {
-  const { programId, rpc, error: configError } = readConfig();
+  const { programId, endpoints, rpc, error: configError } = readConfig();
   const { publicKey } = useWallet();
 
   const [snapshot, setSnapshot] = useState<GuardSnapshot | null>(null);
@@ -81,11 +100,15 @@ export function useGuardAccount() {
   const programIdKey = programId?.toBase58();
   const ownerKey = publicKey?.toBase58() ?? null;
   const inFlight = useRef(false);
+  // `endpoints` is a fresh array every render, so the effect keys off its
+  // contents rather than its identity — otherwise it tears down and rebuilds
+  // the poll interval on every render.
+  const endpointKey = endpoints.join(',');
 
   useEffect(() => {
     if (!programIdKey) return;
 
-    const connection = new Connection(rpc, 'confirmed');
+    const connection = createFailoverConnection(endpointKey.split(','));
     const program = new PublicKey(programIdKey);
     const owner = ownerKey ? new PublicKey(ownerKey) : null;
     const [routeConfig] = routeConfigPda(program);
@@ -113,9 +136,10 @@ export function useGuardAccount() {
       if (inFlight.current) return;
       inFlight.current = true;
       try {
-        const [found, configInfo] = await Promise.all([
+        const [found, configInfo, slot] = await Promise.all([
           readGuard(),
           connection.getAccountInfo(routeConfig),
+          connection.getSlot(),
         ]);
         if (cancelled) return;
 
@@ -141,6 +165,7 @@ export function useGuardAccount() {
           address: found.address.toBase58(),
           state,
           health,
+          budget: dailyBudget(state, BigInt(slot)),
           venueLabel: venueLabel(state.venue, state.authorityReq),
           isCoSigned,
           awaitingConfirmation: isCoSigned && state.pendingIxNonce !== null,
@@ -165,7 +190,7 @@ export function useGuardAccount() {
       cancelled = true;
       clearInterval(interval);
     };
-  }, [programIdKey, rpc, ownerKey, nudge]);
+  }, [programIdKey, endpointKey, ownerKey, nudge]);
 
   const refresh = () => setNudge((n) => n + 1);
 

@@ -14,6 +14,7 @@ import { PolicyPanel } from '@/components/wick/PolicyPanel';
 import { ActionPanel } from '@/components/wick/ActionPanel';
 import { ActivityFeed } from '@/components/wick/ActivityFeed';
 import { LatencyGraph } from '@/components/wick/LatencyGraph';
+import { PoweredByMagicBlock } from '@/components/wick/PoweredByMagicBlock';
 import { latencyStats } from '@/lib/wick-data';
 import { cn } from '@/lib/utils';
 
@@ -26,34 +27,35 @@ export default function ConsolePage() {
     programId,
     guardAddress: snapshot?.address ?? null,
     owner: publicKey,
-    rpc,
     onDone: refresh,
   });
 
   return (
     <div className="min-h-screen bg-background text-foreground">
       <header className="sticky top-0 z-40 border-b border-border bg-background/80 backdrop-blur">
-        <div className="mx-auto flex max-w-6xl items-center justify-between gap-4 px-4 py-3.5 sm:px-6">
-          <div className="flex min-w-0 items-center gap-3">
-            <Link href="/" className="flex items-center gap-2.5">
+        <div className="mx-auto flex max-w-6xl items-center justify-between gap-2 px-4 py-3 sm:gap-4 sm:px-6 sm:py-3.5">
+          <div className="flex min-w-0 items-center gap-2 sm:gap-3">
+            <Link href="/" className="flex shrink-0 items-center gap-2.5">
               <WickMark />
               <span className="font-mono text-sm font-semibold tracking-[0.28em]">WICK</span>
             </Link>
-            <span className="rounded border border-border px-1.5 py-0.5 font-mono text-[10px] tracking-[0.16em] text-muted-foreground">
+            {/* The badge is pure decoration next to a logo that already says where
+                you are — first thing to go when the row runs out of room. */}
+            <span className="hidden rounded border border-border px-1.5 py-0.5 font-mono text-[10px] tracking-[0.16em] text-muted-foreground sm:inline">
               CONSOLE
             </span>
           </div>
 
-          <div className="flex shrink-0 items-center gap-3">
+          <div className="flex shrink-0 items-center gap-1.5 sm:gap-3">
             <StatusPill status={status} snapshot={snapshot} />
             <WalletButton />
             <button
               type="button"
               onClick={refresh}
               aria-label="Refresh guard state"
-              className="rounded p-1.5 text-muted-foreground transition-colors hover:text-foreground"
+              className="-mr-1.5 grid h-11 w-11 place-items-center rounded text-muted-foreground transition-colors hover:text-foreground sm:h-9 sm:w-9"
             >
-              <RefreshCw className="h-3.5 w-3.5" />
+              <RefreshCw className="h-4 w-4" />
             </button>
           </div>
         </div>
@@ -129,12 +131,17 @@ export default function ConsolePage() {
 
               <div className="space-y-4">
                 <PositionPanel state={snapshot.state} health={snapshot.health} />
-                <PolicyPanel state={snapshot.state} />
+                <PolicyPanel state={snapshot.state} budget={snapshot.budget} />
               </div>
             </div>
           </>
         )}
       </main>
+
+      <footer className="mx-auto mt-4 flex max-w-6xl flex-wrap items-center justify-between gap-3 border-t border-border px-4 py-6 font-mono text-[11px] text-muted-foreground sm:px-6">
+        <span>guard state is polled from the configured RPC every 5s</span>
+        <PoweredByMagicBlock />
+      </footer>
     </div>
   );
 }
@@ -167,14 +174,16 @@ function StatusPill({
       <span
         aria-hidden="true"
         className={cn(
-          'h-1.5 w-1.5 rounded-full',
+          'h-1.5 w-1.5 shrink-0 rounded-full',
           tone === 'healthy' && 'bg-healthy animate-pulse-dot',
           tone === 'risk' && 'bg-risk',
           tone === 'warning' && 'bg-warning',
           tone === 'muted' && 'bg-border-strong',
         )}
       />
-      {label}
+      {/* Below sm the dot carries the signal on its own; the word is still in the
+          accessibility tree so the colour is never the only cue. */}
+      <span className="sr-only sm:not-sr-only">{label}</span>
     </span>
   );
 }

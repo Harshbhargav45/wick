@@ -21,9 +21,14 @@ export function HealthGauge({ health }: { health: Health }) {
       ? 'trigger buffer breached'
       : 'above the trigger buffer';
 
+  const liqPct = pct(1);
+  const triggerPct = pct(triggerFactor);
+  // Each label runs ~5rem; ticks closer than this share horizontal space.
+  const stacked = Math.abs(triggerPct - liqPct) < 18;
+
   return (
     <div className="rounded-xl border border-border bg-surface/40 p-5">
-      <div className="flex items-baseline justify-between">
+      <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
         <span className="font-mono text-[11px] tracking-[0.24em] text-muted-foreground">
           HEALTH FACTOR
         </span>
@@ -41,7 +46,7 @@ export function HealthGauge({ health }: { health: Health }) {
 
       <div
         className={cn(
-          'mt-3 font-serif text-5xl tabular-nums',
+          'mt-3 font-serif text-4xl tabular-nums sm:text-5xl',
           tone === 'risk' && 'text-risk',
           tone === 'warning' && 'text-warning',
           tone === 'healthy' && 'text-foreground',
@@ -72,11 +77,22 @@ export function HealthGauge({ health }: { health: Health }) {
         />
       </div>
 
-      <div className="relative mt-2 h-4 font-mono text-[10px] text-muted-foreground">
-        <span className="absolute -translate-x-1/2" style={{ left: `${pct(1)}%` }}>
+      {/* Both labels are absolutely positioned over their ticks, so two things can
+          go wrong on a narrow card: a label at the far end spills past the edge,
+          and — at the default 15% buffer the ticks sit only 7.5% apart — the two
+          labels land on top of each other. Clamp the anchors, and drop `trigger`
+          to its own row when the gap is too small to fit both. */}
+      <div className={cn('relative mt-2 font-mono text-[10px] text-muted-foreground', stacked ? 'h-7' : 'h-4')}>
+        <span
+          className="absolute top-0 -translate-x-1/2 whitespace-nowrap"
+          style={{ left: `clamp(2.5rem, ${liqPct}%, calc(100% - 2.5rem))` }}
+        >
           liq 1.00
         </span>
-        <span className="absolute -translate-x-1/2" style={{ left: `${pct(triggerFactor)}%` }}>
+        <span
+          className={cn('absolute -translate-x-1/2 whitespace-nowrap', stacked ? 'top-3.5' : 'top-0')}
+          style={{ left: `clamp(3.25rem, ${triggerPct}%, calc(100% - 3.25rem))` }}
+        >
           trigger {triggerFactor.toFixed(2)}
         </span>
       </div>
