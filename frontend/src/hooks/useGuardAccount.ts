@@ -195,11 +195,21 @@ export function useGuardAccount() {
         ]);
         if (cancelled) return;
 
-        setRouteConfig(
-          configInfo
-            ? { exists: true, paused: decodeRouteConfig(new Uint8Array(configInfo.data)).paused }
-            : { exists: false, paused: false },
-        );
+        // The RouteConfig may exist but carry a stale version (e.g. v2 before the
+        // v3 program upgrade). A failed decode is treated as "needs re-init" so
+        // the console still loads and shows the banner instead of crashing.
+        let parsedRouteConfig: RouteConfigState = { exists: false, paused: false };
+        if (configInfo) {
+          try {
+            const decoded = decodeRouteConfig(new Uint8Array(configInfo.data));
+            parsedRouteConfig = { exists: true, paused: decoded.paused };
+          } catch {
+            // Stale version — the account exists but is not v3. The program
+            // will also reject it, so treat it the same as missing.
+            parsedRouteConfig = { exists: false, paused: false };
+          }
+        }
+        setRouteConfig(parsedRouteConfig);
 
         if (!found) {
           setSnapshot(null);
