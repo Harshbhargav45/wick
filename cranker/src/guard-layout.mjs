@@ -100,20 +100,29 @@ export const PENDING_IX_NAMES = {
 };
 export const PENDING_IX_DATA_LEN = 50;
 
-/** Instruction discriminators, mirroring `processor::process_instruction`. */
+/**
+ * Instruction discriminators, mirroring the `WickInstruction` enum in
+ * `program/src/instruction.rs` and the dispatch in `processor.rs`.
+ *
+ * Keep every variant here even where the cranker never sends it. A partial map
+ * is how the previous version of this object came to claim `UpdatePosition: 3`
+ * and `SetPaused: 12`: the gaps left by the delegation instructions got closed
+ * up, silently renumbering everything after them.
+ */
 export const IX = {
   InitGuard: 0,
   DepositMargin: 1,
   WithdrawMargin: 2,
-  UpdatePosition: 3,
-  SetPolicy: 4,
-  Pause: 5,
-  Unpause: 6,
+  SetPaused: 3,
+  Delegate: 4,
+  CommitAndUndelegate: 5,
+  Commit: 6,
   OnPriceTick: 7,
+  UpdatePosition: 8,
   ConfirmYes: 9,
   InitRouteConfig: 10,
   CloseGuard: 11,
-  SetPaused: 12,
+  SetRouteAuthority: 12,
   ReconcileVenue: 13,
   InitMarginWallet: 14,
   FundMarginWallet: 15,

@@ -1,10 +1,11 @@
 'use client';
 
 import Link from 'next/link';
+import { PublicKey } from '@solana/web3.js';
 import { ArrowLeft, RefreshCw } from 'lucide-react';
-import { useGuardAccount } from '@/hooks/useGuardAccount';
+import { useGuardAccount, writeBlockReason } from '@/hooks/useGuardAccount';
 import { useGuardEvents } from '@/hooks/useGuardEvents';
-import { useGuardActions } from '@/hooks/useGuardActions';
+import { useGuardActions, type OpKind } from '@/hooks/useGuardActions';
 import { useWallet } from '@/hooks/useWallet';
 import { WickMark } from '@/components/wick/Logo';
 import { WalletButton } from '@/components/wick/WalletButton';
@@ -15,6 +16,9 @@ import { ActionPanel } from '@/components/wick/ActionPanel';
 import { ActivityFeed } from '@/components/wick/ActivityFeed';
 import { LatencyGraph } from '@/components/wick/LatencyGraph';
 import { PoweredByMagicBlock } from '@/components/wick/PoweredByMagicBlock';
+import { ReconcilePanel } from '@/components/wick/ReconcilePanel';
+import { ReservePanel } from '@/components/wick/ReservePanel';
+import { PositionActions } from '@/components/wick/PositionActions';
 import { latencyStats } from '@/lib/wick-data';
 import { cn } from '@/lib/utils';
 
@@ -23,12 +27,30 @@ export default function ConsolePage() {
     useGuardAccount();
   const events = useGuardEvents(snapshot);
   const { publicKey } = useWallet();
-  const { tx, canSend, confirm } = useGuardActions({
+  const actions = useGuardActions({
     programId,
     guardAddress: snapshot?.address ?? null,
     owner: publicKey,
+    // Read off the guard rather than assumed, because the 2-of-2 paths must
+    // name the exact key the program will compare against.
+    coAuthority: snapshot ? new PublicKey(snapshot.state.coAuthority).toBase58() : null,
+    marginWalletBump: snapshot?.state.marginWalletBump ?? null,
     onDone: refresh,
   });
+  const { tx, canSend, isPending, canCoSign } = actions;
+
+  // One reason, one place. Every disabled control quotes the same sentence for
+  // the same condition instead of inventing its own.
+  const blockReason = writeBlockReason(routeConfig, snapshot, Boolean(publicKey));
+  const canWrite = canSend && blockReason === null && !writesBlocked;
+  /**
+   * Pending is per-operation: `isPending` covers the click-to-wallet window that
+   * `tx.kind` misses, but it is global to the hook, so it is only attributed to
+   * the operation the current `tx` belongs to. Otherwise one click would show
+   * every button in the console as sending.
+   */
+  const pending = (op: OpKind): boolean =>
+    tx.kind !== 'idle' && tx.op === op && (isPending || tx.kind === 'sending');
 
   return (
     <div className="min-h-screen bg-background text-foreground">
@@ -82,8 +104,8 @@ export default function ConsolePage() {
               <div className="min-w-0">
                 <h1 className="font-serif text-3xl text-foreground">{snapshot.venueLabel}</h1>
                 <p className="mt-1 font-mono text-[11px] text-muted-foreground">
-                  guard {snapshot.address.slice(0, 6)}…{snapshot.address.slice(-6)} · last check
-                  slot {snapshot.state.lastCheckSlot.toString()}
+                  guard {snapshot.address.slice(0, 6)}…{snapshot.address.slice(-6)} · last tick{' '}
+                  {describeTick(snapshot.state.lastCheckTs, snapshot.chainTs)}
                 </p>
               </div>
               <span className="rounded-md border border-border px-2.5 py-1.5 font-mono text-[11px] text-muted-foreground">
@@ -107,9 +129,12 @@ export default function ConsolePage() {
                   staleStreak={snapshot.state.staleStreak}
                   nonce={snapshot.state.nonce}
                   pendingIxNonce={snapshot.state.pendingIxNonce}
-                  canConfirm={canSend && snapshot.isOwner && !writesBlocked}
-                  onConfirm={confirm}
+                  canConfirm={canWrite}
+                  blockReason={blockReason}
+                  onConfirm={actions.confirm}
                   tx={tx}
+                  pending={pending('confirm')}
+                  diverged={snapshot.health.diverged}
                 />
 
                 <div className="rounded-xl border border-border bg-surface/40 p-5">
@@ -131,7 +156,33 @@ export default function ConsolePage() {
 
               <div className="space-y-4">
                 <PositionPanel state={snapshot.state} health={snapshot.health} />
+                <ReconcilePanel state={snapshot.state} chainTs={snapshot.chainTs} />
                 <PolicyPanel state={snapshot.state} budget={snapshot.budget} />
+                <ReservePanel
+                  reserve={snapshot.reserve}
+                  topUpCap={snapshot.state.policy.caps.topUpUsdPerAction}
+                  canWrite={canWrite}
+                  blockReason={blockReason}
+                  canCoSign={canCoSign}
+                  onInit={actions.initReserve}
+                  onFund={actions.fundReserve}
+                  onWithdraw={actions.withdrawReserve}
+                  tx={tx}
+                  pending={pending}
+                />
+                <PositionActions
+                  state={snapshot.state}
+                  diverged={snapshot.health.diverged}
+                  canWrite={canWrite}
+                  blockReason={blockReason}
+                  canCoSign={canCoSign}
+                  onDeposit={actions.deposit}
+                  onWithdraw={actions.withdraw}
+                  onUpdatePosition={actions.updatePosition}
+                  onCloseGuard={actions.closeGuard}
+                  tx={tx}
+                  pending={pending}
+                />
               </div>
             </div>
           </>
@@ -139,11 +190,33 @@ export default function ConsolePage() {
       </main>
 
       <footer className="mx-auto mt-4 flex max-w-6xl flex-wrap items-center justify-between gap-3 border-t border-border px-4 py-6 font-mono text-[11px] text-muted-foreground sm:px-6">
-        <span>guard state is polled from the configured RPC every 5s</span>
+        <span>
+          guard state is polled every 5s from{' '}
+          {/* Redacted at the source in `rpc.ts` — a keyed endpoint is a
+              credential and does not belong in the DOM. */}
+          <span className="text-muted-foreground/80">{rpc}</span>
+        </span>
         <PoweredByMagicBlock />
       </footer>
     </div>
   );
+}
+
+/**
+ * Age of the last accepted tick, against the chain's clock.
+ *
+ * `last_check_ts` is unix seconds, not a slot — printing the raw number was both
+ * mislabelled and unreadable. Compared against the `Clock` sysvar rather than
+ * `Date.now()`, so a browser with a skewed system time does not report a fresh
+ * guard as minutes stale.
+ */
+function describeTick(lastCheckTs: bigint, chainTs: bigint): string {
+  if (lastCheckTs === 0n) return 'never ticked';
+  const age = chainTs - lastCheckTs;
+  if (age <= 0n) return 'just now';
+  if (age < 60n) return `${age}s ago`;
+  if (age < 3_600n) return `${age / 60n}m ago`;
+  return `${age / 3_600n}h ago`;
 }
 
 function StatusPill({

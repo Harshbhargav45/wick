@@ -8,14 +8,51 @@ import {
   VENUE_JUPITER,
   VENUE_NONE,
   decodeGuardState,
+  decodeWalletState,
   type GuardState,
+  type WalletState,
 } from '@/lib/guard-layout';
-import { decodeRouteConfig, guardPda, routeConfigPda } from '@/lib/guard-program';
+import {
+  decodeRouteConfig,
+  guardPda,
+  marginWalletAddressForBump,
+  marginWalletPda,
+  routeConfigPda,
+} from '@/lib/guard-program';
 import { computeHealth, dailyBudget, type DailyBudget, type Health } from '@/lib/guard-health';
 import { createFailoverConnection, redactRpc, rpcEndpoints } from '@/lib/rpc';
 import { useWallet } from './useWallet';
 
 const POLL_INTERVAL_MS = 5_000;
+
+/** `SysvarC1ock` — read for `unix_timestamp`, which is the clock the program sees. */
+const CLOCK_SYSVAR = new PublicKey('SysvarC1ock11111111111111111111111111111111');
+/** `Clock`: slot(8) epoch_start_timestamp(8) epoch(8) leader_schedule_epoch(8) unix_timestamp(8). */
+const CLOCK_UNIX_TS_OFF = 32;
+
+function readClockUnixTs(data: Uint8Array): bigint {
+  let acc = 0n;
+  for (let i = 7; i >= 0; i--) acc = (acc << 8n) | BigInt(data[CLOCK_UNIX_TS_OFF + i]!);
+  return acc >= 1n << 63n ? acc - (1n << 64n) : acc;
+}
+
+/**
+ * The guard's margin reserve (§8.5), as the console needs to reason about it.
+ *
+ * `exists: false` is a real operational state, not an absence of data: the
+ * program gates an autonomous `TopUp` on `margin_wallet_bump != 0`, so a guard
+ * whose policy allows top-ups but has no reserve will escalate instead of
+ * acting. That is worth saying out loud on the dashboard.
+ */
+export interface ReserveState {
+  address: string;
+  exists: boolean;
+  /** Lamports the reserve claims to hold on the owner's behalf. */
+  balance: bigint;
+  /** Total lamports on the account, including the rent that is not withdrawable. */
+  lamports: bigint;
+  state: WalletState | null;
+}
 
 export interface GuardSnapshot {
   address: string;
@@ -30,6 +67,10 @@ export interface GuardSnapshot {
   awaitingConfirmation: boolean;
   /** True when the connected wallet is this guard's venue owner. */
   isOwner: boolean;
+  /** The 2-of-2 lamport reserve behind autonomous top-ups. */
+  reserve: ReserveState;
+  /** The chain's own `unix_timestamp` at this read — what staleness is measured against. */
+  chainTs: bigint;
   fetchedAt: number;
 }
 
@@ -136,10 +177,10 @@ export function useGuardAccount() {
       if (inFlight.current) return;
       inFlight.current = true;
       try {
-        const [found, configInfo, slot] = await Promise.all([
+        const [found, configInfo, clockInfo] = await Promise.all([
           readGuard(),
           connection.getAccountInfo(routeConfig),
-          connection.getSlot(),
+          connection.getAccountInfo(CLOCK_SYSVAR),
         ]);
         if (cancelled) return;
 
@@ -159,17 +200,51 @@ export function useGuardAccount() {
         const state = decodeGuardState(found.data);
         const health = computeHealth(state);
         const isCoSigned = state.authorityReq === 'CoSigned';
-        const venueOwner = new PublicKey(state.venueOwner).toBase58();
+        const venueOwnerKey = new PublicKey(state.venueOwner);
+        const venueOwner = venueOwnerKey.toBase58();
+
+        // The reserve is derived from the guard's own `venue_owner` rather than
+        // the connected wallet, so a read-only viewer sees the same reserve the
+        // program would spend from.
+        const reserveAddress =
+          state.marginWalletBump === null
+            ? marginWalletPda(program, venueOwnerKey)[0]
+            : (marginWalletAddressForBump(program, venueOwnerKey, state.marginWalletBump) ??
+              marginWalletPda(program, venueOwnerKey)[0]);
+        const reserveInfo = state.marginWalletBump === null
+          ? null
+          : await connection.getAccountInfo(reserveAddress);
+        if (cancelled) return;
+
+        const reserveState = reserveInfo
+          ? decodeWalletState(new Uint8Array(reserveInfo.data))
+          : null;
+        const reserve: ReserveState = {
+          address: reserveAddress.toBase58(),
+          exists: reserveState !== null,
+          balance: reserveState?.balance ?? 0n,
+          lamports: BigInt(reserveInfo?.lamports ?? 0),
+          state: reserveState,
+        };
+
+        // The program's own clock, not the browser's — a machine with a skewed
+        // system time would otherwise roll the daily epoch at the wrong moment
+        // and report a budget the program does not agree with.
+        const chainTs = clockInfo
+          ? readClockUnixTs(new Uint8Array(clockInfo.data))
+          : BigInt(Math.floor(Date.now() / 1000));
 
         setSnapshot({
           address: found.address.toBase58(),
           state,
           health,
-          budget: dailyBudget(state, BigInt(slot)),
+          budget: dailyBudget(state, chainTs),
           venueLabel: venueLabel(state.venue, state.authorityReq),
           isCoSigned,
           awaitingConfirmation: isCoSigned && state.pendingIxNonce !== null,
           isOwner: ownerKey === venueOwner,
+          reserve,
+          chainTs,
           fetchedAt: Date.now(),
         });
         setStatus('ready');
@@ -205,4 +280,24 @@ export function useGuardAccount() {
     rpc,
     programId: programIdKey ?? null,
   };
+}
+
+/**
+ * Why a write cannot be attempted, or `null` when it can.
+ *
+ * Centralized so every button gives the same reason for the same condition.
+ * These are the conditions the *program* will reject on, checked here only so
+ * the owner reads a sentence instead of a simulation log — the program remains
+ * the authority, and nothing here is a substitute for its checks.
+ */
+export function writeBlockReason(
+  routeConfig: RouteConfigState,
+  snapshot: GuardSnapshot | null,
+  connected: boolean,
+): string | null {
+  if (!connected) return 'Connect a wallet to sign.';
+  if (!routeConfig.exists) return 'RouteConfig is not initialized — every write rejects.';
+  if (routeConfig.paused) return 'The program is paused by the route authority.';
+  if (snapshot && !snapshot.isOwner) return 'The connected wallet is not this guard’s owner.';
+  return null;
 }

@@ -3,6 +3,7 @@
 import type { Action } from '@/lib/guard-layout';
 import { describeActionText } from '@/lib/guard-events';
 import type { TxState } from '@/hooks/useGuardActions';
+import { TxResult } from './WriteForms';
 import { cn } from '@/lib/utils';
 
 export function ActionPanel({
@@ -13,8 +14,11 @@ export function ActionPanel({
   nonce,
   pendingIxNonce,
   canConfirm,
+  blockReason,
   onConfirm,
   tx,
+  pending,
+  diverged,
 }: {
   action: Action | null;
   awaitingConfirmation: boolean;
@@ -23,11 +27,15 @@ export function ActionPanel({
   nonce: bigint;
   pendingIxNonce: bigint | null;
   canConfirm: boolean;
+  blockReason: string | null;
   onConfirm: () => void;
   tx: TxState;
+  pending: boolean;
+  /** The venue disagrees with the guard's model — execution is refused (§8.8). */
+  diverged: boolean;
 }) {
   const escalated = action?.kind === 'EscalateManualReview';
-  const tone = degraded || escalated ? 'risk' : action ? 'warning' : 'healthy';
+  const tone = degraded || escalated || diverged ? 'risk' : action ? 'warning' : 'healthy';
 
   return (
     <div
@@ -59,7 +67,7 @@ export function ActionPanel({
               tone === 'healthy' && 'bg-healthy animate-pulse-dot',
             )}
           />
-          {degraded ? 'degraded' : action ? 'action pending' : 'watching'}
+          {degraded ? 'degraded' : diverged ? 'diverged' : action ? 'action pending' : 'watching'}
         </span>
       </div>
 
@@ -69,6 +77,12 @@ export function ActionPanel({
             The guard has seen {staleStreak} consecutive stale ticks and has flipped to degraded.
             It will not dispatch on dead price data — a fresh tick clears both the streak and the
             flag.
+          </>
+        ) : diverged ? (
+          <>
+            The venue reports a different position than the guard is watching, so autonomous
+            execution is refused. Every number here is arithmetic on a position the venue does not
+            confirm — re-enroll it before relying on them.
           </>
         ) : escalated ? (
           <>
@@ -114,29 +128,22 @@ export function ActionPanel({
           <button
             type="button"
             onClick={onConfirm}
-            disabled={!canConfirm || tx.kind === 'sending'}
+            disabled={!canConfirm || pending}
             className={cn(
               'w-full rounded-md border px-4 py-2.5 font-mono text-[12px] tracking-[0.08em] transition-colors',
-              canConfirm && tx.kind !== 'sending'
+              canConfirm && !pending
                 ? 'border-warning/60 text-warning hover:bg-warning/10'
                 : 'cursor-not-allowed border-border text-muted-foreground',
             )}
           >
-            {tx.kind === 'sending' ? 'confirming…' : `confirm nonce ${pendingIxNonce?.toString()}`}
+            {pending ? 'confirming…' : `confirm nonce ${pendingIxNonce?.toString()}`}
           </button>
           <p className="mt-2 text-[11.5px] leading-relaxed text-muted-foreground">
             {canConfirm
               ? 'Confirm only after the guard-built venue instruction has landed. This commits the nonce and clears the pending action.'
-              : 'Connect the owner wallet for this guard to co-sign.'}
+              : (blockReason ?? 'Connect the owner wallet for this guard to co-sign.')}
           </p>
-          {tx.kind === 'error' ? (
-            <p className="mt-2 font-mono text-[11px] break-all text-risk">{tx.message}</p>
-          ) : null}
-          {tx.kind === 'sent' ? (
-            <p className="mt-2 font-mono text-[11px] break-all text-healthy">
-              confirmed · {tx.signature.slice(0, 16)}…
-            </p>
-          ) : null}
+          <TxResult tx={tx} op="confirm" />
         </div>
       ) : null}
     </div>

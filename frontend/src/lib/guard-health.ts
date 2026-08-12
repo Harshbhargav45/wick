@@ -7,7 +7,7 @@
  * at the very end, for display.
  */
 
-import { BPS_DENOM, SCALE, type GuardState } from './guard-layout';
+import { BPS_DENOM, RECONCILE_DIVERGED, SCALE, type GuardState } from './guard-layout';
 
 export function computePnl(size: bigint, entry: bigint, current: bigint): bigint {
   return (size * (current - entry)) / SCALE;
@@ -52,6 +52,21 @@ export interface Health {
   factor: number;
   /** The factor at which the guard fires — 1 + trigger_buffer_bps/10000. */
   triggerFactor: number;
+  /**
+   * The venue's own account disagrees with the guard's model (§8.8).
+   *
+   * Kept separate from the equity-based flags because it is not a margin
+   * condition at all: the numbers above are arithmetic on `collateral`, `size`
+   * and `entry`, and if those no longer describe the real position then every
+   * one of them is confidently wrong. The program fails closed on this, so the
+   * console has to show it even while the math reads comfortable.
+   */
+  diverged: boolean;
+  /**
+   * True when nothing is protecting this position right now — either the guard
+   * would be refused by its own checks, or equity is already below maintenance.
+   */
+  unprotected: boolean;
 }
 
 export function computeHealth(state: GuardState): Health {
@@ -69,6 +84,7 @@ export function computeHealth(state: GuardState): Health {
 
   const factor = marginRequired === 0n ? Infinity : Number(eq) / Number(marginRequired);
   const triggerFactor = 1 + Number(policy.triggerBufferBps) / Number(BPS_DENOM);
+  const diverged = state.reconcile.status === RECONCILE_DIVERGED;
 
   return {
     pnl,
@@ -80,11 +96,21 @@ export function computeHealth(state: GuardState): Health {
     breachingBuffer,
     factor,
     triggerFactor,
+    diverged,
+    unprotected: liquidatable || diverged || state.degraded,
   };
 }
 
-/** Slots in one daily epoch — mirrors `state::DAILY_EPOCH_SLOTS`. */
-export const DAILY_EPOCH_SLOTS = 216_000n;
+/**
+ * Seconds in one daily epoch — mirrors `state::DAILY_EPOCH_SECS`.
+ *
+ * Wall-clock seconds, not slots. The program compares `unix_timestamp` against
+ * `daily_epoch_start_ts` for the same reason it does for tick staleness: slot
+ * length drifts around ~400ms, so a slot count is not a day. Counting 216,000
+ * of anything here would put the rollover boundary in the wrong place and
+ * mis-window the cap.
+ */
+export const DAILY_EPOCH_SECS = 86_400n;
 
 export interface DailyBudget {
   spent: bigint;
@@ -96,17 +122,17 @@ export interface DailyBudget {
 }
 
 /**
- * The daily action budget as of `currentSlot`.
+ * The daily action budget as of `nowTs` (unix seconds).
  *
  * The accumulator on the account is only rolled over by the program on its next
  * tick, so a guard whose epoch has already elapsed still reports the old
  * `dailySpentUsd` on chain. Applying the same rollover rule here keeps the
  * dashboard from showing a budget as spent when the next tick will reset it.
  */
-export function dailyBudget(state: GuardState, currentSlot: bigint): DailyBudget {
+export function dailyBudget(state: GuardState, nowTs: bigint): DailyBudget {
   const elapsed =
-    currentSlot > state.dailyEpochStartSlot ? currentSlot - state.dailyEpochStartSlot : 0n;
-  const spent = elapsed >= DAILY_EPOCH_SLOTS ? 0n : state.dailySpentUsd;
+    nowTs > state.dailyEpochStartTs ? nowTs - state.dailyEpochStartTs : 0n;
+  const spent = elapsed >= DAILY_EPOCH_SECS ? 0n : state.dailySpentUsd;
   const total = state.policy.caps.dailyTotalUsd;
   const remaining = total > spent ? total - spent : 0n;
   const used = total === 0n ? 1 : Math.min(1, Number(spent) / Number(total));

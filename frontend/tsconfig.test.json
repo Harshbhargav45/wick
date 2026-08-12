@@ -1,0 +1,28 @@
+/*
+ * Test build for the pure logic in `src/lib`.
+ *
+ * The console's decoders, builders and amount parsers are plain TypeScript with
+ * no React and no DOM, so they are testable without a browser runner. This
+ * compiles them to CommonJS in `.test-build/` and `node --test` runs the specs
+ * against the output — the same runner the cranker uses, and no new dependency.
+ *
+ * Deliberately narrow: this is not a second build of the app. The app is built
+ * by `next build` from the root tsconfig, which stays `noEmit`.
+ */
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["esnext"],
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "strict": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "outDir": ".test-build",
+    "noEmit": false,
+    "incremental": false,
+    "declaration": false,
+    "sourceMap": false
+  },
+  "include": ["src/lib/amounts.ts", "src/lib/guard-layout.ts", "src/lib/guard-health.ts", "src/lib/guard-program.ts"]
+}

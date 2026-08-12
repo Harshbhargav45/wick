@@ -62,7 +62,7 @@ export function ActivityFeed({ events }: { events: GuardEvent[] }) {
                 {event.message}
               </span>
               <span className="shrink-0 font-mono text-[10.5px] text-muted-foreground/70">
-                slot {event.slot} · {ago(event.at, now)}
+                {ago(event.at, now)}
               </span>
             </li>
           ))}
