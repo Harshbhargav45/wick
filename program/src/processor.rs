@@ -22,28 +22,66 @@
 //!   [2] route_config (readonly).
 //! * `InitRouteConfig`— [0] config PDA (writable, created), [1] authority
 //!   (signer), [2] payer (signer, writable), [3] rent sysvar.
+//! * `CloseGuard`   — [0] guard (writable, program-owned), [1] owner (signer,
+//!   writable — receives the rent refund). Payload = [bump].
+//! * `SetRouteAuthority`— [0] route-config (writable, program-owned),
+//!   [1] current authority (signer), [2] new authority (signer).
+//! * `ReconcileVenue`— [0] guard (writable), [1] clock, [2] route_config
+//!   (readonly), [3] venue position account (readonly, venue-owned). Payload is
+//!   the reconcile `nonce` (u64 LE). Permissionless: the caller chooses *when*
+//!   the guard looks at the venue, never *what it sees*.
+//! * `InitMarginWallet`— [0] wallet PDA (writable, created), [1] guard
+//!   (writable), [2] owner (signer), [3] payer (signer, writable), [4] rent
+//!   sysvar, [5] route_config (readonly). Payload = [bump]; the PDA is derived
+//!   from `b"margin"` || venue_owner || bump.
+//! * `FundMarginWallet`— [0] wallet (writable, program-owned), [1] guard
+//!   (readonly), [2] owner (signer, writable), [3] rent sysvar,
+//!   [4] route_config (readonly). Payload is `amount` in **lamports** (u128 LE).
+//! * `WithdrawMarginWallet`— [0] wallet (writable, program-owned), [1] guard
+//!   (readonly), [2] owner (signer, writable), [3] co_authority (signer),
+//!   [4] rent sysvar, [5] route_config (readonly). Payload is `amount` in
+//!   lamports (u128 LE). Enforces the §8.5 2-of-2 rule.
 
 use pinocchio::error::ProgramResult;
 use pinocchio::instruction::{cpi::Signer, seeds};
 use pinocchio::sysvars::clock::Clock;
+use pinocchio::sysvars::rent::Rent;
 use pinocchio::{AccountView, Address};
 
-use pinocchio_system::instructions::CreateAccount;
+use pinocchio_system::instructions::{CreateAccount, Transfer};
 
-use crate::account::{GuardState, PendingIx, ACCOUNT_VERSION, GUARD_DATA_LEN, ROUTE_CONFIG_LEN};
+use crate::account::{
+    GuardState, PendingIx, WalletState, ACCOUNT_VERSION, GUARD_DATA_LEN,
+    PENDING_IX_JUPITER_DEFENSIVE_CLOSE, PENDING_IX_JUPITER_TPSL, RECONCILE_DIVERGED,
+    RECONCILE_NEVER, ROUTE_CONFIG_LEN, WALLET_DATA_LEN,
+};
 use crate::delegation;
-use crate::drift::{DriftPlaceOrderAccounts, ReduceDirection, ReduceOrderParams, VENUE_DRIFT};
+use crate::drift::{
+    read_user_position, verify_user_account, DriftPlaceOrderAccounts, ReduceDirection,
+    ReduceOrderParams, VENUE_DRIFT,
+};
 use crate::error::WickError;
 use crate::instruction::WickInstruction;
-use crate::jupiter::{build_tp_safety_net, VENUE_JUPITER};
+use crate::jupiter::{build_defensive_close, build_tp_safety_net, VENUE_JUPITER};
 use crate::pyth::{pyth_price_to_scale6, read_price_no_older_than, SOL_USD_FEED_ID};
 use crate::state::{
-    accept_tick, guard_act, select_action, track_tick_freshness, Action, ActionCaps,
-    AuthorityRequirement, DispatchRegime, HealthSnapshot, RouteConfig, VenuePolicy,
+    accept_tick, action_daily_usd, guard_act, reconcile_verdict, roll_daily_epoch, select_action,
+    track_tick_freshness, Action, ActionCaps, AuthorityRequirement, DispatchRegime, HealthSnapshot,
+    RouteConfig, VenuePolicy, BPS_DENOM, SCALE,
 };
 
 const GUARD_SEED: &[u8] = b"guard";
 const ROUTE_CONFIG_SEED: &[u8] = b"route_config";
+/// Seed prefix of the 2-of-2 margin-wallet PDA: `b"margin" || venue_owner`.
+const MARGIN_WALLET_SEED: &[u8] = b"margin";
+
+/// How stale the price backing a co-signed defensive close may be before the
+/// guard refuses to build it (§8.7). A stop level is only meaningful relative to
+/// the mark it was derived from: handing the owner an instruction anchored to a
+/// minute-old price invites them to sign a stop that is already through the
+/// market. Matches `PYTH_MAX_AGE_SECS` — the same freshness the price itself is
+/// gated on, not a looser second standard.
+const DEFENSIVE_CLOSE_TTL_SECS: i64 = 60;
 
 /// Pyth pull-oracle gating (hours.md §7.1): a tick is only priced against a
 /// `PriceUpdateV2` no older than this many seconds, whose confidence is within
@@ -245,13 +283,30 @@ fn init_guard(program_id: &Address, accounts: &[AccountView], data: &[u8]) -> Pr
         entry: 0,
         current_price: 0,
         nonce: 0,
-        last_check_slot: 0,
+        last_check_ts: 0,
+        // A fresh guard starts with an unspent budget. The epoch anchors at 0
+        // rather than the current slot so the first tick rolls it forward and
+        // stamps a real start; enrolling does not consume any of day one.
+        daily_spent_usd: 0,
+        daily_epoch_start_ts: 0,
         pending: None,
         pending_ix: None,
         degraded: false,
         stale_streak: 0,
         drift_market_index,
         drift_subaccount_id,
+        // §8.3 — no reconcile has run against the venue yet. `NeverReconciled`
+        // is deliberately not `Diverged`: a guard that has never been checked is
+        // not evidence of a mismatch, and starting disarmed would make every
+        // fresh guard useless until a cranker happened to reconcile it.
+        venue_size: 0,
+        venue_collateral: 0,
+        reconcile_ts: 0,
+        reconcile_nonce: 0,
+        reconcile_status: RECONCILE_NEVER,
+        // No margin wallet until `InitMarginWallet` creates one and stamps its
+        // bump here. 0 means "no reserve linked", which gates TopUp (§8.5).
+        margin_wallet_bump: 0,
     };
     store_guard(guard, &state)?;
     Ok(())
@@ -334,6 +389,106 @@ fn set_paused(program_id: &Address, accounts: &[AccountView], data: &[u8]) -> Pr
     Ok(())
 }
 
+/// Close a guard: refund its rent to the owner and zero the account.
+///
+/// The guard PDA is a pure function of `b"guard" || owner || bump`, so an owner
+/// gets exactly one guard address, forever. Without this handler a guard whose
+/// bytes no longer decode under the current layout is a tombstone at that one
+/// address: `init_guard`'s re-init branch refuses an account whose version badge
+/// already matches, every other handler refuses one that does not decode, and
+/// the rent is unrecoverable. This is the escape hatch, and it re-arms itself on
+/// every future layout change.
+///
+/// Deliberately **does not** decode the guard. The account that most needs
+/// closing is the one that cannot be decoded, so authority is proven the only
+/// way that survives a broken layout: the PDA is re-derived from the signing
+/// owner's key and must equal the account being closed. That is the same
+/// binding `init_guard` gets from the runtime during `CreateAccount`.
+///
+/// Also **not** gated on the kill switch. A pause exists to stop the guard from
+/// acting; leaving the owner's rent trapped for the duration is not part of that
+/// and would reintroduce the lockout this instruction removes. It moves no
+/// value except the owner's own rent, back to the owner.
+///
+/// Account layout: [0] guard (writable, program-owned), [1] owner (signer,
+/// writable — receives the rent refund).
+/// Data (after discriminator): [0] bump.
+fn close_guard(program_id: &Address, accounts: &[AccountView], data: &[u8]) -> ProgramResult {
+    let (guard, owner) = split_2(accounts)?;
+    if !owner.is_signer() {
+        return Err(WickError::MissingOwnerAuthority.into());
+    }
+    // A delegated guard is owned by the Delegation Program, not us; undelegate
+    // it first. Checking here turns that into a clear error instead of a
+    // runtime "spent from an account it does not own" failure.
+    if !guard.owned_by(program_id) {
+        return Err(WickError::WrongAccountOwner.into());
+    }
+    let bump = *data.get(1).ok_or(WickError::InvalidInstruction)?;
+
+    let owner_key = owner.address().to_bytes();
+    let expected = Address::create_program_address(&[GUARD_SEED, &owner_key, &[bump]], program_id)
+        .map_err(|_| WickError::InvalidPda)?;
+    if guard.address() != &expected {
+        return Err(WickError::InvalidPda.into());
+    }
+
+    // Lamports must leave the account before it is closed or the instruction
+    // ends unbalanced. The refund goes to the owner, who paid the rent.
+    let refund = guard.lamports();
+    owner.set_lamports(
+        owner
+            .lamports()
+            .checked_add(refund)
+            .ok_or(WickError::MathOverflow)?,
+    );
+    guard.set_lamports(0);
+    guard.close()?;
+    Ok(())
+}
+
+/// Rotate the RouteConfig kill-switch authority.
+///
+/// The authority is stamped once at `InitRouteConfig` and, until now, could
+/// never change: a lost or compromised key meant the program could never be
+/// paused again, or could be paused by someone who should no longer be able to.
+///
+/// The incoming authority must **sign**. Rotating a kill switch to a mistyped
+/// address disables it permanently — the same one-way trap `CloseGuard` exists
+/// to undo, except a RouteConfig has no second address to fall back on. A
+/// signature proves the key exists and is controlled. A multisig can satisfy it.
+///
+/// Account layout: [0] route_config (writable, program-owned), [1] current
+/// authority (signer), [2] new authority (signer).
+/// Data (after discriminator): none — the new authority is account [2].
+fn set_route_authority(program_id: &Address, accounts: &[AccountView]) -> ProgramResult {
+    let (config, authority, new_authority) = split_3(accounts)?;
+    if !config.owned_by(program_id) {
+        return Err(WickError::WrongAccountOwner.into());
+    }
+    if !authority.is_signer() || !new_authority.is_signer() {
+        return Err(WickError::Unauthorized.into());
+    }
+
+    let mut cfg =
+        RouteConfig::from_bytes(&config.try_borrow().map_err(|_| WickError::NotInitialized)?)
+            .map_err(|_| WickError::NotInitialized)?;
+    if authority.address() != &Address::from(cfg.authority) {
+        return Err(WickError::Unauthorized.into());
+    }
+    // `paused` is carried through untouched: a rotation during an incident must
+    // not quietly un-pause the program.
+    cfg.authority = new_authority.address().to_bytes();
+    {
+        let mut out = config
+            .try_borrow_mut()
+            .map_err(|_| WickError::NotInitialized)?;
+        cfg.write_into(&mut out)
+            .map_err(|_| WickError::NotInitialized)?;
+    }
+    Ok(())
+}
+
 /// Record the watched position's snapshot. Only the guard owner (venue owner)
 /// may set it — this is the enrollment step after the position is opened.
 ///
@@ -360,6 +515,18 @@ fn update_position(program_id: &Address, accounts: &[AccountView], data: &[u8]) 
     state.collateral = collateral;
     state.size = size;
     state.entry = entry;
+    // §8.3 — the model just changed, so the previous reconcile verdict no longer
+    // describes it. Back to `NeverReconciled` rather than `Converged`: the owner
+    // asserting a new snapshot is not evidence the venue agrees, and claiming
+    // convergence the guard never observed would be the exact fiction
+    // reconciliation exists to prevent. This is also the owner's way out of a
+    // `Diverged` freeze — they correct the model, the guard re-arms, and the
+    // next `ReconcileVenue` re-checks it against the venue's own bytes.
+    //
+    // `venue_size`/`venue_collateral`/`reconcile_ts` are left as they were: they
+    // are a timestamped observation of the venue, still true as of that stamp,
+    // and the console renders them alongside it.
+    state.reconcile_status = RECONCILE_NEVER;
     store_guard(guard, &state)?;
     Ok(())
 }
@@ -372,6 +539,19 @@ fn update_position(program_id: &Address, accounts: &[AccountView], data: &[u8]) 
 /// that instruction on L1 with their own signature; `Confirm` records that it
 /// happened: it commits `expected_nonce` as the new base and clears the pending
 /// instruction so a later genuine breach is not mistaken for a replay.
+///
+/// **Restriction (§8.4/§8.7).** Only `VENUE_JUPITER` builds a `pending_ix`, and
+/// only for the two actions Jupiter's TP/SL instruction can express: `TakeProfit`
+/// (tag `PENDING_IX_JUPITER_TPSL`) and `PartialClose` (tag
+/// `PENDING_IX_JUPITER_DEFENSIVE_CLOSE`). Both are confirmable and both commit
+/// the nonce the same way — the tag records *which* instruction the owner was
+/// handed, so a console cannot offer a take-profit button for a stop. A CoSigned
+/// guard on `VENUE_NONE` or `VENUE_DRIFT`, or on Jupiter with a top-up or an
+/// escalation, records `pending` for the dashboard but produces nothing for the
+/// owner to sign — those are advisory and must be actioned at the venue. This
+/// path fails closed with `ConfirmUnsupportedForVenue` rather than committing a
+/// nonce for work that never happened: advancing it would mark the breach
+/// handled and disarm the guard against the next genuine one.
 ///
 /// Account layout: [0] guard (writable, program-owned), [1] owner (signer).
 /// Data (after discriminator): none — the pending instruction is on the guard.
@@ -388,12 +568,397 @@ fn confirm_pending(program_id: &Address, accounts: &[AccountView], _data: &[u8])
     if owner.address() != &Address::from(state.venue_owner) {
         return Err(WickError::SignerKeyMismatch.into());
     }
-    let px = state.pending_ix.ok_or(WickError::NoPendingConfirm)?;
+    let px = match state.pending_ix {
+        Some(px) => px,
+        // Distinguish "nothing is pending" from "something is pending but this
+        // venue cannot produce a confirmable instruction" — otherwise the owner
+        // sees the dashboard show a pending action and gets a bare
+        // `NoPendingConfirm` with no way to tell which case they are in.
+        None if state.pending.is_some() => return Err(WickError::ConfirmUnsupportedForVenue.into()),
+        None => return Err(WickError::NoPendingConfirm.into()),
+    };
+    // §8.2 — the co-signed action lands now, so it charges the daily budget
+    // now. Recomputed from the stored pending action rather than carried on
+    // `PendingIx`, so the figure reflects the notional at confirm time.
+    //
+    // This is load-bearing for the defensive close (`PENDING_IX_JUPITER_-
+    // DEFENSIVE_CLOSE`): it is a `PartialClose`, so confirming one spends
+    // notional against the daily cap exactly as an autonomous reduce would.
+    // Without the charge, a co-signed venue could be walked past its daily
+    // budget one owner signature at a time. A take-profit charges nothing, so
+    // the older Jupiter pairing is unaffected.
+    //
+    // No epoch rollover here: `Confirm` takes no clock account, and adding one
+    // would change the instruction's account layout for every existing caller.
+    // Charging against a possibly-expired epoch can only *under*-allow, never
+    // over-allow, so the omission fails closed. The next tick rolls it.
+    let notional = state
+        .size
+        .unsigned_abs()
+        .checked_mul(state.current_price)
+        .ok_or(WickError::MathOverflow)?
+        .checked_div(SCALE)
+        .ok_or(WickError::MathOverflow)?;
+    let charge = state
+        .pending
+        .map(|a| action_daily_usd(a, notional))
+        .unwrap_or(0);
+    if !state
+        .policy
+        .caps
+        .within_daily(state.daily_spent_usd, charge)
+    {
+        return Err(WickError::OverPolicyCap.into());
+    }
+    state.daily_spent_usd = state.daily_spent_usd.saturating_add(charge);
+
     // §8.4 — the nonce commits only when the owner confirms on L1.
     state.nonce = px.expected_nonce;
     state.pending_ix = None;
     state.pending = None;
     store_guard(guard, &state)?;
+    Ok(())
+}
+
+// -------------------------------------------------------------------------
+// §8.3 Venue reconciliation
+// -------------------------------------------------------------------------
+
+/// Reconcile the guard's model of the position against the venue's own account.
+///
+/// Everything else in this program trusts `state.size` — the solver sizes orders
+/// from it, the health math prices it, the caps meter it. Until now the only
+/// writer was the owner's `UpdatePosition`, so a position that moved at the venue
+/// (a manual partial close, a liquidation, a fill the guard never saw) left the
+/// guard confidently acting on a number that was no longer true.
+///
+/// This reads the venue's bytes and records what it found. Three properties make
+/// it safe to leave open to anyone:
+///
+/// * **The number is never supplied by the caller.** The payload carries a nonce
+///   and nothing else; size and collateral are decoded out of the venue's own
+///   account, which is verified to be the account this guard watches
+///   (`verify_user_account` re-derives it from the guard's `venue_owner` and
+///   sub-account, and requires the venue program to own it).
+/// * **Replays cannot re-apply an old snapshot.** `reconcile_nonce` must strictly
+///   increase, so a captured transaction cannot roll a newer observation back to
+///   an older one.
+/// * **It moves no value and grants no authority.** The worst a hostile caller can
+///   do is pay a fee to tell the guard the truth.
+///
+/// A `Diverged` verdict is *recorded, not raised*: returning an error would roll
+/// the write back, and a divergence nobody can persist is a divergence nobody
+/// acts on. `on_price_tick` reads the stored status and refuses to execute.
+///
+/// Account layout: [0] guard (writable, program-owned), [1] clock sysvar
+/// (readonly), [2] route_config (readonly, program-owned), [3] venue position
+/// account (readonly, owned by the venue program).
+/// Data (after discriminator): [0..8] reconcile nonce (u64 LE).
+fn reconcile_venue(program_id: &Address, accounts: &[AccountView], data: &[u8]) -> ProgramResult {
+    let (guard, clock, route_config) = split_3(accounts)?;
+    let venue_account = accounts.get(3).ok_or(WickError::InvalidInstruction)?;
+    check_not_paused(route_config, program_id)?;
+    let now = Clock::from_account_view(clock)
+        .map_err(|_| WickError::InvalidInstruction)?
+        .unix_timestamp;
+
+    let payload = data.get(1..).ok_or(WickError::InvalidInstruction)?;
+    if payload.len() != 8 {
+        return Err(WickError::InvalidInstruction.into());
+    }
+    let nonce = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+
+    let mut state = load_guard(guard, program_id)?;
+    // Strictly increasing, checked before any venue work: a replayed or duplicate
+    // reconcile is cheap to reject and must not overwrite a newer snapshot.
+    if nonce <= state.reconcile_nonce {
+        return Err(WickError::ReconcileStale.into());
+    }
+    // Only the autonomous tier has a position account to read. A Jupiter guard's
+    // position lives behind keeper infrastructure the program cannot decode, and
+    // guessing at it would be worse than admitting the gap.
+    if state.venue != VENUE_DRIFT {
+        return Err(WickError::UnsupportedVenueAction.into());
+    }
+
+    verify_user_account(venue_account, &state.venue_owner, state.drift_subaccount_id)?;
+    let venue_data = venue_account
+        .try_borrow()
+        .map_err(|_| WickError::NotInitialized)?;
+    let observed = read_user_position(&venue_data, state.drift_market_index)?;
+
+    state.reconcile_status = reconcile_verdict(state.size, observed.size).to_byte();
+    state.venue_size = observed.size;
+    state.venue_collateral = observed.collateral;
+    state.reconcile_ts = now;
+    state.reconcile_nonce = nonce;
+    store_guard(guard, &state)?;
+    Ok(())
+}
+
+// -------------------------------------------------------------------------
+// §8.5 Margin wallet — a real, 2-of-2 lamport reserve
+// -------------------------------------------------------------------------
+
+/// Re-derive the margin wallet PDA for a guard and check the supplied account is
+/// it. Accepting a foreign wallet would let a guard credit itself from value its
+/// owner does not control, or drain a wallet belonging to somebody else.
+fn verify_margin_wallet(
+    wallet: &AccountView,
+    program_id: &Address,
+    venue_owner: &[u8; 32],
+    bump: u8,
+) -> Result<(), WickError> {
+    if !wallet.owned_by(program_id) {
+        return Err(WickError::WrongAccountOwner);
+    }
+    let expected =
+        Address::create_program_address(&[MARGIN_WALLET_SEED, venue_owner, &[bump]], program_id)
+            .map_err(|_| WickError::InvalidPda)?;
+    if wallet.address() != &expected {
+        return Err(WickError::MarginWalletMismatch);
+    }
+    Ok(())
+}
+
+/// The reserve invariant (§8.5): the PDA's lamports must cover its own rent plus
+/// every lamport it claims to hold on the owner's behalf.
+///
+/// Without it `balance` is just a number again — the thing this whole instruction
+/// family exists to stop. Checked *after* every mutation, on both the funding and
+/// the withdrawing path, so neither direction can leave the wallet claiming value
+/// it does not have.
+fn check_wallet_backed(
+    wallet: &AccountView,
+    rent: &AccountView,
+    balance: u128,
+) -> Result<(), WickError> {
+    let minimum = Rent::from_account_view(rent)
+        .map_err(|_| WickError::InvalidInstruction)?
+        .try_minimum_balance(WALLET_DATA_LEN)
+        .map_err(|_| WickError::MathOverflow)?;
+    let backing = u128::from(
+        wallet
+            .lamports()
+            .checked_sub(minimum)
+            .ok_or(WickError::InsufficientMarginWallet)?,
+    );
+    if backing < balance {
+        return Err(WickError::InsufficientMarginWallet);
+    }
+    Ok(())
+}
+
+/// Create the guard's margin wallet and link it.
+///
+/// Account layout: [0] wallet PDA (writable, created), [1] guard (writable,
+/// program-owned), [2] owner (signer), [3] payer (signer, writable), [4] rent
+/// sysvar, [5] route_config (readonly, program-owned).
+/// Data (after discriminator): [0] wallet bump.
+fn init_margin_wallet(
+    program_id: &Address,
+    accounts: &[AccountView],
+    data: &[u8],
+) -> ProgramResult {
+    let (wallet, guard, owner, payer) = split_4(accounts)?;
+    let rent = accounts.get(4).ok_or(WickError::InvalidInstruction)?;
+    let route_config = accounts.get(5).ok_or(WickError::InvalidInstruction)?;
+    check_not_paused(route_config, program_id)?;
+    if !owner.is_signer() || !payer.is_signer() {
+        return Err(WickError::MissingOwnerAuthority.into());
+    }
+    let bump = *data.get(1).ok_or(WickError::InvalidInstruction)?;
+
+    let mut state = load_guard(guard, program_id)?;
+    if owner.address() != &Address::from(state.venue_owner) {
+        return Err(WickError::SignerKeyMismatch.into());
+    }
+
+    let bump_bytes = [bump];
+    let seeds = seeds!(MARGIN_WALLET_SEED, &state.venue_owner[..], &bump_bytes);
+    if wallet.lamports() == 0 {
+        CreateAccount::with_minimum_balance(
+            payer,
+            wallet,
+            WALLET_DATA_LEN as u64,
+            program_id,
+            Some(rent),
+        )?
+        .invoke_signed(&[Signer::from(&seeds)])?;
+    } else {
+        // Same trap as `init_guard`'s re-init branch: the runtime only re-derives
+        // the PDA during `CreateAccount`, so a funded account skips that check.
+        // Re-initializing a live wallet would zero a `balance` the owner funded.
+        if !wallet.owned_by(program_id) {
+            return Err(WickError::WrongAccountOwner.into());
+        }
+        let existing = wallet.try_borrow().map_err(|_| WickError::NotInitialized)?;
+        if existing.len() != WALLET_DATA_LEN || existing[0] == ACCOUNT_VERSION {
+            return Err(WickError::AlreadyInitialized.into());
+        }
+    }
+    verify_margin_wallet(wallet, program_id, &state.venue_owner, bump)?;
+
+    // The wallet inherits the guard's own 2-of-2 pair, so the exit path cannot be
+    // widened by pointing a wallet at a friendlier co-authority.
+    let ws = WalletState {
+        owner: state.venue_owner,
+        co_authority: state.co_authority,
+        balance: 0,
+    };
+    {
+        let mut out = wallet
+            .try_borrow_mut()
+            .map_err(|_| WickError::NotInitialized)?;
+        ws.write_into(&mut out)
+            .map_err(|_| WickError::NotInitialized)?;
+    }
+
+    state.margin_wallet_bump = bump;
+    store_guard(guard, &state)?;
+    Ok(())
+}
+
+/// Move lamports from the owner's wallet into the margin reserve.
+///
+/// Account layout: [0] wallet PDA (writable, program-owned), [1] guard
+/// (readonly, program-owned), [2] owner (signer, writable), [3] rent sysvar,
+/// [4] route_config (readonly, program-owned).
+/// Data (after discriminator): amount in lamports (u128 LE, must fit u64).
+fn fund_margin_wallet(
+    program_id: &Address,
+    accounts: &[AccountView],
+    data: &[u8],
+) -> ProgramResult {
+    let (wallet, guard, owner, rent) = split_4(accounts)?;
+    let route_config = accounts.get(4).ok_or(WickError::InvalidInstruction)?;
+    check_not_paused(route_config, program_id)?;
+    if !owner.is_signer() {
+        return Err(WickError::MissingOwnerAuthority.into());
+    }
+    let amount = parse_amount(data)?;
+    let lamports = u64::try_from(amount).map_err(|_| WickError::MathOverflow)?;
+
+    let state = load_guard(guard, program_id)?;
+    if owner.address() != &Address::from(state.venue_owner) {
+        return Err(WickError::SignerKeyMismatch.into());
+    }
+    if state.margin_wallet_bump == 0 {
+        return Err(WickError::MarginWalletMismatch.into());
+    }
+    verify_margin_wallet(
+        wallet,
+        program_id,
+        &state.venue_owner,
+        state.margin_wallet_bump,
+    )?;
+
+    let mut ws =
+        WalletState::from_bytes(&wallet.try_borrow().map_err(|_| WickError::NotInitialized)?)
+            .map_err(|_| WickError::NotInitialized)?;
+
+    // Real lamports first, accounting second. A System transfer from a signing
+    // owner needs no PDA signature and fails the whole instruction if the owner
+    // cannot cover it, so `balance` is never incremented against a transfer that
+    // did not happen.
+    Transfer {
+        from: owner,
+        to: wallet,
+        lamports,
+    }
+    .invoke()?;
+
+    ws.balance = ws
+        .balance
+        .checked_add(amount)
+        .ok_or(WickError::MathOverflow)?;
+    {
+        let mut out = wallet
+            .try_borrow_mut()
+            .map_err(|_| WickError::NotInitialized)?;
+        ws.write_into(&mut out)
+            .map_err(|_| WickError::NotInitialized)?;
+    }
+    check_wallet_backed(wallet, rent, ws.balance)?;
+    Ok(())
+}
+
+/// Withdraw lamports out of the margin reserve — 2-of-2 (§8.5).
+///
+/// Account layout: [0] wallet PDA (writable, program-owned), [1] guard
+/// (readonly, program-owned), [2] owner (signer, writable — receives the
+/// lamports), [3] co_authority (signer), [4] rent sysvar, [5] route_config
+/// (readonly, program-owned).
+/// Data (after discriminator): amount in lamports (u128 LE, must fit u64).
+fn withdraw_margin_wallet(
+    program_id: &Address,
+    accounts: &[AccountView],
+    data: &[u8],
+) -> ProgramResult {
+    let (wallet, guard, owner, co_authority) = split_4(accounts)?;
+    let rent = accounts.get(4).ok_or(WickError::InvalidInstruction)?;
+    let route_config = accounts.get(5).ok_or(WickError::InvalidInstruction)?;
+    check_not_paused(route_config, program_id)?;
+    let amount = parse_amount(data)?;
+    let lamports = u64::try_from(amount).map_err(|_| WickError::MathOverflow)?;
+
+    let state = load_guard(guard, program_id)?;
+    // The same §8.5 check `withdraw_margin` uses — value only leaves on two
+    // signatures, and the wallet's own recorded pair must be the pair that signs.
+    validate_withdraw(
+        owner.is_signer(),
+        owner.address(),
+        &Address::from(state.venue_owner),
+        co_authority.is_signer(),
+        co_authority.address(),
+        &Address::from(state.co_authority),
+    )?;
+    if state.margin_wallet_bump == 0 {
+        return Err(WickError::MarginWalletMismatch.into());
+    }
+    verify_margin_wallet(
+        wallet,
+        program_id,
+        &state.venue_owner,
+        state.margin_wallet_bump,
+    )?;
+
+    let mut ws =
+        WalletState::from_bytes(&wallet.try_borrow().map_err(|_| WickError::NotInitialized)?)
+            .map_err(|_| WickError::NotInitialized)?;
+    if amount > ws.balance {
+        return Err(WickError::InsufficientMarginWallet.into());
+    }
+    if ws.owner != state.venue_owner || ws.co_authority != state.co_authority {
+        return Err(WickError::MarginWalletMismatch.into());
+    }
+
+    // The wallet is program-owned, so lamports move by direct mutation rather
+    // than a System CPI (System will not debit an account this program owns).
+    wallet.set_lamports(
+        wallet
+            .lamports()
+            .checked_sub(lamports)
+            .ok_or(WickError::InsufficientMarginWallet)?,
+    );
+    owner.set_lamports(
+        owner
+            .lamports()
+            .checked_add(lamports)
+            .ok_or(WickError::MathOverflow)?,
+    );
+
+    ws.balance -= amount;
+    {
+        let mut out = wallet
+            .try_borrow_mut()
+            .map_err(|_| WickError::NotInitialized)?;
+        ws.write_into(&mut out)
+            .map_err(|_| WickError::NotInitialized)?;
+    }
+    // Rent must survive the withdrawal, or the account is closable by the
+    // runtime and the remaining `balance` evaporates with it.
+    check_wallet_backed(wallet, rent, ws.balance)?;
     Ok(())
 }
 
@@ -424,7 +989,6 @@ fn on_price_tick(program_id: &Address, accounts: &[AccountView], data: &[u8]) ->
         return Err(WickError::WrongAccountOwner.into());
     }
     let clock_sv = Clock::from_account_view(clock).map_err(|_| WickError::InvalidInstruction)?;
-    let current_slot = clock_sv.slot;
     let now = clock_sv.unix_timestamp;
 
     let payload = data.get(1..).ok_or(WickError::InvalidInstruction)?;
@@ -466,18 +1030,27 @@ fn on_price_tick(program_id: &Address, accounts: &[AccountView], data: &[u8]) ->
 
     // §8.1.3 — reject stale ticks, tracking the degraded streak. A rejected
     // tick is not "do nothing this tick": it updates the streak/flag so the
-    // guard can never silently protect against dead data.
-    let fresh = accept_tick(current_slot, state.last_check_slot);
+    // guard can never silently protect against dead data. Wall-clock freshness
+    // (`now`) rather than slot — see MAX_TICK_AGE_SECS: a slot means ~400ms on
+    // base Solana and ~50ms on the ER, seconds mean the same on both.
+    let fresh = accept_tick(now, state.last_check_ts);
     let (streak, degraded) = track_tick_freshness(state.stale_streak, fresh);
     state.stale_streak = streak;
     state.degraded = degraded;
     state.current_price = price;
-    state.last_check_slot = current_slot;
+    state.last_check_ts = now;
 
     if !fresh {
         store_guard(guard, &state)?;
         return Ok(());
     }
+
+    // §8.2 — roll the daily budget before it is consulted, so a guard whose
+    // epoch elapsed while it sat idle starts this tick with a fresh allowance.
+    let (spent, epoch_start) =
+        roll_daily_epoch(state.daily_spent_usd, state.daily_epoch_start_ts, now);
+    state.daily_spent_usd = spent;
+    state.daily_epoch_start_ts = epoch_start;
 
     // §8.2 — health → nonce → caps → action selection (§7.2 ordering).
     let health = HealthSnapshot {
@@ -486,10 +1059,24 @@ fn on_price_tick(program_id: &Address, accounts: &[AccountView], data: &[u8]) ->
         entry: state.entry,
         current_price: price,
     };
-    let Some(action) = select_action(&health, &state.policy, tick_nonce, state.nonce)? else {
+    let Some(action) = select_action(&health, &state.policy, tick_nonce, state.nonce, spent)?
+    else {
         store_guard(guard, &state)?; // healthy — snapshot updated, nothing else
         return Ok(());
     };
+
+    // USD this action commits against the daily budget, charged at the point it
+    // actually lands — immediately for an autonomous execution, at the owner's
+    // confirm for a co-signed one. Charging at selection time would let a
+    // co-signed build the owner never signs burn the budget anyway.
+    let notional = state
+        .size
+        .unsigned_abs()
+        .checked_mul(price)
+        .ok_or(WickError::MathOverflow)?
+        .checked_div(SCALE)
+        .ok_or(WickError::MathOverflow)?;
+    let action_usd = action_daily_usd(action, notional);
 
     // §8.4 — two-regime authority dispatch.
     let (regime, expected_nonce) = guard_act(&state.policy, tick_nonce)?;
@@ -497,11 +1084,48 @@ fn on_price_tick(program_id: &Address, accounts: &[AccountView], data: &[u8]) ->
     // route_config, pyth oracle).
     let venue_accounts = accounts.get(4..).unwrap_or(&[]);
     match regime {
+        // §8.3.4 — fail closed on a diverged model. The last reconcile found the
+        // venue's own bytes out of tolerance of `state.size`, and every
+        // autonomous order the guard would place is sized *from* `state.size`.
+        // Executing here trades a number the venue has already contradicted: too
+        // small and the breach is not cleared, too large and a `reduce_only`
+        // order that should trim a position closes it outright. Escalate instead
+        // and leave the nonce uncommitted, so the guard re-arms the moment a
+        // fresh `ReconcileVenue` converges or the owner runs `UpdatePosition`.
+        //
+        // The price, freshness streak and daily epoch are already updated above,
+        // so a diverged guard still reports live health — it just will not act.
+        DispatchRegime::Autonomous if state.reconcile_status == RECONCILE_DIVERGED => {
+            state.pending = Some(Action::EscalateManualReview);
+        }
+        // §8.5 — a TopUp the owner cannot fund is not an action, it is a
+        // suggestion. The margin wallet is the only value the guard controls, and
+        // `margin_wallet_bump == 0` means no reserve was ever linked. Surface
+        // manual review rather than a top-up that has nothing behind it.
+        //
+        // This checks that a reserve *exists*, not that it covers the draw: the
+        // wallet is not ER-delegated and is not in this instruction's account
+        // list, so its balance is unreadable from here. Sufficiency is enforced
+        // at `FundMarginWallet`/`WithdrawMarginWallet`, where lamports move.
+        DispatchRegime::Autonomous
+            if matches!(action, Action::TopUp { .. }) && state.margin_wallet_bump == 0 =>
+        {
+            state.pending = Some(Action::EscalateManualReview);
+        }
         DispatchRegime::Autonomous => {
             match execute_autonomous(&state, action, venue_accounts, bump) {
                 Ok(VenueOutcome::Executed) => {
                     // Nonce commits only when the venue action actually lands.
                     state.nonce = expected_nonce;
+                    state.daily_spent_usd = state.daily_spent_usd.saturating_add(action_usd);
+                    // The position just shrank on the venue, so the guard's
+                    // model of it has to shrink too. Without this the guard
+                    // still believes it holds the pre-reduce size, re-solves
+                    // against the original notional on the very next tick, and
+                    // under a sustained breach closes the whole position in a
+                    // handful of ticks — each one a real order at the venue.
+                    // Mirrors `execute_drift_autonomous`'s own arithmetic.
+                    apply_executed_reduce(&mut state, action);
                 }
                 Ok(VenueOutcome::Escalate) | Err(WickError::UnsupportedVenueAction) => {
                     state.pending = Some(Action::EscalateManualReview);
@@ -515,15 +1139,51 @@ fn on_price_tick(program_id: &Address, accounts: &[AccountView], data: &[u8]) ->
             // nonce must NOT advance until the owner co-signs on L1. The guard
             // never signs or submits it (no fake autonomy).
             if state.venue == VENUE_JUPITER {
-                if let Action::TakeProfit = action {
-                    let now = Clock::from_account_view(clock)
-                        .map_err(|_| WickError::InvalidInstruction)?
-                        .unix_timestamp;
-                    let data = build_tp_safety_net(
-                        state.policy.take_profit.unwrap_or(state.current_price),
-                        now,
-                    )?;
+                let built = match action {
+                    // The profit-taking leg: a trigger *above* market covering
+                    // the whole position (§8.7).
+                    Action::TakeProfit => Some((
+                        PENDING_IX_JUPITER_TPSL,
+                        build_tp_safety_net(
+                            state.policy.take_profit.unwrap_or(state.current_price),
+                            now,
+                        )?,
+                    )),
+                    // §8.7 — the defensive leg. A CoSigned Jupiter guard used to
+                    // record `PartialClose` for the dashboard and build nothing,
+                    // so the one action that answers a live breach was the one
+                    // the owner could not sign. Build a stop for exactly the
+                    // notional the solver sized, anchored to this tick's verified
+                    // price, and hold it pending — the guard still never signs.
+                    Action::PartialClose { fraction_bps } => {
+                        let close_usd = notional
+                            .checked_mul(fraction_bps)
+                            .ok_or(WickError::MathOverflow)?
+                            / BPS_DENOM;
+                        Some((
+                            PENDING_IX_JUPITER_DEFENSIVE_CLOSE,
+                            build_defensive_close(
+                                // The trigger is this tick's verified mark, not
+                                // some level further out: the breach is already
+                                // live, so the honest instruction is "close this
+                                // much, now", not "close it if things get worse".
+                                price,
+                                close_usd,
+                                state.size < 0,
+                                pyth.publish_time,
+                                now,
+                                DEFENSIVE_CLOSE_TTL_SECS,
+                            )?,
+                        ))
+                    }
+                    // A top-up adds collateral, which Jupiter's TP/SL
+                    // instruction cannot express, and an escalation is by
+                    // definition not automatable. Both stay advisory.
+                    Action::TopUp { .. } | Action::EscalateManualReview => None,
+                };
+                if let Some((kind, data)) = built {
                     state.pending_ix = Some(PendingIx {
+                        kind,
                         expected_nonce,
                         data,
                     });
@@ -534,6 +1194,35 @@ fn on_price_tick(program_id: &Address, accounts: &[AccountView], data: &[u8]) ->
     }
     store_guard(guard, &state)?;
     Ok(())
+}
+
+/// Update the guard's model of the position after an autonomous reduce landed.
+///
+/// A `PartialClose{fraction_bps}` shrinks `size` by that fraction in magnitude
+/// (matching `execute_drift_autonomous`: `abs_size * fraction_bps / 10_000`,
+/// floored to whole base units, so the residual always rounds in the guard's
+/// favor — it models holding slightly *more* than the venue now holds). A
+/// `TakeProfit` closes the watched position in full, so `size` goes to zero.
+/// `TopUp`/`Escalate` never reach here — they cannot execute.
+///
+/// The `executed` reduce is the authoritative notification that exposure left
+/// the venue; `current_price`, `entry` and `collateral` are left untouched.
+fn apply_executed_reduce(state: &mut GuardState, action: Action) {
+    match action {
+        Action::TakeProfit => state.size = 0,
+        Action::PartialClose { fraction_bps } => {
+            let abs = state.size.unsigned_abs();
+            let reduced = abs.saturating_mul(fraction_bps) / 10_000;
+            // `size >= 0` is the same direction test `execute_drift_autonomous`
+            // uses to pick the venue order direction.
+            if state.size >= 0 {
+                state.size = (abs.saturating_sub(reduced)) as i128;
+            } else {
+                state.size = -((abs.saturating_sub(reduced)) as i128);
+            }
+        }
+        Action::TopUp { .. } | Action::EscalateManualReview => {}
+    }
 }
 
 /// Outcome of an autonomous venue execution.
@@ -589,6 +1278,19 @@ fn execute_drift_autonomous(
     let fraction_bps: u128 = match action {
         Action::PartialClose { fraction_bps } => fraction_bps,
         Action::TakeProfit => 10_000,
+        // §8.5 — a TopUp adds *collateral*, which on Drift means a `deposit` into
+        // the quote spot market: an SPL token transfer out of a token account the
+        // guard PDA owns, against the spot-market vault and its oracle. None of
+        // those accounts are in this instruction's list and no deposit adapter is
+        // wired, so the guard has no way to move the value.
+        //
+        // It escalates rather than pretending. The alternative — debiting the
+        // margin wallet and crediting `state.collateral` — would be strictly
+        // worse than doing nothing: the guard's health math would price a
+        // position as rescued while the venue, which is the only party that can
+        // liquidate it, saw no collateral arrive. `on_price_tick` already refuses
+        // to route a TopUp here at all unless a funded reserve is linked, so the
+        // escalation reaches an owner who can act on it.
         Action::TopUp { .. } | Action::EscalateManualReview => {
             return Err(WickError::UnsupportedVenueAction)
         }
@@ -690,13 +1392,19 @@ pub fn process_instruction(
         WickInstruction::DepositMargin => deposit_margin(program_id, accounts, data),
         WickInstruction::WithdrawMargin => withdraw_margin(program_id, accounts, data),
         WickInstruction::SetPaused => set_paused(program_id, accounts, data),
-        WickInstruction::Delegate => delegation::process_delegate(accounts, &data[1..]),
+        WickInstruction::Delegate => delegation::process_delegate(program_id, accounts, &data[1..]),
         WickInstruction::CommitAndUndelegate => delegation::process_commit_and_undelegate(accounts),
         WickInstruction::Commit => delegation::process_commit(accounts),
         WickInstruction::OnPriceTick => on_price_tick(program_id, accounts, data),
         WickInstruction::UpdatePosition => update_position(program_id, accounts, data),
         WickInstruction::ConfirmYes => confirm_pending(program_id, accounts, data),
         WickInstruction::InitRouteConfig => init_route_config(program_id, accounts, data),
+        WickInstruction::CloseGuard => close_guard(program_id, accounts, data),
+        WickInstruction::SetRouteAuthority => set_route_authority(program_id, accounts),
+        WickInstruction::ReconcileVenue => reconcile_venue(program_id, accounts, data),
+        WickInstruction::InitMarginWallet => init_margin_wallet(program_id, accounts, data),
+        WickInstruction::FundMarginWallet => fund_margin_wallet(program_id, accounts, data),
+        WickInstruction::WithdrawMarginWallet => withdraw_margin_wallet(program_id, accounts, data),
     }
 }
 
@@ -941,13 +1649,21 @@ mod tests {
             entry: 50_000_000,
             current_price: 49_000_000,
             nonce: 0,
-            last_check_slot: 0,
+            last_check_ts: 0,
             pending: None,
             pending_ix: None,
             degraded: false,
             stale_streak: 0,
             drift_market_index: 0,
             drift_subaccount_id: 0,
+            daily_spent_usd: 0,
+            daily_epoch_start_ts: 0,
+            venue_size: 0,
+            venue_collateral: 0,
+            reconcile_ts: 0,
+            reconcile_nonce: 0,
+            reconcile_status: RECONCILE_NEVER,
+            margin_wallet_bump: 0,
         };
         let mut buf = vec![0u8; GUARD_DATA_LEN];
         state.write_into(&mut buf).unwrap();
@@ -960,7 +1676,7 @@ mod tests {
         authority: AuthorityRequirement,
         venue: u8,
         nonce: u64,
-        last_check_slot: u64,
+        last_check_ts: i64,
     ) -> Vec<u8> {
         let state = GuardState {
             venue,
@@ -984,13 +1700,21 @@ mod tests {
             entry: 50_000_000,
             current_price: 50_000_000,
             nonce,
-            last_check_slot,
+            last_check_ts,
             pending: None,
             pending_ix: None,
             degraded: false,
             stale_streak: 0,
             drift_market_index: 0,
             drift_subaccount_id: 0,
+            daily_spent_usd: 0,
+            daily_epoch_start_ts: 0,
+            venue_size: 0,
+            venue_collateral: 0,
+            reconcile_ts: 0,
+            reconcile_nonce: 0,
+            reconcile_status: RECONCILE_NEVER,
+            margin_wallet_bump: 0,
         };
         let mut buf = vec![0u8; GUARD_DATA_LEN];
         state.write_into(&mut buf).unwrap();
@@ -1009,10 +1733,15 @@ mod tests {
     }
 
     /// A Pyth `PriceUpdateV2` account carrying `price6` in Wick's 6-decimal
-    /// scale, published fresh and with zero confidence, owned by the Pyth
+    /// scale, published at `publish_ts` with zero confidence, owned by the Pyth
     /// receiver program. Mirrors the golden layout in `pyth::tests`.
     /// With expo=-8, raw * 10^(expo+6) = raw * 10^-2 == price6 ⇒ raw = price6*100.
-    fn pyth_price_account(price6: u128) -> TestAccount {
+    ///
+    /// `publish_ts` tracks the tick's clock rather than being pinned at 0:
+    /// `read_price_no_older_than` rejects anything older than
+    /// `PYTH_MAX_AGE_SECS`, so a fixture frozen at the unix epoch reads as
+    /// decades stale against any realistic timestamp.
+    fn pyth_price_account_at(price6: u128, publish_ts: i64) -> TestAccount {
         let mut data = vec![0u8; 200];
         data[..8].copy_from_slice(&crate::pyth::PRICE_UPDATE_V2_DISCRIMINATOR);
         data[40] = 1; // Full verification
@@ -1020,7 +1749,7 @@ mod tests {
         data[73..81].copy_from_slice(&((price6 * 100) as i64).to_le_bytes()); // raw (i64)
         data[81..89].copy_from_slice(&0u64.to_le_bytes()); // conf = 0
         data[89..93].copy_from_slice(&(-8i32).to_le_bytes()); // exponent
-        data[93..101].copy_from_slice(&0i64.to_le_bytes()); // publish_time (now=0 in unit clock)
+        data[93..101].copy_from_slice(&publish_ts.to_le_bytes()); // publish_time
         TestAccount::new(
             Address::new_from_array([3u8; 32]), // mock address
             crate::pyth::PYTH_RECEIVER_PROGRAM_ID,
@@ -1033,9 +1762,17 @@ mod tests {
 
     /// A Clock sysvar account reporting `slot`. Address must be CLOCK_ID or
     /// `Clock::from_account_view` rejects it.
-    fn clock_account(slot: u64) -> TestAccount {
+    /// Clock sysvar: slot at 0, then epoch_start_timestamp, epoch,
+    /// leader_schedule_epoch, and `unix_timestamp` (i64) at 32.
+    ///
+    /// Both are driven off one axis so a test that means "10 units later" gets a
+    /// coherent clock. Tick freshness reads `unix_timestamp` (§8.1), so leaving
+    /// it at 0 while advancing only the slot would make every tick look
+    /// 56-years stale.
+    fn clock_account(ts: i64) -> TestAccount {
         let mut data = vec![0u8; 40];
-        data[0..8].copy_from_slice(&slot.to_le_bytes());
+        data[0..8].copy_from_slice(&(ts as u64).to_le_bytes());
+        data[32..40].copy_from_slice(&ts.to_le_bytes());
         TestAccount::new(
             CLOCK_ID,
             Address::new_from_array([0u8; 32]),
@@ -1347,7 +2084,7 @@ mod tests {
         // `NotEnoughAccountKeys` before doing any CPI work.
         let empty: [AccountView; 0] = [];
         let data = [4u8, 0]; // bump = 0
-        let result = delegation::process_delegate(&empty, &data[1..]);
+        let result = delegation::process_delegate(&PROGRAM_ID, &empty, &data[1..]);
         assert!(result.is_err());
     }
 
@@ -1449,13 +2186,15 @@ mod tests {
     /// from the Pyth oracle fixture, not the payload.
     fn run_tick(
         guard_acc: &TestAccount,
-        slot: u64,
+        ts: i64,
         price: u128,
         data: &[u8],
     ) -> Result<(), pinocchio::error::ProgramError> {
-        let clock = clock_account(slot);
+        let clock = clock_account(ts);
         let route_config = route_config_account();
-        let pyth = pyth_price_account(price);
+        // The oracle publishes at the tick's own timestamp — these tests are
+        // about tick freshness, not oracle staleness, which has its own tests.
+        let pyth = pyth_price_account_at(price, ts);
         let accounts = [guard_acc.view, clock.view, route_config.view, pyth.view];
         process_instruction(&PROGRAM_ID, &accounts, data)
     }
@@ -1474,7 +2213,7 @@ mod tests {
         assert!(state.pending.is_some());
         // ...and must NOT advance the nonce — only the owner's L1 confirm does.
         assert_eq!(state.nonce, 0);
-        assert_eq!(state.last_check_slot, 20);
+        assert_eq!(state.last_check_ts, 20);
         assert_eq!(state.current_price, 48_000_000);
         assert!(!state.degraded);
     }
@@ -1504,9 +2243,9 @@ mod tests {
         // Expected nonce is nonce+1 and is NOT committed until owner confirms.
         assert_eq!(px.expected_nonce, 1);
         assert_eq!(state.nonce, 0, "nonce must not advance on CoSigned build");
-        // The built data is the deterministic instantCreateTpsl payload.
-        // clock_account leaves unix_timestamp at 0.
-        let expected = build_tp_safety_net(55_000_000, 0).unwrap();
+        // The built data is the deterministic instantCreateTpsl payload, whose
+        // expiry is anchored to the tick's `unix_timestamp` (20 above).
+        let expected = build_tp_safety_net(55_000_000, 20).unwrap();
         assert_eq!(px.data, expected);
     }
 
@@ -1517,6 +2256,7 @@ mod tests {
         {
             let mut state = GuardState::from_bytes(&guard_data).unwrap();
             state.pending_ix = Some(PendingIx {
+                kind: PENDING_IX_JUPITER_TPSL,
                 expected_nonce: 43,
                 data: [7u8; PENDING_IX_DATA_LEN],
             });
@@ -1549,11 +2289,73 @@ mod tests {
     }
 
     #[test]
+    fn confirm_rejects_pending_with_no_owner_signed_instruction() {
+        // §8.4/§8.7 — only VENUE_JUPITER + TakeProfit builds a `pending_ix`. A
+        // CoSigned guard on any other venue records `pending` for the dashboard
+        // but has nothing for the owner to sign. Confirming must fail closed
+        // with a distinct error: committing the nonce here would mark the breach
+        // handled and disarm the guard against the next genuine one.
+        // venue 0 = no adapter (the frontend's VENUE_NONE); 3 = Drift.
+        for venue in [0u8, VENUE_DRIFT] {
+            let mut guard_data = make_guard(AuthorityRequirement::CoSigned, venue, 42, 0);
+            {
+                let mut state = GuardState::from_bytes(&guard_data).unwrap();
+                state.pending = Some(Action::TopUp { amount: 1_000 });
+                state.pending_ix = None;
+                state.write_into(&mut guard_data).unwrap();
+            }
+            let guard = TestAccount::new(PROGRAM_ID, PROGRAM_ID, 100, &guard_data, false, true);
+            let owner = TestAccount::new(
+                Address::new_from_array([9u8; 32]),
+                Address::new_from_array([0u8; 32]),
+                0,
+                &[],
+                true,
+                false,
+            );
+            let route_config = route_config_account();
+            let accounts = [guard.view, owner.view, route_config.view];
+            let result = process_instruction(&PROGRAM_ID, &accounts, &[9u8]);
+            assert_eq!(
+                result,
+                Err(WickError::ConfirmUnsupportedForVenue.into()),
+                "venue {venue} should reject confirm"
+            );
+
+            // Nonce and pending action both untouched — the guard stays armed.
+            let state = GuardState::from_bytes(guard.data()).unwrap();
+            assert_eq!(state.nonce, 42);
+            assert_eq!(state.pending, Some(Action::TopUp { amount: 1_000 }));
+        }
+    }
+
+    #[test]
+    fn confirm_with_nothing_pending_is_distinct_from_unsupported_venue() {
+        // Empty guard: no pending action at all. This is the "nothing to do"
+        // case and must stay distinguishable from the venue restriction above.
+        let guard_data = make_guard(AuthorityRequirement::CoSigned, VENUE_JUPITER, 42, 0);
+        let guard = TestAccount::new(PROGRAM_ID, PROGRAM_ID, 100, &guard_data, false, true);
+        let owner = TestAccount::new(
+            Address::new_from_array([9u8; 32]),
+            Address::new_from_array([0u8; 32]),
+            0,
+            &[],
+            true,
+            false,
+        );
+        let route_config = route_config_account();
+        let accounts = [guard.view, owner.view, route_config.view];
+        let result = process_instruction(&PROGRAM_ID, &accounts, &[9u8]);
+        assert_eq!(result, Err(WickError::NoPendingConfirm.into()));
+    }
+
+    #[test]
     fn confirm_rejects_non_owner() {
         let mut guard_data = make_guard(AuthorityRequirement::CoSigned, VENUE_JUPITER, 42, 0);
         {
             let mut state = GuardState::from_bytes(&guard_data).unwrap();
             state.pending_ix = Some(PendingIx {
+                kind: PENDING_IX_JUPITER_TPSL,
                 expected_nonce: 43,
                 data: [7u8; PENDING_IX_DATA_LEN],
             });
@@ -1586,6 +2388,7 @@ mod tests {
         {
             let mut state = GuardState::from_bytes(&guard_data).unwrap();
             state.pending_ix = Some(PendingIx {
+                kind: PENDING_IX_JUPITER_TPSL,
                 expected_nonce: 43,
                 data: [7u8; PENDING_IX_DATA_LEN],
             });
@@ -1636,7 +2439,7 @@ mod tests {
         let state = GuardState::from_bytes(guard.data()).unwrap();
         assert!(state.pending.is_none());
         assert_eq!(state.current_price, 55_000_000);
-        assert_eq!(state.last_check_slot, 20);
+        assert_eq!(state.last_check_ts, 20);
         assert_eq!(state.nonce, 0);
     }
 
@@ -1662,10 +2465,25 @@ mod tests {
         let guard_data = make_guard(AuthorityRequirement::CoSigned, 0, 0, 0);
         let guard = TestAccount::new(PROGRAM_ID, PROGRAM_ID, 100, &guard_data, false, true);
 
-        // Three stale ticks — each arrives >25 slots after the previous check
-        // (a glitching stream). First two do nothing, the third flips degraded.
-        for slot in [100u64, 130, 160] {
-            let result = run_tick(&guard, slot, 48_000_000, &tick_data(1, 0));
+        // A guard's first tick has nothing to measure against
+        // (`last_check_ts == 0`), so it anchors the clock rather than counting as
+        // stale. Without this the very first tick of every new guard would open a
+        // streak at 1. Priced healthy (55m, not the 48m breach used below) so the
+        // anchor itself has nothing to dispatch.
+        assert!(run_tick(&guard, 100, 55_000_000, &tick_data(1, 0)).is_ok());
+        assert_eq!(
+            GuardState::from_bytes(guard.data()).unwrap().stale_streak,
+            0
+        );
+        assert!(GuardState::from_bytes(guard.data())
+            .unwrap()
+            .pending
+            .is_none());
+
+        // Three stale ticks — each arrives >MAX_TICK_AGE_SECS after the previous
+        // check (a glitching stream). First two do nothing, the third degrades.
+        for ts in [130i64, 160, 190] {
+            let result = run_tick(&guard, ts, 48_000_000, &tick_data(1, 0));
             assert!(result.is_ok());
         }
         let state = GuardState::from_bytes(guard.data()).unwrap();
@@ -1674,9 +2492,9 @@ mod tests {
         // Stale ticks must never dispatch an action.
         assert!(state.pending.is_none());
 
-        // A tick arriving within 25 slots of the last check is fresh and
-        // clears the streak and the degraded flag (§8.1.3).
-        let result = run_tick(&guard, 165, 48_000_000, &tick_data(1, 0)); // 165 - 160 = 5 → fresh
+        // A tick arriving within MAX_TICK_AGE_SECS of the last check is fresh
+        // and clears the streak and the degraded flag (§8.1.3).
+        let result = run_tick(&guard, 195, 48_000_000, &tick_data(1, 0)); // 195 - 190 = 5s → fresh
         assert!(result.is_ok());
         let state = GuardState::from_bytes(guard.data()).unwrap();
         assert_eq!(state.stale_streak, 0);
@@ -1727,13 +2545,21 @@ mod tests {
             entry: 50_000_000,
             current_price: 49_000_000,
             nonce: 0,
-            last_check_slot: 0,
+            last_check_ts: 0,
             pending: None,
             pending_ix: None,
             degraded: false,
             stale_streak: 0,
             drift_market_index: 1,
             drift_subaccount_id: 0,
+            daily_spent_usd: 0,
+            daily_epoch_start_ts: 0,
+            venue_size: 0,
+            venue_collateral: 0,
+            reconcile_ts: 0,
+            reconcile_nonce: 0,
+            reconcile_status: RECONCILE_NEVER,
+            margin_wallet_bump: 0,
         };
         let mut guard_data = vec![0u8; GUARD_DATA_LEN];
         state.write_into(&mut guard_data).unwrap();
@@ -1764,7 +2590,7 @@ mod tests {
         let state = GuardState::from_bytes(guard.data()).unwrap();
         assert_eq!(state.nonce, 0);
         assert_eq!(
-            state.last_check_slot, 0,
+            state.last_check_ts, 0,
             "a rejected tick must not mutate guard state"
         );
 
@@ -1909,10 +2735,7 @@ mod tests {
         assert_eq!(result, Err(WickError::InvalidInstruction.into()));
         let state = GuardState::from_bytes(guard.data()).unwrap();
         assert_eq!(state.nonce, 0);
-        assert_eq!(
-            state.last_check_slot, 0,
-            "no state mutated by rejected tick"
-        );
+        assert_eq!(state.last_check_ts, 0, "no state mutated by rejected tick");
     }
 
     #[test]
@@ -1990,5 +2813,1529 @@ mod tests {
         let accounts = [guard.view, stranger.view, route_config.view];
         let result = process_instruction(&PROGRAM_ID, &accounts, &data);
         assert_eq!(result, Err(WickError::SignerKeyMismatch.into()));
+    }
+
+    // ------------------------------------------------------------------
+    //  Post-execution position accounting
+    // ------------------------------------------------------------------
+
+    /// A guard that believes it still holds the pre-reduce size re-solves
+    /// against the original notional every tick and walks the whole position
+    /// out of the venue a slice at a time. The reduce must be reflected.
+    #[test]
+    fn executed_partial_close_shrinks_size_by_fraction() {
+        let mut state = GuardState::from_bytes(&make_guard(
+            AuthorityRequirement::Autonomous,
+            VENUE_DRIFT,
+            0,
+            0,
+        ))
+        .unwrap();
+        state.size = 100_000_000;
+        apply_executed_reduce(
+            &mut state,
+            Action::PartialClose {
+                fraction_bps: 3_000,
+            },
+        );
+        // Same arithmetic the venue adapter used: 100_000_000 * 3000 / 10_000.
+        assert_eq!(state.size, 70_000_000);
+    }
+
+    /// Shorts carry a negative size; the reduce shrinks magnitude and must not
+    /// flip the sign — a sign flip would have the guard buying to "reduce".
+    #[test]
+    fn executed_partial_close_preserves_short_sign() {
+        let mut state = GuardState::from_bytes(&make_guard(
+            AuthorityRequirement::Autonomous,
+            VENUE_DRIFT,
+            0,
+            0,
+        ))
+        .unwrap();
+        state.size = -100_000_000;
+        apply_executed_reduce(
+            &mut state,
+            Action::PartialClose {
+                fraction_bps: 2_500,
+            },
+        );
+        assert_eq!(state.size, -75_000_000);
+    }
+
+    /// `execute_drift_autonomous` sends `fraction_bps = 10_000` for a
+    /// TakeProfit, so the whole watched position leaves the venue.
+    #[test]
+    fn executed_take_profit_zeroes_size() {
+        let mut state = GuardState::from_bytes(&make_guard(
+            AuthorityRequirement::Autonomous,
+            VENUE_DRIFT,
+            0,
+            0,
+        ))
+        .unwrap();
+        state.size = -100_000_000;
+        apply_executed_reduce(&mut state, Action::TakeProfit);
+        assert_eq!(state.size, 0);
+    }
+
+    /// The residual must round *up*, never down: the venue floors the reduce to
+    /// whole base units, so modelling a smaller residual than the venue holds
+    /// would leave real exposure the guard no longer watches.
+    #[test]
+    fn executed_partial_close_rounds_residual_in_guards_favour() {
+        let mut state = GuardState::from_bytes(&make_guard(
+            AuthorityRequirement::Autonomous,
+            VENUE_DRIFT,
+            0,
+            0,
+        ))
+        .unwrap();
+        state.size = 7;
+        // 7 * 3333 / 10_000 = 2 (floored) — the venue reduced 2, leaving 5.
+        apply_executed_reduce(
+            &mut state,
+            Action::PartialClose {
+                fraction_bps: 3_333,
+            },
+        );
+        assert_eq!(state.size, 5);
+    }
+
+    /// Neither action can reach the venue (`execute_drift_autonomous` rejects
+    /// them), so neither may move the guard's model of the position.
+    #[test]
+    fn top_up_and_escalate_leave_size_untouched() {
+        let mut state = GuardState::from_bytes(&make_guard(
+            AuthorityRequirement::Autonomous,
+            VENUE_DRIFT,
+            0,
+            0,
+        ))
+        .unwrap();
+        state.size = 100_000_000;
+        apply_executed_reduce(&mut state, Action::TopUp { amount: 1_000 });
+        assert_eq!(state.size, 100_000_000);
+        apply_executed_reduce(&mut state, Action::EscalateManualReview);
+        assert_eq!(state.size, 100_000_000);
+    }
+
+    // ------------------------------------------------------------------
+    //  CloseGuard
+    // ------------------------------------------------------------------
+
+    /// Build a guard account at its real PDA so `close_guard`'s re-derivation
+    /// can succeed. Returns the account plus the bump the caller must pass.
+    fn guard_at_pda(owner: Address, lamports: u64) -> (TestAccount, u8) {
+        let owner_key = owner.to_bytes();
+        let (pda, bump) = Address::find_program_address(&[GUARD_SEED, &owner_key], &PROGRAM_ID);
+        let data = sample_guard(owner);
+        (
+            TestAccount::new(pda, PROGRAM_ID, lamports, &data, false, true),
+            bump,
+        )
+    }
+
+    #[test]
+    fn close_guard_refunds_rent_and_frees_the_account() {
+        let owner = addr(9);
+        let (guard, bump) = guard_at_pda(owner, 2_000_000);
+        let owner_acc = TestAccount::new(
+            owner,
+            Address::new_from_array([0u8; 32]),
+            500,
+            &[],
+            true,
+            true,
+        );
+
+        let accounts = [guard.view, owner_acc.view];
+        let result = process_instruction(&PROGRAM_ID, &accounts, &[11u8, bump]);
+        assert!(result.is_ok());
+
+        // Rent moved to the owner, and the account is emptied so the PDA is
+        // free for a fresh `InitGuard`.
+        assert_eq!(guard.view.lamports(), 0);
+        assert_eq!(owner_acc.view.lamports(), 2_000_500);
+        assert_eq!(guard.view.data_len(), 0);
+    }
+
+    /// The whole point of the instruction is to recover an account that no
+    /// longer decodes, so it must not decode the account to authorize itself.
+    #[test]
+    fn close_guard_recovers_an_undecodable_guard() {
+        let owner = addr(9);
+        let owner_key = owner.to_bytes();
+        let (pda, bump) = Address::find_program_address(&[GUARD_SEED, &owner_key], &PROGRAM_ID);
+        // Right length, garbage version badge — `GuardState::from_bytes` fails.
+        let mut junk = vec![0xABu8; GUARD_DATA_LEN];
+        junk[0] = 0xFF;
+        assert!(GuardState::from_bytes(&junk).is_err());
+
+        let guard = TestAccount::new(pda, PROGRAM_ID, 2_000_000, &junk, false, true);
+        let owner_acc = TestAccount::new(
+            owner,
+            Address::new_from_array([0u8; 32]),
+            0,
+            &[],
+            true,
+            true,
+        );
+        let accounts = [guard.view, owner_acc.view];
+        assert!(process_instruction(&PROGRAM_ID, &accounts, &[11u8, bump]).is_ok());
+        assert_eq!(owner_acc.view.lamports(), 2_000_000);
+    }
+
+    /// A stranger's key derives a different PDA, so the re-derivation is what
+    /// stops them draining someone else's rent.
+    #[test]
+    fn close_guard_rejects_a_stranger() {
+        let owner = addr(9);
+        let (guard, bump) = guard_at_pda(owner, 2_000_000);
+        let stranger = TestAccount::new(
+            addr(42),
+            Address::new_from_array([0u8; 32]),
+            0,
+            &[],
+            true,
+            true,
+        );
+
+        let accounts = [guard.view, stranger.view];
+        let result = process_instruction(&PROGRAM_ID, &accounts, &[11u8, bump]);
+        assert_eq!(result, Err(WickError::InvalidPda.into()));
+        assert_eq!(guard.view.lamports(), 2_000_000);
+    }
+
+    #[test]
+    fn close_guard_requires_owner_signature() {
+        let owner = addr(9);
+        let (guard, bump) = guard_at_pda(owner, 2_000_000);
+        // Correct key, but not a signer.
+        let owner_acc = TestAccount::new(
+            owner,
+            Address::new_from_array([0u8; 32]),
+            0,
+            &[],
+            false,
+            true,
+        );
+
+        let accounts = [guard.view, owner_acc.view];
+        let result = process_instruction(&PROGRAM_ID, &accounts, &[11u8, bump]);
+        assert_eq!(result, Err(WickError::MissingOwnerAuthority.into()));
+        assert_eq!(guard.view.lamports(), 2_000_000);
+    }
+
+    /// A delegated guard belongs to the Delegation Program. Closing it here
+    /// would try to spend from an account we no longer own.
+    #[test]
+    fn close_guard_rejects_a_guard_we_do_not_own() {
+        let owner = addr(9);
+        let owner_key = owner.to_bytes();
+        let (pda, bump) = Address::find_program_address(&[GUARD_SEED, &owner_key], &PROGRAM_ID);
+        let data = sample_guard(owner);
+        let guard = TestAccount::new(pda, addr(77), 2_000_000, &data, false, true);
+        let owner_acc = TestAccount::new(
+            owner,
+            Address::new_from_array([0u8; 32]),
+            0,
+            &[],
+            true,
+            true,
+        );
+
+        let accounts = [guard.view, owner_acc.view];
+        let result = process_instruction(&PROGRAM_ID, &accounts, &[11u8, bump]);
+        assert_eq!(result, Err(WickError::WrongAccountOwner.into()));
+        assert_eq!(guard.view.lamports(), 2_000_000);
+    }
+
+    /// A wrong bump derives a different address (or none at all); either way it
+    /// must not authorize a close.
+    #[test]
+    fn close_guard_rejects_a_wrong_bump() {
+        let owner = addr(9);
+        let (guard, bump) = guard_at_pda(owner, 2_000_000);
+        let owner_acc = TestAccount::new(
+            owner,
+            Address::new_from_array([0u8; 32]),
+            0,
+            &[],
+            true,
+            true,
+        );
+
+        let accounts = [guard.view, owner_acc.view];
+        let wrong = if bump == 0 { 1 } else { bump - 1 };
+        let result = process_instruction(&PROGRAM_ID, &accounts, &[11u8, wrong]);
+        assert_eq!(result, Err(WickError::InvalidPda.into()));
+        assert_eq!(guard.view.lamports(), 2_000_000);
+    }
+
+    // ------------------------------------------------------------------
+    //  SetRouteAuthority
+    // ------------------------------------------------------------------
+
+    /// A RouteConfig account whose authority is `authority`, optionally paused.
+    fn route_config_owned_by(authority: Address, paused: bool) -> TestAccount {
+        let cfg = RouteConfig {
+            authority: authority.to_bytes(),
+            paused,
+            _padding: [0u8; 31],
+        };
+        let mut data = vec![0u8; ROUTE_CONFIG_LEN];
+        cfg.write_into(&mut data).unwrap();
+        TestAccount::new(
+            Address::new_from_array([2u8; 32]),
+            PROGRAM_ID,
+            0,
+            &data,
+            false,
+            true,
+        )
+    }
+
+    fn signer_account(key: Address) -> TestAccount {
+        TestAccount::new(key, Address::new_from_array([0u8; 32]), 0, &[], true, false)
+    }
+
+    #[test]
+    fn set_route_authority_rotates_to_the_new_key() {
+        let current = addr(1);
+        let next = addr(2);
+        let config = route_config_owned_by(current, false);
+        let cur_acc = signer_account(current);
+        let new_acc = signer_account(next);
+
+        let accounts = [config.view, cur_acc.view, new_acc.view];
+        assert!(process_instruction(&PROGRAM_ID, &accounts, &[12u8]).is_ok());
+
+        let cfg = RouteConfig::from_bytes(config.data()).unwrap();
+        assert_eq!(cfg.authority, next.to_bytes());
+    }
+
+    /// Rotating during an incident must not un-pause the program.
+    #[test]
+    fn set_route_authority_preserves_the_paused_flag() {
+        let current = addr(1);
+        let next = addr(2);
+        let config = route_config_owned_by(current, true);
+        let cur_acc = signer_account(current);
+        let new_acc = signer_account(next);
+
+        let accounts = [config.view, cur_acc.view, new_acc.view];
+        assert!(process_instruction(&PROGRAM_ID, &accounts, &[12u8]).is_ok());
+
+        let cfg = RouteConfig::from_bytes(config.data()).unwrap();
+        assert_eq!(cfg.authority, next.to_bytes());
+        assert!(cfg.paused);
+    }
+
+    #[test]
+    fn set_route_authority_rejects_a_stranger() {
+        let current = addr(1);
+        let config = route_config_owned_by(current, false);
+        let impostor = signer_account(addr(42));
+        let new_acc = signer_account(addr(2));
+
+        let accounts = [config.view, impostor.view, new_acc.view];
+        let result = process_instruction(&PROGRAM_ID, &accounts, &[12u8]);
+        assert_eq!(result, Err(WickError::Unauthorized.into()));
+
+        let cfg = RouteConfig::from_bytes(config.data()).unwrap();
+        assert_eq!(cfg.authority, current.to_bytes());
+    }
+
+    /// Rotating a kill switch to an address nobody controls disables it
+    /// permanently, and a RouteConfig has no second address to fall back on.
+    #[test]
+    fn set_route_authority_requires_the_incoming_key_to_sign() {
+        let current = addr(1);
+        let config = route_config_owned_by(current, false);
+        let cur_acc = signer_account(current);
+        let unsigned_new = TestAccount::new(
+            addr(2),
+            Address::new_from_array([0u8; 32]),
+            0,
+            &[],
+            false, // does not sign
+            false,
+        );
+
+        let accounts = [config.view, cur_acc.view, unsigned_new.view];
+        let result = process_instruction(&PROGRAM_ID, &accounts, &[12u8]);
+        assert_eq!(result, Err(WickError::Unauthorized.into()));
+
+        let cfg = RouteConfig::from_bytes(config.data()).unwrap();
+        assert_eq!(cfg.authority, current.to_bytes());
+    }
+
+    #[test]
+    fn set_route_authority_rejects_a_foreign_config_account() {
+        let current = addr(1);
+        let cfg = RouteConfig {
+            authority: current.to_bytes(),
+            paused: false,
+            _padding: [0u8; 31],
+        };
+        let mut data = vec![0u8; ROUTE_CONFIG_LEN];
+        cfg.write_into(&mut data).unwrap();
+        // Owned by someone else — an attacker-supplied lookalike.
+        let config = TestAccount::new(
+            Address::new_from_array([2u8; 32]),
+            addr(77),
+            0,
+            &data,
+            false,
+            true,
+        );
+        let cur_acc = signer_account(current);
+        let new_acc = signer_account(addr(2));
+
+        let accounts = [config.view, cur_acc.view, new_acc.view];
+        let result = process_instruction(&PROGRAM_ID, &accounts, &[12u8]);
+        assert_eq!(result, Err(WickError::WrongAccountOwner.into()));
+    }
+
+    /// The rotated-in key can pause; the rotated-out key can no longer.
+    #[test]
+    fn rotated_authority_controls_the_kill_switch() {
+        let current = addr(1);
+        let next = addr(2);
+        let config = route_config_owned_by(current, false);
+        let cur_acc = signer_account(current);
+        let new_acc = signer_account(next);
+
+        let accounts = [config.view, cur_acc.view, new_acc.view];
+        assert!(process_instruction(&PROGRAM_ID, &accounts, &[12u8]).is_ok());
+
+        // Old authority is now powerless.
+        let accounts = [config.view, cur_acc.view];
+        assert_eq!(
+            process_instruction(&PROGRAM_ID, &accounts, &[3u8, 1]),
+            Err(WickError::Unauthorized.into())
+        );
+
+        // New authority can pause.
+        let accounts = [config.view, new_acc.view];
+        assert!(process_instruction(&PROGRAM_ID, &accounts, &[3u8, 1]).is_ok());
+        assert!(RouteConfig::from_bytes(config.data()).unwrap().paused);
+    }
+
+    // ------------------------------------------------------------------
+    //  §8.3 Venue reconciliation
+    // ------------------------------------------------------------------
+
+    use crate::account::RECONCILE_CONVERGED;
+    use crate::drift::{synthetic_user, DRIFT_PROGRAM_ID};
+
+    const VENUE_OWNER: [u8; 32] = [9u8; 32];
+
+    /// An autonomous Drift guard modelling a 0.1-unit long on market 0.
+    fn drift_guard_state() -> GuardState {
+        GuardState {
+            venue: VENUE_DRIFT,
+            venue_owner: VENUE_OWNER,
+            co_authority: [5u8; 32],
+            authority_req: AuthorityRequirement::Autonomous,
+            policy: VenuePolicy {
+                maintenance_bps: 500,
+                trigger_buffer_bps: 500,
+                fee_bps: 10,
+                authority: AuthorityRequirement::Autonomous,
+                caps: ActionCaps {
+                    top_up_usd_per_action: u128::MAX,
+                    partial_close_usd_per_action: u128::MAX,
+                    daily_total_usd: u128::MAX,
+                },
+                take_profit: None,
+            },
+            collateral: 100_000_000,
+            size: 100_000_000,
+            entry: 50_000_000,
+            current_price: 50_000_000,
+            nonce: 0,
+            last_check_ts: 0,
+            pending: None,
+            pending_ix: None,
+            degraded: false,
+            stale_streak: 0,
+            drift_market_index: 0,
+            drift_subaccount_id: 0,
+            daily_spent_usd: 0,
+            daily_epoch_start_ts: 0,
+            venue_size: 0,
+            venue_collateral: 0,
+            reconcile_ts: 0,
+            reconcile_nonce: 0,
+            reconcile_status: RECONCILE_NEVER,
+            margin_wallet_bump: 0,
+        }
+    }
+
+    fn guard_account_for(state: &GuardState) -> TestAccount {
+        let mut buf = vec![0u8; GUARD_DATA_LEN];
+        state.write_into(&mut buf).unwrap();
+        TestAccount::new(PROGRAM_ID, PROGRAM_ID, 100, &buf, false, true)
+    }
+
+    /// A Velocity `User` account at the PDA the guard re-derives, owned by the
+    /// venue program — i.e. the only account `verify_user_account` will accept.
+    fn venue_user_account(
+        subaccount: u16,
+        market_index: u16,
+        base: i64,
+        scaled: u64,
+    ) -> TestAccount {
+        let (pda, _bump) = Address::find_program_address(
+            &[b"user", &VENUE_OWNER, &subaccount.to_le_bytes()],
+            &DRIFT_PROGRAM_ID,
+        );
+        let data = synthetic_user(market_index, base, scaled);
+        TestAccount::new(pda, DRIFT_PROGRAM_ID, 0, &data, false, false)
+    }
+
+    /// `ReconcileVenue` payload: [13, nonce:8].
+    fn reconcile_data(nonce: u64) -> [u8; 9] {
+        let mut d = [0u8; 9];
+        d[0] = 13;
+        d[1..9].copy_from_slice(&nonce.to_le_bytes());
+        d
+    }
+
+    fn run_reconcile(
+        guard: &TestAccount,
+        venue: &TestAccount,
+        ts: i64,
+        nonce: u64,
+    ) -> Result<(), pinocchio::error::ProgramError> {
+        let clock = clock_account(ts);
+        let route_config = route_config_account();
+        let accounts = [guard.view, clock.view, route_config.view, venue.view];
+        process_instruction(&PROGRAM_ID, &accounts, &reconcile_data(nonce))
+    }
+
+    #[test]
+    fn reconcile_records_the_venues_own_numbers() {
+        let guard = guard_account_for(&drift_guard_state());
+        // Venue agrees exactly; 1e15 scaled balance = 1e12 in the guard's 6dp.
+        let venue = venue_user_account(0, 0, 100_000_000, 1_000_000_000_000_000);
+
+        assert!(run_reconcile(&guard, &venue, 1_700_000_000, 1).is_ok());
+
+        let state = GuardState::from_bytes(guard.data()).unwrap();
+        assert_eq!(state.reconcile_status, RECONCILE_CONVERGED);
+        assert_eq!(state.venue_size, 100_000_000);
+        assert_eq!(state.venue_collateral, 1_000_000_000_000);
+        assert_eq!(state.reconcile_ts, 1_700_000_000);
+        assert_eq!(state.reconcile_nonce, 1);
+        // Reconciliation observes; it never edits the model or moves value.
+        assert_eq!(state.size, 100_000_000);
+        assert_eq!(state.collateral, 100_000_000);
+        assert!(state.pending.is_none());
+    }
+
+    /// Inside `RECONCILE_TOLERANCE_BPS` (25 bps) the guard stays armed — funding
+    /// and fill dust must not disarm it.
+    #[test]
+    fn reconcile_absorbs_dust_sized_disagreement() {
+        let guard = guard_account_for(&drift_guard_state());
+        // 10 bps under the model: 100_000_000 → 99_900_000.
+        let venue = venue_user_account(0, 0, 99_900_000, 0);
+        assert!(run_reconcile(&guard, &venue, 1_700_000_000, 1).is_ok());
+        assert_eq!(
+            GuardState::from_bytes(guard.data())
+                .unwrap()
+                .reconcile_status,
+            RECONCILE_CONVERGED
+        );
+    }
+
+    /// The load-bearing test for §8.3: a divergence must be **recorded**, not
+    /// raised. Returning an error would roll back the very write that disarms
+    /// the guard, leaving it armed on a model the venue has contradicted.
+    #[test]
+    fn reconcile_records_divergence_rather_than_raising_it() {
+        let guard = guard_account_for(&drift_guard_state());
+        let venue = venue_user_account(0, 0, 50_000_000, 0); // half the model
+
+        let result = run_reconcile(&guard, &venue, 1_700_000_000, 1);
+        assert!(result.is_ok(), "a diverged verdict must commit, not error");
+
+        let state = GuardState::from_bytes(guard.data()).unwrap();
+        assert_eq!(state.reconcile_status, RECONCILE_DIVERGED);
+        assert_eq!(state.venue_size, 50_000_000);
+    }
+
+    /// The owner closed at the venue behind the guard's back. Flat-vs-exposed
+    /// has no ratio to test, so it is divergence by construction.
+    #[test]
+    fn reconcile_notices_a_position_closed_at_the_venue() {
+        let guard = guard_account_for(&drift_guard_state());
+        let venue = venue_user_account(0, 0, 0, 0);
+        assert!(run_reconcile(&guard, &venue, 1_700_000_000, 1).is_ok());
+
+        let state = GuardState::from_bytes(guard.data()).unwrap();
+        assert_eq!(state.reconcile_status, RECONCILE_DIVERGED);
+        assert_eq!(state.venue_size, 0);
+    }
+
+    /// `ReconcileVenue` is permissionless, so a replayed transaction is free to
+    /// send. Without a strictly-increasing nonce it would re-apply an old
+    /// snapshot over a newer one — including re-arming a guard that has since
+    /// diverged.
+    #[test]
+    fn reconcile_rejects_a_replayed_or_stale_nonce() {
+        let guard = guard_account_for(&drift_guard_state());
+        let venue = venue_user_account(0, 0, 100_000_000, 0);
+
+        assert!(run_reconcile(&guard, &venue, 1_700_000_000, 5).is_ok());
+        // Same nonce again — the literal replay.
+        assert_eq!(
+            run_reconcile(&guard, &venue, 1_700_000_100, 5),
+            Err(WickError::ReconcileStale.into())
+        );
+        // And anything behind it.
+        assert_eq!(
+            run_reconcile(&guard, &venue, 1_700_000_100, 4),
+            Err(WickError::ReconcileStale.into())
+        );
+        // The stored observation is the one from nonce 5, untouched.
+        let state = GuardState::from_bytes(guard.data()).unwrap();
+        assert_eq!(state.reconcile_nonce, 5);
+        assert_eq!(state.reconcile_ts, 1_700_000_000);
+    }
+
+    /// security: the position account is attacker-supplied. Bytes that decode
+    /// are not enough — the account must be *owned by the venue program*, or a
+    /// caller could hand the guard a look-alike they wrote themselves and have
+    /// a fabricated position adopted as ground truth.
+    #[test]
+    fn reconcile_rejects_a_venue_account_the_venue_does_not_own() {
+        let guard = guard_account_for(&drift_guard_state());
+        let (pda, _) = Address::find_program_address(
+            &[b"user", &VENUE_OWNER, &0u16.to_le_bytes()],
+            &DRIFT_PROGRAM_ID,
+        );
+        // Right address, right bytes — wrong owner.
+        let data = synthetic_user(0, 1, 0);
+        let forged = TestAccount::new(pda, addr(66), 0, &data, false, false);
+
+        assert_eq!(
+            run_reconcile(&guard, &forged, 1_700_000_000, 1),
+            Err(WickError::VenueAccountMismatch.into())
+        );
+        let state = GuardState::from_bytes(guard.data()).unwrap();
+        assert_eq!(state.reconcile_status, RECONCILE_NEVER);
+        assert_eq!(state.reconcile_nonce, 0);
+    }
+
+    /// The other half of the check: a genuine venue account belonging to a
+    /// *different* sub-account than the one this guard watches.
+    #[test]
+    fn reconcile_rejects_a_different_subaccount() {
+        let guard = guard_account_for(&drift_guard_state()); // watches sub 0
+        let venue = venue_user_account(7, 0, 100_000_000, 0);
+        assert_eq!(
+            run_reconcile(&guard, &venue, 1_700_000_000, 1),
+            Err(WickError::VenueAccountMismatch.into())
+        );
+    }
+
+    /// A guard on a co-signed venue has no position account the program can
+    /// decode. Admitting that beats guessing at one.
+    #[test]
+    fn reconcile_rejects_a_non_drift_venue() {
+        let mut state = drift_guard_state();
+        state.venue = VENUE_JUPITER;
+        let guard = guard_account_for(&state);
+        let venue = venue_user_account(0, 0, 100_000_000, 0);
+        assert_eq!(
+            run_reconcile(&guard, &venue, 1_700_000_000, 1),
+            Err(WickError::UnsupportedVenueAction.into())
+        );
+    }
+
+    #[test]
+    fn reconcile_requires_the_venue_account_and_an_exact_payload() {
+        let guard = guard_account_for(&drift_guard_state());
+        let clock = clock_account(1_700_000_000);
+        let route_config = route_config_account();
+
+        // Venue account omitted entirely.
+        let short = [guard.view, clock.view, route_config.view];
+        assert_eq!(
+            process_instruction(&PROGRAM_ID, &short, &reconcile_data(1)),
+            Err(WickError::InvalidInstruction.into())
+        );
+
+        // Truncated nonce.
+        let venue = venue_user_account(0, 0, 100_000_000, 0);
+        let accounts = [guard.view, clock.view, route_config.view, venue.view];
+        assert_eq!(
+            process_instruction(&PROGRAM_ID, &accounts, &[13u8, 1, 0, 0]),
+            Err(WickError::InvalidInstruction.into())
+        );
+        // Trailing junk is rejected too — a payload the program does not fully
+        // understand is a payload it must not act on.
+        assert_eq!(
+            process_instruction(&PROGRAM_ID, &accounts, &[13u8, 1, 0, 0, 0, 0, 0, 0, 0, 0]),
+            Err(WickError::InvalidInstruction.into())
+        );
+    }
+
+    #[test]
+    fn reconcile_is_refused_while_paused() {
+        let guard = guard_account_for(&drift_guard_state());
+        let venue = venue_user_account(0, 0, 100_000_000, 0);
+        let clock = clock_account(1_700_000_000);
+        let paused = route_config_owned_by(addr(1), true);
+        let accounts = [guard.view, clock.view, paused.view, venue.view];
+        assert_eq!(
+            process_instruction(&PROGRAM_ID, &accounts, &reconcile_data(1)),
+            Err(WickError::Paused.into())
+        );
+    }
+
+    // ------------------------------------------------------------------
+    //  §8.3.4 A diverged model disarms autonomous execution
+    // ------------------------------------------------------------------
+
+    /// Every autonomous order is sized *from* `state.size`. Once the venue has
+    /// contradicted that number the guard must stop trading it: too small and
+    /// the breach is not cleared, too large and a reduce that should trim the
+    /// position closes it outright.
+    ///
+    /// The distinguishing signal is the error, not the pending action. With no
+    /// venue adapter accounts supplied, a *converged* guard reaches
+    /// `execute_autonomous` and fails hard (`InvalidInstruction`, as
+    /// `tick_drift_missing_venue_accounts_rejected` pins); a diverged one never
+    /// gets there and returns `Ok` with an escalation. Same fixture, opposite
+    /// outcome — so this test cannot pass for the wrong reason.
+    #[test]
+    fn diverged_guard_escalates_instead_of_executing() {
+        let mut state = drift_guard_state();
+        state.reconcile_status = RECONCILE_DIVERGED;
+        state.policy.take_profit = Some(49_000_000);
+        let guard = guard_account_for(&state);
+
+        let result = run_tick(&guard, 20, 49_000_000, &tick_data(1, 0));
+        assert!(
+            result.is_ok(),
+            "diverged tick must not fail the transaction"
+        );
+
+        let after = GuardState::from_bytes(guard.data()).unwrap();
+        assert_eq!(after.pending, Some(Action::EscalateManualReview));
+        // Nonce uncommitted, so the guard re-arms the moment the model is fixed.
+        assert_eq!(after.nonce, 0);
+        assert_eq!(after.daily_spent_usd, 0);
+        // Health still updates — a disarmed guard is not a blind one.
+        assert_eq!(after.current_price, 49_000_000);
+        assert_eq!(after.last_check_ts, 20);
+    }
+
+    #[test]
+    fn converged_guard_still_reaches_the_venue_adapter() {
+        let mut state = drift_guard_state();
+        state.reconcile_status = RECONCILE_CONVERGED;
+        state.policy.take_profit = Some(49_000_000);
+        let guard = guard_account_for(&state);
+
+        // Same missing venue accounts as above, but the guard is armed: the
+        // adapter is reached and rejects. This is the control for the test above.
+        assert_eq!(
+            run_tick(&guard, 20, 49_000_000, &tick_data(1, 0)),
+            Err(WickError::InvalidInstruction.into())
+        );
+    }
+
+    /// An owner `UpdatePosition` is the documented way out of a diverged freeze:
+    /// it resets the verdict to `NeverReconciled` (never to `Converged` — the
+    /// owner asserting a number is not the venue agreeing to it).
+    #[test]
+    fn update_position_clears_a_diverged_freeze() {
+        let mut state = drift_guard_state();
+        state.reconcile_status = RECONCILE_DIVERGED;
+        state.venue_size = 50_000_000;
+        state.reconcile_ts = 1_700_000_000;
+        let guard = guard_account_for(&state);
+
+        let mut data = vec![8u8];
+        data.extend_from_slice(&100_000_000u128.to_le_bytes());
+        data.extend_from_slice(&50_000_000i128.to_le_bytes());
+        data.extend_from_slice(&50_000_000u128.to_le_bytes());
+        let owner_acc = signer_account(Address::from(VENUE_OWNER));
+        let route_config = route_config_account();
+        let accounts = [guard.view, owner_acc.view, route_config.view];
+        assert!(process_instruction(&PROGRAM_ID, &accounts, &data).is_ok());
+
+        let after = GuardState::from_bytes(guard.data()).unwrap();
+        assert_eq!(after.reconcile_status, RECONCILE_NEVER);
+        assert_eq!(after.size, 50_000_000);
+        // The observation itself survives — it is a timestamped fact, and the
+        // console renders it beside the stamp.
+        assert_eq!(after.venue_size, 50_000_000);
+        assert_eq!(after.reconcile_ts, 1_700_000_000);
+    }
+
+    // ------------------------------------------------------------------
+    //  §8.5 Margin wallet — a real, rent-backed, 2-of-2 lamport reserve
+    // ------------------------------------------------------------------
+    //
+    //  A note on what these tests can and cannot prove. Off-target, a CPI is a
+    //  no-op that returns `Ok` (`solana-instruction-view`'s
+    //  `invoke_signed_unchecked` compiles to a `black_box` when the target is
+    //  not Solana), so `CreateAccount` and `Transfer` move nothing here. These
+    //  tests therefore cover the parts that are this program's own logic —
+    //  derivation, authority, accounting, and the rent-backing invariant — with
+    //  the fixture standing in for the lamports the runtime would have moved.
+    //  `tests/margin_wallet.rs` runs the same flow against the real SBF VM,
+    //  where the transfers actually happen.
+
+    use pinocchio::sysvars::rent::{DEFAULT_LAMPORTS_PER_BYTE, RENT_ID};
+
+    /// `f64::to_le_bytes` of `2.0` — the current exemption threshold. Pinned as
+    /// bytes because the on-chain `Rent` avoids floating-point entirely.
+    const EXEMPTION_THRESHOLD_2_0: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 64];
+
+    /// The Rent sysvar. Address must be `RENT_ID` or `Rent::from_account_view`
+    /// rejects it. Layout: `lamports_per_byte` (u64) at 0, `exemption_threshold`
+    /// (f64 LE bytes) at 8.
+    fn rent_account() -> TestAccount {
+        let mut data = vec![0u8; 17];
+        data[0..8].copy_from_slice(&DEFAULT_LAMPORTS_PER_BYTE.to_le_bytes());
+        data[8..16].copy_from_slice(&EXEMPTION_THRESHOLD_2_0);
+        data[16] = 50; // burn_percent — present on the real sysvar, unread here
+        TestAccount::new(
+            RENT_ID,
+            Address::new_from_array([0u8; 32]),
+            0,
+            &data,
+            false,
+            false,
+        )
+    }
+
+    /// What the runtime would demand to keep an 81-byte account alive. Computed
+    /// from the same sysvar the program reads rather than restated as a literal.
+    fn wallet_rent_minimum() -> u64 {
+        2 * (128 + WALLET_DATA_LEN as u64) * DEFAULT_LAMPORTS_PER_BYTE
+    }
+
+    fn margin_pda() -> (Address, u8) {
+        Address::find_program_address(&[MARGIN_WALLET_SEED, &VENUE_OWNER], &PROGRAM_ID)
+    }
+
+    /// A margin wallet PDA holding `balance` lamports on the owner's behalf,
+    /// funded to exactly the invariant: rent minimum + balance.
+    fn wallet_account(balance: u128, extra_lamports: u64) -> TestAccount {
+        let (pda, _) = margin_pda();
+        let ws = WalletState {
+            owner: VENUE_OWNER,
+            co_authority: [5u8; 32],
+            balance,
+        };
+        let mut data = vec![0u8; WALLET_DATA_LEN];
+        ws.write_into(&mut data).unwrap();
+        let lamports = wallet_rent_minimum() + balance as u64 + extra_lamports;
+        TestAccount::new(pda, PROGRAM_ID, lamports, &data, false, true)
+    }
+
+    /// An uninitialized wallet at the right PDA: program-owned and correctly
+    /// sized (what `CreateAccount` leaves behind on-chain), zero lamports so
+    /// `init_margin_wallet` takes the create branch.
+    fn uninit_wallet_account() -> TestAccount {
+        let (pda, _) = margin_pda();
+        let data = vec![0u8; WALLET_DATA_LEN];
+        TestAccount::new(pda, PROGRAM_ID, 0, &data, false, true)
+    }
+
+    fn writable_signer(key: Address, lamports: u64) -> TestAccount {
+        TestAccount::new(
+            key,
+            Address::new_from_array([0u8; 32]),
+            lamports,
+            &[],
+            true,
+            true,
+        )
+    }
+
+    fn amount_data(disc: u8, amount: u128) -> Vec<u8> {
+        let mut d = vec![disc];
+        d.extend_from_slice(&amount.to_le_bytes());
+        d
+    }
+
+    #[test]
+    fn init_margin_wallet_links_the_reserve_to_the_guard() {
+        let (_, bump) = margin_pda();
+        let guard = guard_account_for(&drift_guard_state());
+        let wallet = uninit_wallet_account();
+        let owner = writable_signer(Address::from(VENUE_OWNER), 10 * wallet_rent_minimum());
+        let rent = rent_account();
+        let route_config = route_config_account();
+
+        let accounts = [
+            wallet.view,
+            guard.view,
+            owner.view,
+            owner.view,
+            rent.view,
+            route_config.view,
+        ];
+        assert!(process_instruction(&PROGRAM_ID, &accounts, &[14u8, bump]).is_ok());
+
+        // The guard now knows how to re-derive its reserve.
+        assert_eq!(
+            GuardState::from_bytes(guard.data())
+                .unwrap()
+                .margin_wallet_bump,
+            bump
+        );
+        // The wallet inherits the guard's own 2-of-2 pair, so the exit path
+        // cannot be widened by pointing a wallet at a friendlier co-authority.
+        let ws = WalletState::from_bytes(wallet.data()).unwrap();
+        assert_eq!(ws.owner, VENUE_OWNER);
+        assert_eq!(ws.co_authority, [5u8; 32]);
+        assert_eq!(ws.balance, 0);
+    }
+
+    /// Same trap `init_guard` guards against: the runtime only re-derives a PDA
+    /// during `CreateAccount`, which a funded account skips. Re-initializing a
+    /// live wallet would zero a `balance` the owner funded.
+    #[test]
+    fn init_margin_wallet_rejects_reinitialization() {
+        let (_, bump) = margin_pda();
+        let guard = guard_account_for(&drift_guard_state());
+        let wallet = wallet_account(5_000_000, 0); // already live and funded
+        let owner = writable_signer(Address::from(VENUE_OWNER), 10 * wallet_rent_minimum());
+        let rent = rent_account();
+        let route_config = route_config_account();
+
+        let accounts = [
+            wallet.view,
+            guard.view,
+            owner.view,
+            owner.view,
+            rent.view,
+            route_config.view,
+        ];
+        assert_eq!(
+            process_instruction(&PROGRAM_ID, &accounts, &[14u8, bump]),
+            Err(WickError::AlreadyInitialized.into())
+        );
+        // The funded balance survives the attempt.
+        assert_eq!(
+            WalletState::from_bytes(wallet.data()).unwrap().balance,
+            5_000_000
+        );
+    }
+
+    #[test]
+    fn init_margin_wallet_requires_the_guards_own_owner() {
+        let (_, bump) = margin_pda();
+        let guard = guard_account_for(&drift_guard_state());
+        let wallet = uninit_wallet_account();
+        let stranger = writable_signer(addr(77), 10 * wallet_rent_minimum());
+        let rent = rent_account();
+        let route_config = route_config_account();
+
+        let accounts = [
+            wallet.view,
+            guard.view,
+            stranger.view,
+            stranger.view,
+            rent.view,
+            route_config.view,
+        ];
+        assert_eq!(
+            process_instruction(&PROGRAM_ID, &accounts, &[14u8, bump]),
+            Err(WickError::SignerKeyMismatch.into())
+        );
+        assert_eq!(
+            GuardState::from_bytes(guard.data())
+                .unwrap()
+                .margin_wallet_bump,
+            0
+        );
+    }
+
+    /// Fixture note: the wallet is pre-funded to the post-transfer balance,
+    /// because the System CPI is a host no-op (see the section comment). What
+    /// this test pins is the accounting and the invariant check that follows it.
+    #[test]
+    fn fund_margin_wallet_credits_the_recorded_balance() {
+        let (_, bump) = margin_pda();
+        let mut gs = drift_guard_state();
+        gs.margin_wallet_bump = bump;
+        let guard = guard_account_for(&gs);
+        // Already holds 1_000_000; the 2_000_000 being funded is present too.
+        let wallet = wallet_account(1_000_000, 2_000_000);
+        let owner = writable_signer(Address::from(VENUE_OWNER), 10 * wallet_rent_minimum());
+        let rent = rent_account();
+        let route_config = route_config_account();
+
+        let accounts = [
+            wallet.view,
+            guard.view,
+            owner.view,
+            rent.view,
+            route_config.view,
+        ];
+        assert!(process_instruction(&PROGRAM_ID, &accounts, &amount_data(15, 2_000_000)).is_ok());
+
+        assert_eq!(
+            WalletState::from_bytes(wallet.data()).unwrap().balance,
+            3_000_000
+        );
+    }
+
+    /// The invariant is the whole point of §8.5: without it `balance` is just a
+    /// number again. Here the lamports never arrive (the CPI is a host no-op and
+    /// nothing pre-funds them), and the guard refuses to record value it cannot
+    /// see rather than book a credit against a transfer that did not land.
+    #[test]
+    fn fund_margin_wallet_refuses_an_unbacked_credit() {
+        let (_, bump) = margin_pda();
+        let mut gs = drift_guard_state();
+        gs.margin_wallet_bump = bump;
+        let guard = guard_account_for(&gs);
+        let wallet = wallet_account(0, 0); // exactly rent — no room for a credit
+        let owner = writable_signer(Address::from(VENUE_OWNER), 10 * wallet_rent_minimum());
+        let rent = rent_account();
+        let route_config = route_config_account();
+
+        let accounts = [
+            wallet.view,
+            guard.view,
+            owner.view,
+            rent.view,
+            route_config.view,
+        ];
+        assert_eq!(
+            process_instruction(&PROGRAM_ID, &accounts, &amount_data(15, 5_000_000)),
+            Err(WickError::InsufficientMarginWallet.into())
+        );
+    }
+
+    /// security: accepting a foreign wallet would let a guard credit itself from
+    /// value its owner does not control — or drain somebody else's reserve.
+    #[test]
+    fn fund_margin_wallet_rejects_a_wallet_it_cannot_re_derive() {
+        let (_, bump) = margin_pda();
+        let mut gs = drift_guard_state();
+        gs.margin_wallet_bump = bump;
+        let guard = guard_account_for(&gs);
+
+        // A well-formed, program-owned wallet — belonging to a different owner.
+        let (foreign_pda, _) =
+            Address::find_program_address(&[MARGIN_WALLET_SEED, &[3u8; 32]], &PROGRAM_ID);
+        let ws = WalletState {
+            owner: [3u8; 32],
+            co_authority: [5u8; 32],
+            balance: 9_000_000,
+        };
+        let mut data = vec![0u8; WALLET_DATA_LEN];
+        ws.write_into(&mut data).unwrap();
+        let foreign = TestAccount::new(foreign_pda, PROGRAM_ID, 50_000_000, &data, false, true);
+        let owner = writable_signer(Address::from(VENUE_OWNER), 10 * wallet_rent_minimum());
+        let rent = rent_account();
+        let route_config = route_config_account();
+
+        let accounts = [
+            foreign.view,
+            guard.view,
+            owner.view,
+            rent.view,
+            route_config.view,
+        ];
+        assert_eq!(
+            process_instruction(&PROGRAM_ID, &accounts, &amount_data(15, 1_000_000)),
+            Err(WickError::MarginWalletMismatch.into())
+        );
+        assert_eq!(
+            WalletState::from_bytes(foreign.data()).unwrap().balance,
+            9_000_000
+        );
+    }
+
+    /// A guard with no reserve linked has nothing to fund. Silently accepting
+    /// would write a wallet the guard cannot find again.
+    #[test]
+    fn fund_margin_wallet_rejects_an_unlinked_guard() {
+        let guard = guard_account_for(&drift_guard_state()); // bump == 0
+        let wallet = wallet_account(0, 5_000_000);
+        let owner = writable_signer(Address::from(VENUE_OWNER), 10 * wallet_rent_minimum());
+        let rent = rent_account();
+        let route_config = route_config_account();
+
+        let accounts = [
+            wallet.view,
+            guard.view,
+            owner.view,
+            rent.view,
+            route_config.view,
+        ];
+        assert_eq!(
+            process_instruction(&PROGRAM_ID, &accounts, &amount_data(15, 1_000_000)),
+            Err(WickError::MarginWalletMismatch.into())
+        );
+    }
+
+    /// The withdraw path moves lamports by direct mutation rather than a System
+    /// CPI (System will not debit an account this program owns), so unlike
+    /// funding it is fully exercised here — real lamports, real balances.
+    fn withdraw_accounts(
+        wallet: &TestAccount,
+        guard: &TestAccount,
+        owner: &TestAccount,
+        co: &TestAccount,
+        rent: &TestAccount,
+        route_config: &TestAccount,
+    ) -> [AccountView; 6] {
+        [
+            wallet.view,
+            guard.view,
+            owner.view,
+            co.view,
+            rent.view,
+            route_config.view,
+        ]
+    }
+
+    #[test]
+    fn withdraw_margin_wallet_moves_lamports_on_two_signatures() {
+        let (_, bump) = margin_pda();
+        let mut gs = drift_guard_state();
+        gs.margin_wallet_bump = bump;
+        let guard = guard_account_for(&gs);
+        let wallet = wallet_account(5_000_000, 0);
+        let owner = writable_signer(Address::from(VENUE_OWNER), 1_000);
+        let co = signer_account(addr(5));
+        let rent = rent_account();
+        let route_config = route_config_account();
+
+        let wallet_before = wallet.view.lamports();
+        let accounts = withdraw_accounts(&wallet, &guard, &owner, &co, &rent, &route_config);
+        assert!(process_instruction(&PROGRAM_ID, &accounts, &amount_data(16, 2_000_000)).is_ok());
+
+        assert_eq!(
+            WalletState::from_bytes(wallet.data()).unwrap().balance,
+            3_000_000
+        );
+        assert_eq!(wallet.view.lamports(), wallet_before - 2_000_000);
+        assert_eq!(owner.view.lamports(), 1_000 + 2_000_000);
+    }
+
+    /// §8.5 — value only leaves on two signatures. Either one alone is refused,
+    /// and a correct key with the signer flag unset is not a signature.
+    #[test]
+    fn withdraw_margin_wallet_requires_both_signatures() {
+        let (_, bump) = margin_pda();
+        let mut gs = drift_guard_state();
+        gs.margin_wallet_bump = bump;
+        let guard = guard_account_for(&gs);
+        let wallet = wallet_account(5_000_000, 0);
+        let rent = rent_account();
+        let route_config = route_config_account();
+        let owner = writable_signer(Address::from(VENUE_OWNER), 0);
+        let unsigned_co = TestAccount::new(
+            addr(5),
+            Address::new_from_array([0u8; 32]),
+            0,
+            &[],
+            false,
+            false,
+        );
+
+        let accounts =
+            withdraw_accounts(&wallet, &guard, &owner, &unsigned_co, &rent, &route_config);
+        assert_eq!(
+            process_instruction(&PROGRAM_ID, &accounts, &amount_data(16, 1)),
+            Err(WickError::MissingCoAuthority.into())
+        );
+
+        // Co-authority alone.
+        let unsigned_owner = TestAccount::new(
+            Address::from(VENUE_OWNER),
+            Address::new_from_array([0u8; 32]),
+            0,
+            &[],
+            false,
+            true,
+        );
+        let co = signer_account(addr(5));
+        let accounts =
+            withdraw_accounts(&wallet, &guard, &unsigned_owner, &co, &rent, &route_config);
+        assert_eq!(
+            process_instruction(&PROGRAM_ID, &accounts, &amount_data(16, 1)),
+            Err(WickError::MissingOwnerAuthority.into())
+        );
+
+        // A stranger holding a real signature is still a stranger.
+        let stranger = writable_signer(addr(88), 0);
+        let accounts = withdraw_accounts(&wallet, &guard, &stranger, &co, &rent, &route_config);
+        assert_eq!(
+            process_instruction(&PROGRAM_ID, &accounts, &amount_data(16, 1)),
+            Err(WickError::MissingOwnerAuthority.into())
+        );
+
+        // Nothing moved on any of the three attempts.
+        assert_eq!(
+            WalletState::from_bytes(wallet.data()).unwrap().balance,
+            5_000_000
+        );
+        assert_eq!(wallet.view.lamports(), wallet_rent_minimum() + 5_000_000);
+    }
+
+    #[test]
+    fn withdraw_margin_wallet_rejects_more_than_the_balance() {
+        let (_, bump) = margin_pda();
+        let mut gs = drift_guard_state();
+        gs.margin_wallet_bump = bump;
+        let guard = guard_account_for(&gs);
+        // Extra lamports sitting in the account are *not* withdrawable: they are
+        // not credited to the owner, and treating them as spendable would let a
+        // stray airdrop become someone's balance.
+        let wallet = wallet_account(1_000_000, 9_000_000);
+        let owner = writable_signer(Address::from(VENUE_OWNER), 0);
+        let co = signer_account(addr(5));
+        let rent = rent_account();
+        let route_config = route_config_account();
+
+        let accounts = withdraw_accounts(&wallet, &guard, &owner, &co, &rent, &route_config);
+        assert_eq!(
+            process_instruction(&PROGRAM_ID, &accounts, &amount_data(16, 1_000_001)),
+            Err(WickError::InsufficientMarginWallet.into())
+        );
+        assert_eq!(owner.view.lamports(), 0);
+    }
+
+    /// Draining the whole balance is legal and must leave the account rent-alive:
+    /// if rent did not survive, the runtime could reap the account and any future
+    /// `balance` with it.
+    #[test]
+    fn withdraw_margin_wallet_drains_to_exactly_rent() {
+        let (_, bump) = margin_pda();
+        let mut gs = drift_guard_state();
+        gs.margin_wallet_bump = bump;
+        let guard = guard_account_for(&gs);
+        let wallet = wallet_account(4_000_000, 0);
+        let owner = writable_signer(Address::from(VENUE_OWNER), 0);
+        let co = signer_account(addr(5));
+        let rent = rent_account();
+        let route_config = route_config_account();
+
+        let accounts = withdraw_accounts(&wallet, &guard, &owner, &co, &rent, &route_config);
+        assert!(process_instruction(&PROGRAM_ID, &accounts, &amount_data(16, 4_000_000)).is_ok());
+
+        assert_eq!(WalletState::from_bytes(wallet.data()).unwrap().balance, 0);
+        assert_eq!(wallet.view.lamports(), wallet_rent_minimum());
+        assert_eq!(owner.view.lamports(), 4_000_000);
+    }
+
+    /// A wallet whose recorded pair no longer matches the guard's is not this
+    /// guard's reserve, even if it re-derives: the 2-of-2 the value was placed
+    /// under must be the 2-of-2 that releases it.
+    #[test]
+    fn withdraw_margin_wallet_rejects_a_wallet_with_a_foreign_pair() {
+        let (pda, bump) = margin_pda();
+        let mut gs = drift_guard_state();
+        gs.margin_wallet_bump = bump;
+        let guard = guard_account_for(&gs);
+
+        let ws = WalletState {
+            owner: VENUE_OWNER,
+            co_authority: [1u8; 32], // not the guard's co_authority
+            balance: 5_000_000,
+        };
+        let mut data = vec![0u8; WALLET_DATA_LEN];
+        ws.write_into(&mut data).unwrap();
+        let wallet = TestAccount::new(
+            pda,
+            PROGRAM_ID,
+            wallet_rent_minimum() + 5_000_000,
+            &data,
+            false,
+            true,
+        );
+        let owner = writable_signer(Address::from(VENUE_OWNER), 0);
+        let co = signer_account(addr(5));
+        let rent = rent_account();
+        let route_config = route_config_account();
+
+        let accounts = withdraw_accounts(&wallet, &guard, &owner, &co, &rent, &route_config);
+        assert_eq!(
+            process_instruction(&PROGRAM_ID, &accounts, &amount_data(16, 1_000_000)),
+            Err(WickError::MarginWalletMismatch.into())
+        );
+        assert_eq!(owner.view.lamports(), 0);
+    }
+
+    #[test]
+    fn margin_wallet_instructions_are_refused_while_paused() {
+        let (_, bump) = margin_pda();
+        let mut gs = drift_guard_state();
+        gs.margin_wallet_bump = bump;
+        let guard = guard_account_for(&gs);
+        let wallet = wallet_account(5_000_000, 0);
+        let owner = writable_signer(Address::from(VENUE_OWNER), 0);
+        let co = signer_account(addr(5));
+        let rent = rent_account();
+        let paused = route_config_owned_by(addr(1), true);
+
+        let fund = [wallet.view, guard.view, owner.view, rent.view, paused.view];
+        assert_eq!(
+            process_instruction(&PROGRAM_ID, &fund, &amount_data(15, 1)),
+            Err(WickError::Paused.into())
+        );
+
+        let withdraw = withdraw_accounts(&wallet, &guard, &owner, &co, &rent, &paused);
+        assert_eq!(
+            process_instruction(&PROGRAM_ID, &withdraw, &amount_data(16, 1)),
+            Err(WickError::Paused.into())
+        );
+    }
+
+    /// Lamport amounts are carried as u128 on the wire for consistency with the
+    /// USD fields, but a lamport count is a u64 on-chain. An amount that cannot
+    /// narrow is rejected rather than wrapped into a different number.
+    #[test]
+    fn margin_wallet_rejects_an_unrepresentable_lamport_amount() {
+        let (_, bump) = margin_pda();
+        let mut gs = drift_guard_state();
+        gs.margin_wallet_bump = bump;
+        let guard = guard_account_for(&gs);
+        let wallet = wallet_account(0, 0);
+        let owner = writable_signer(Address::from(VENUE_OWNER), 0);
+        let rent = rent_account();
+        let route_config = route_config_account();
+
+        let accounts = [
+            wallet.view,
+            guard.view,
+            owner.view,
+            rent.view,
+            route_config.view,
+        ];
+        assert_eq!(
+            process_instruction(
+                &PROGRAM_ID,
+                &accounts,
+                &amount_data(15, u128::from(u64::MAX) + 1)
+            ),
+            Err(WickError::MathOverflow.into())
+        );
+    }
+
+    /// An autonomous top-up has no Drift adapter behind it (a deposit needs an
+    /// SPL transfer into the quote spot market against the vault and oracle —
+    /// accounts a tick does not carry), so it escalates to the owner instead of
+    /// crediting collateral the venue never received.
+    ///
+    /// Honest scope: the `margin_wallet_bump == 0` gate in `on_price_tick` and
+    /// the adapter's own refusal converge on the same outcome today, so this
+    /// pins the observable property — a top-up never silently no-ops, never
+    /// credits collateral, and never advances the nonce — in both reserve
+    /// states, rather than claiming to distinguish the two arms.
+    #[test]
+    fn autonomous_top_up_escalates_and_commits_nothing() {
+        let (_, bump) = margin_pda();
+        for reserve_bump in [0, bump] {
+            let mut gs = drift_guard_state();
+            gs.margin_wallet_bump = reserve_bump;
+            // Undercollateralized: 6% collateral against a 5% maintenance +
+            // 5% buffer requirement, with room to top up but not to close.
+            gs.collateral = 3_000_000;
+            gs.policy.caps.partial_close_usd_per_action = 0;
+            let guard = guard_account_for(&gs);
+
+            let result = run_tick(&guard, 20, 50_000_000, &tick_data(1, 0));
+            assert!(result.is_ok(), "reserve_bump={reserve_bump}: {result:?}");
+
+            let after = GuardState::from_bytes(guard.data()).unwrap();
+            assert_eq!(
+                after.pending,
+                Some(Action::EscalateManualReview),
+                "reserve_bump={reserve_bump}"
+            );
+            assert_eq!(
+                after.collateral, 3_000_000,
+                "collateral must not be credited"
+            );
+            assert_eq!(after.nonce, 0, "an escalation commits no nonce");
+            assert_eq!(after.daily_spent_usd, 0);
+            assert!(
+                after.pending_ix.is_none(),
+                "no signable ix on a Drift guard"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    //  §8.7 Jupiter defensive close — the co-signed answer to a breach
+    // ------------------------------------------------------------------
+
+    /// A breaching Jupiter guard whose only affordable action is a partial close.
+    ///
+    /// The numbers matter, so they are spelled out: notional is
+    /// `100 * $50 = $5,000`, maintenance at 500 bps is `$250`, and the fixture's
+    /// `$100` of collateral sits under it — a breach. Capping top-ups at zero
+    /// pushes §8.2's precedence past step 2 to the close solver, and `$100` is
+    /// deliberately well clear of the `$50` fee on a full close, so the solver
+    /// finds a real fraction instead of `CannotReachSafeBuffer` (which would
+    /// escalate and quietly build nothing to sign).
+    fn jupiter_breach_guard() -> GuardState {
+        let mut gs = drift_guard_state();
+        gs.venue = VENUE_JUPITER;
+        gs.authority_req = AuthorityRequirement::CoSigned;
+        gs.policy.authority = AuthorityRequirement::CoSigned;
+        gs.policy.caps.top_up_usd_per_action = 0; // no reserve to draw on
+        gs
+    }
+
+    /// The gap this closes: before it, a co-signed guard could only ever hand its
+    /// owner a take-profit — it was silent during the breach it exists to answer.
+    #[test]
+    fn jupiter_breach_builds_a_signable_defensive_close() {
+        let guard = guard_account_for(&jupiter_breach_guard());
+        let ts = 1_700_000_000;
+        assert!(run_tick(&guard, ts, 50_000_000, &tick_data(1, 0)).is_ok());
+
+        let after = GuardState::from_bytes(guard.data()).unwrap();
+        let px = after
+            .pending_ix
+            .expect("a breach must produce something to sign");
+        assert_eq!(px.kind, PENDING_IX_JUPITER_DEFENSIVE_CLOSE);
+        assert_eq!(px.expected_nonce, 1);
+        // §8.4 — the nonce is not committed until the owner signs.
+        assert_eq!(after.nonce, 0);
+        assert!(matches!(after.pending, Some(Action::PartialClose { .. })));
+
+        // The bytes are the ones `jupiter::build_defensive_close` produces for
+        // this position, not merely "some 50 bytes".
+        let Some(Action::PartialClose { fraction_bps }) = after.pending else {
+            unreachable!()
+        };
+        let notional = after.size.unsigned_abs() * after.current_price / SCALE;
+        let expected = build_defensive_close(
+            50_000_000,
+            notional * fraction_bps / BPS_DENOM,
+            false,
+            ts,
+            ts,
+            DEFENSIVE_CLOSE_TTL_SECS,
+        )
+        .unwrap();
+        assert_eq!(px.data, expected);
+    }
+
+    /// A long is protected by a stop *below* market, a short by one *above*.
+    /// Inverting this builds an order that fires the instant it lands, so the
+    /// flag is derived from the position's sign rather than taken on trust.
+    #[test]
+    fn defensive_close_direction_follows_the_position_sign() {
+        // Long.
+        let long = guard_account_for(&jupiter_breach_guard());
+        assert!(run_tick(&long, 1_700_000_000, 50_000_000, &tick_data(1, 0)).is_ok());
+        let long_px = GuardState::from_bytes(long.data())
+            .unwrap()
+            .pending_ix
+            .unwrap();
+        assert_eq!(long_px.data[8 + 24], 0, "a long's stop sits below market");
+
+        // Short, mirrored: entry above the mark so it is equally underwater.
+        let mut gs = jupiter_breach_guard();
+        gs.size = -100_000_000;
+        gs.entry = 50_000_000;
+        let short = guard_account_for(&gs);
+        assert!(run_tick(&short, 1_700_000_000, 50_000_000, &tick_data(1, 0)).is_ok());
+        let short_px = GuardState::from_bytes(short.data())
+            .unwrap()
+            .pending_ix
+            .unwrap();
+        assert_eq!(short_px.data[8 + 24], 1, "a short's stop sits above market");
+    }
+
+    /// The owner signs and lands the instruction at the venue; only then does the
+    /// guard's nonce advance and the notional charge against the daily budget.
+    #[test]
+    fn confirming_a_defensive_close_commits_the_nonce_and_charges_the_budget() {
+        let guard = guard_account_for(&jupiter_breach_guard());
+        assert!(run_tick(&guard, 1_700_000_000, 50_000_000, &tick_data(1, 0)).is_ok());
+
+        let owner = signer_account(Address::from(VENUE_OWNER));
+        let route_config = route_config_account();
+        let accounts = [guard.view, owner.view, route_config.view];
+        assert!(process_instruction(&PROGRAM_ID, &accounts, &[9u8]).is_ok());
+
+        let after = GuardState::from_bytes(guard.data()).unwrap();
+        assert_eq!(after.nonce, 1, "the owner's signature commits the nonce");
+        assert!(after.pending_ix.is_none());
+        assert!(after.pending.is_none());
+        assert!(
+            after.daily_spent_usd > 0,
+            "a confirmed close must spend against the daily cap, or a co-signed \
+             venue can be walked past its budget one signature at a time"
+        );
+    }
+
+    /// The budget is what stops a co-signed venue from being walked past its
+    /// daily allowance one owner signature at a time. A confirmed close spends,
+    /// and once spent the next breach gets an escalation rather than a second
+    /// instruction to sign.
+    ///
+    /// Which gate binds is worth stating plainly: §8.2's `select_action` refuses
+    /// first, so the guard builds nothing rather than building a stop the owner
+    /// would be rejected for signing. The `within_daily` check inside
+    /// `confirm_pending` is the backstop behind it, for a `pending_ix` whose
+    /// position grew via `UpdatePosition` after the build.
+    #[test]
+    fn a_confirmed_close_spends_the_budget_and_the_next_one_is_refused() {
+        let mut gs = jupiter_breach_guard();
+        // One close fits, two do not — the solver needs to shed more than half
+        // the position here, so `2 * closed_usd` exceeds the notional itself.
+        gs.policy.caps.daily_total_usd = 5_000_000_000;
+        let guard = guard_account_for(&gs);
+
+        assert!(run_tick(&guard, 1_700_000_000, 50_000_000, &tick_data(1, 0)).is_ok());
+        let built = GuardState::from_bytes(guard.data()).unwrap();
+        let Some(Action::PartialClose { fraction_bps }) = built.pending else {
+            panic!("expected a partial close, got {:?}", built.pending);
+        };
+        assert!(built.pending_ix.is_some());
+
+        let owner = signer_account(Address::from(VENUE_OWNER));
+        let route_config = route_config_account();
+        let accounts = [guard.view, owner.view, route_config.view];
+        assert!(process_instruction(&PROGRAM_ID, &accounts, &[9u8]).is_ok());
+
+        let spent = GuardState::from_bytes(guard.data())
+            .unwrap()
+            .daily_spent_usd;
+        let closed_usd = 5_000_000_000u128 * fraction_bps / BPS_DENOM;
+        assert_eq!(spent, closed_usd);
+        // Guards against a vacuous pass: if one close no longer exhausted most
+        // of the budget, the second tick below would be refused for no reason.
+        assert!(
+            spent.saturating_mul(2) > gs.policy.caps.daily_total_usd,
+            "fixture must leave room for one close but not two"
+        );
+
+        // Same breach, same guard, next tick — nothing left to spend. Within
+        // `MAX_TICK_AGE_SECS` of the first, or the tick is rejected as stale
+        // before selection is ever reached.
+        assert!(run_tick(&guard, 1_700_000_005, 50_000_000, &tick_data(2, 0)).is_ok());
+        let after = GuardState::from_bytes(guard.data()).unwrap();
+        assert_eq!(after.pending, Some(Action::EscalateManualReview));
+        assert!(
+            after.pending_ix.is_none(),
+            "an over-budget breach must not hand the owner a stop to sign"
+        );
+        assert_eq!(after.nonce, 1, "and it commits no nonce");
+        assert_eq!(after.daily_spent_usd, spent, "nor spends more");
     }
 }

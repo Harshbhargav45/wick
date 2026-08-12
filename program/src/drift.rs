@@ -205,6 +205,192 @@ impl<'a> DriftPlaceOrderAccounts<'a> {
     }
 }
 
+// -------------------------------------------------------------------------
+// Read-only position decoder (§8.3 reconciliation)
+// -------------------------------------------------------------------------
+
+/// Anchor account discriminator of Velocity's `User` — `sha256("account:User")[..8]`.
+/// Pinned against the real mainnet fixture in `tests/fixtures/` (see
+/// `tests/real_drift.rs`, which builds a byte-identical synthetic user).
+pub const USER_DISCRIMINATOR: [u8; 8] = [0x9f, 0x75, 0x5f, 0xe3, 0xef, 0x97, 0x3a, 0xec];
+
+/// Total `User` account size: 8-byte Anchor discriminator + 4488-byte struct.
+pub const USER_SIZE: usize = 4496;
+
+/// `User.perp_positions` — offset of the array, its element stride, and the
+/// number of slots. All three are pinned against the mainnet fixture; a wrong
+/// offset here would silently read a neighbouring field as a position size,
+/// which is exactly the class of error reconciliation exists to catch.
+const PERP_POSITIONS_OFFSET: usize = 424;
+const PERP_POSITION_STRIDE: usize = 80;
+const PERP_POSITION_COUNT: usize = 8;
+
+/// `PerpPosition` field offsets, relative to the position's own start.
+const PERP_BASE_ASSET_AMOUNT_OFF: usize = 8;
+const PERP_QUOTE_ASSET_AMOUNT_OFF: usize = 16;
+const PERP_MARKET_INDEX_OFF: usize = 76;
+
+/// `User.spot_positions` — the quote (collateral) side.
+const SPOT_POSITIONS_OFFSET: usize = 104;
+const SPOT_POSITION_STRIDE: usize = 40;
+const SPOT_POSITION_COUNT: usize = 8;
+const SPOT_SCALED_BALANCE_OFF: usize = 0;
+const SPOT_MARKET_INDEX_OFF: usize = 32;
+const SPOT_BALANCE_TYPE_OFF: usize = 34;
+/// `SpotBalanceType::Deposit`. A borrow (1) is negative collateral and is not
+/// counted as backing — treating it as a deposit would inflate the health math.
+const SPOT_BALANCE_TYPE_DEPOSIT: u8 = 0;
+/// Quote spot market index. Velocity, like Drift, pins the quote asset to 0.
+const QUOTE_SPOT_MARKET_INDEX: u16 = 0;
+
+/// Velocity's `SpotBalance` precision is 1e9 while the guard carries USD at
+/// 1e6 (`state::SCALE`). Deposits are scaled down by this factor; using the
+/// raw balance would report collateral a thousand times too large.
+const SPOT_BALANCE_TO_SCALE6_DIVISOR: u128 = 1_000;
+
+/// The venue's own view of a watched position, read from its account bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VenuePosition {
+    /// Signed base-asset amount: positive long, negative short.
+    pub size: i128,
+    /// Quote collateral backing the account, in the guard's 6dp USD scale.
+    pub collateral: u128,
+}
+
+/// Decode the watched `PerpPosition` and the quote collateral out of a
+/// Velocity `User` account.
+///
+/// This is deliberately a *read* of the venue's own bytes rather than a
+/// caller-supplied number — the same stance `on_price_tick` takes with the
+/// price. A keeper calling `ReconcileVenue` can choose *when* the guard looks
+/// at the venue, never *what it sees*.
+///
+/// A market the user holds no position in decodes as size 0, not an error: a
+/// position closed at the venue is a real and important observation, and it is
+/// precisely the divergence the guard needs to notice.
+pub fn read_user_position(data: &[u8], market_index: u16) -> Result<VenuePosition, WickError> {
+    if data.len() < USER_SIZE || data[..8] != USER_DISCRIMINATOR {
+        return Err(WickError::VenueAccountMismatch);
+    }
+
+    let mut size: i128 = 0;
+    for slot in 0..PERP_POSITION_COUNT {
+        let base = PERP_POSITIONS_OFFSET + slot * PERP_POSITION_STRIDE;
+        let idx = u16::from_le_bytes(
+            data[base + PERP_MARKET_INDEX_OFF..base + PERP_MARKET_INDEX_OFF + 2]
+                .try_into()
+                .map_err(|_| WickError::VenueAccountMismatch)?,
+        );
+        if idx != market_index {
+            continue;
+        }
+        let base_amt = i64::from_le_bytes(
+            data[base + PERP_BASE_ASSET_AMOUNT_OFF..base + PERP_BASE_ASSET_AMOUNT_OFF + 8]
+                .try_into()
+                .map_err(|_| WickError::VenueAccountMismatch)?,
+        );
+        // Velocity zeroes a closed position's `market_index` too, so slot 0 of
+        // an empty account looks like "market 0, size 0". That decodes to the
+        // honest answer — no exposure — so no extra emptiness test is needed.
+        let _quote = i64::from_le_bytes(
+            data[base + PERP_QUOTE_ASSET_AMOUNT_OFF..base + PERP_QUOTE_ASSET_AMOUNT_OFF + 8]
+                .try_into()
+                .map_err(|_| WickError::VenueAccountMismatch)?,
+        );
+        size = base_amt as i128;
+        break;
+    }
+
+    let mut collateral: u128 = 0;
+    for slot in 0..SPOT_POSITION_COUNT {
+        let base = SPOT_POSITIONS_OFFSET + slot * SPOT_POSITION_STRIDE;
+        let idx = u16::from_le_bytes(
+            data[base + SPOT_MARKET_INDEX_OFF..base + SPOT_MARKET_INDEX_OFF + 2]
+                .try_into()
+                .map_err(|_| WickError::VenueAccountMismatch)?,
+        );
+        if idx != QUOTE_SPOT_MARKET_INDEX
+            || data[base + SPOT_BALANCE_TYPE_OFF] != SPOT_BALANCE_TYPE_DEPOSIT
+        {
+            continue;
+        }
+        let scaled = u64::from_le_bytes(
+            data[base + SPOT_SCALED_BALANCE_OFF..base + SPOT_SCALED_BALANCE_OFF + 8]
+                .try_into()
+                .map_err(|_| WickError::VenueAccountMismatch)?,
+        );
+        collateral = (scaled as u128) / SPOT_BALANCE_TO_SCALE6_DIVISOR;
+        break;
+    }
+
+    Ok(VenuePosition { size, collateral })
+}
+
+/// Re-derive the Velocity user PDA the guard is delegated on and check that the
+/// supplied account really is it.
+///
+/// `ReconcileVenue` is permissionless, so the position account is
+/// attacker-supplied. Without this check a keeper could point the guard at any
+/// account whose bytes happen to decode, and the guard would adopt a fabricated
+/// position as ground truth. Both halves matter: the address must re-derive
+/// from *the guard's own* `venue_owner` and sub-account, and the account must
+/// be owned by the venue program so its contents are the venue's, not a
+/// look-alike the caller wrote themselves.
+pub fn verify_user_account(
+    account: &AccountView,
+    venue_owner: &[u8; 32],
+    subaccount_id: u16,
+) -> Result<(), WickError> {
+    if !account.owned_by(&DRIFT_PROGRAM_ID) {
+        return Err(WickError::VenueAccountMismatch);
+    }
+    let sub = subaccount_id.to_le_bytes();
+    // The canonical bump is not stored on the guard, so every bump is tried
+    // from the top down — `find_program_address` in reverse. In practice the
+    // first candidate matches; the loop exists so a non-canonical-but-valid
+    // sub-account cannot lock the guard out of reconciling.
+    for bump in (0u8..=255).rev() {
+        let Ok(candidate) = Address::create_program_address(
+            &[b"user", venue_owner, &sub, &[bump]],
+            &DRIFT_PROGRAM_ID,
+        ) else {
+            continue;
+        };
+        if account.address() == &candidate {
+            return Ok(());
+        }
+    }
+    Err(WickError::VenueAccountMismatch)
+}
+
+/// Build a `User` account body matching the real mainnet layout — the same
+/// construction `tests/real_drift.rs` uses against the live Velocity BPF,
+/// which is what pins these offsets to reality rather than to memory.
+///
+/// Lives outside the test module because `processor::tests` needs it too: the
+/// reconciliation handler's whole job is decoding these bytes, and giving it a
+/// second, hand-rolled fixture would let the two drift apart silently.
+#[cfg(test)]
+pub(crate) fn synthetic_user(
+    market_index: u16,
+    base_amount: i64,
+    scaled_balance: u64,
+) -> [u8; USER_SIZE] {
+    let mut data = [0u8; USER_SIZE];
+    data[..8].copy_from_slice(&USER_DISCRIMINATOR);
+    let sp = SPOT_POSITIONS_OFFSET;
+    data[sp..sp + 8].copy_from_slice(&scaled_balance.to_le_bytes());
+    data[sp + SPOT_MARKET_INDEX_OFF..sp + SPOT_MARKET_INDEX_OFF + 2]
+        .copy_from_slice(&0u16.to_le_bytes());
+    data[sp + SPOT_BALANCE_TYPE_OFF] = SPOT_BALANCE_TYPE_DEPOSIT;
+    let pp = PERP_POSITIONS_OFFSET;
+    data[pp + PERP_BASE_ASSET_AMOUNT_OFF..pp + PERP_BASE_ASSET_AMOUNT_OFF + 8]
+        .copy_from_slice(&base_amount.to_le_bytes());
+    data[pp + PERP_MARKET_INDEX_OFF..pp + PERP_MARKET_INDEX_OFF + 2]
+        .copy_from_slice(&market_index.to_le_bytes());
+    data
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,4 +460,83 @@ mod tests {
         // Fewer than 3 fixed accounts is rejected.
         assert!(DriftPlaceOrderAccounts::from_account_views(&[]).is_err());
     }
+
+    #[test]
+    fn reads_long_position_and_collateral() {
+        // 0.1 base asset long on market 0, 1e15 scaled balance = 1e12 in 6dp.
+        let data = synthetic_user(0, 100_000_000, 1_000_000_000_000_000);
+        let pos = read_user_position(&data, 0).unwrap();
+        assert_eq!(pos.size, 100_000_000);
+        assert_eq!(pos.collateral, 1_000_000_000_000);
+    }
+
+    #[test]
+    fn reads_short_position_as_negative() {
+        let data = synthetic_user(3, -250_000_000, 0);
+        let pos = read_user_position(&data, 3).unwrap();
+        assert_eq!(pos.size, -250_000_000);
+    }
+
+    /// A market the user is not in reads as flat. That is the observation that
+    /// makes "the owner closed at the venue" detectable at all.
+    #[test]
+    fn unheld_market_reads_flat() {
+        let data = synthetic_user(0, 100_000_000, 0);
+        let pos = read_user_position(&data, 9).unwrap();
+        assert_eq!(pos.size, 0);
+    }
+
+    #[test]
+    fn rejects_foreign_account_bytes() {
+        // Right size, wrong discriminator — someone else's account.
+        let mut data = [0u8; USER_SIZE];
+        data[..8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(
+            read_user_position(&data, 0).unwrap_err(),
+            WickError::VenueAccountMismatch
+        );
+        // Right discriminator, truncated body.
+        let mut short = [0u8; 128];
+        short[..8].copy_from_slice(&USER_DISCRIMINATOR);
+        assert_eq!(
+            read_user_position(&short, 0).unwrap_err(),
+            WickError::VenueAccountMismatch
+        );
+    }
+
+    /// A borrow is not collateral. Counting it as one would report negative
+    /// equity as positive backing.
+    #[test]
+    fn borrow_is_not_counted_as_collateral() {
+        let mut data = synthetic_user(0, 0, 5_000_000_000);
+        data[SPOT_POSITIONS_OFFSET + SPOT_BALANCE_TYPE_OFF] = 1; // Borrow
+        let pos = read_user_position(&data, 0).unwrap();
+        assert_eq!(pos.collateral, 0);
+    }
+
+    /// Offsets are pinned, not recomputed: this is the test that fails loudly
+    /// if someone "tidies" the constants.
+    #[test]
+    fn user_layout_offsets_are_pinned() {
+        assert_eq!(USER_SIZE, 4496);
+        assert_eq!(PERP_POSITIONS_OFFSET, 424);
+        assert_eq!(PERP_POSITION_STRIDE, 80);
+        assert_eq!(PERP_POSITION_MARKET_INDEX_OFF_CHECK, 76);
+        assert_eq!(SPOT_POSITIONS_OFFSET, 104);
+        assert_eq!(SPOT_POSITION_STRIDE, 40);
+        // The array must fit inside the account it is read from. In a `const`
+        // block so this is a compile error rather than a test failure: a
+        // position array that overruns the account is an out-of-bounds read on
+        // chain, and that should never get as far as being run.
+        const {
+            assert!(
+                PERP_POSITIONS_OFFSET + PERP_POSITION_COUNT * PERP_POSITION_STRIDE <= USER_SIZE
+            );
+            assert!(
+                SPOT_POSITIONS_OFFSET + SPOT_POSITION_COUNT * SPOT_POSITION_STRIDE <= USER_SIZE
+            );
+        }
+    }
+
+    const PERP_POSITION_MARKET_INDEX_OFF_CHECK: usize = PERP_MARKET_INDEX_OFF;
 }

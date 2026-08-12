@@ -41,6 +41,33 @@ pub enum WickError {
     /// A tick nonce that skips ahead of `state.nonce + 1` — rejects the
     /// cranker-DoS where a large nonce bakes every future tick as a replay.
     NonceOutOfOrder = 0x11,
+    /// The guard holds a pending action, but this venue/action pair produces no
+    /// owner-signed instruction for the owner to confirm. On `VENUE_JUPITER`,
+    /// `TakeProfit` and `PartialClose` both build one (§8.4/§8.7); a `TopUp` or
+    /// an escalation is advisory and must be resolved at the venue directly.
+    ConfirmUnsupportedForVenue = 0x12,
+    /// A `ReconcileVenue` whose nonce does not strictly exceed the stored one.
+    /// Reconciliation is permissionless, so a replayed transaction would
+    /// otherwise re-apply an old venue snapshot over a newer one.
+    ReconcileStale = 0x13,
+    /// The guard's model of the position is outside tolerance of what the venue
+    /// reports. Fail-closed: autonomous execution stays blocked until the owner
+    /// resolves it with `UpdatePosition`.
+    ReconcileDiverged = 0x14,
+    /// The supplied venue position account is not the one this guard watches —
+    /// it does not re-derive from the guard's own venue_owner/sub-account, or
+    /// it is not owned by the venue program.
+    VenueAccountMismatch = 0x15,
+    /// The margin wallet cannot cover the requested debit, or its lamport
+    /// balance no longer backs the credited `balance` it claims to hold.
+    InsufficientMarginWallet = 0x16,
+    /// The supplied margin wallet is not `b"margin" || venue_owner` for this
+    /// guard. Accepting a foreign wallet would let collateral be credited from
+    /// value the guard's owner does not control.
+    MarginWalletMismatch = 0x17,
+    /// A defensive close cannot be built for the current state — most often the
+    /// build request is past its TTL, so landing it would act on a stale level.
+    DefensiveCloseUnavailable = 0x18,
 }
 
 impl From<WickError> for ProgramError {

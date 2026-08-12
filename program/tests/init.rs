@@ -12,6 +12,7 @@ use solana_native_token::LAMPORTS_PER_SOL;
 use solana_signer::Signer;
 use solana_transaction::Transaction;
 use std::path::PathBuf;
+use wick_guard::account::{ACCOUNT_VERSION, GUARD_DATA_LEN};
 
 /// Address where the program `.so` is deployed for the test. Arbitrary — the
 /// loader treats this as the program id regardless of build-time settings.
@@ -90,9 +91,18 @@ fn init_guard_and_deposit() {
     assert!(res.is_ok(), "InitGuard failed: {res:?}");
 
     let guard_account = svm.get_account(&guard_pda).expect("guard account missing");
+    // Compare the *deployed* `.so`'s behaviour against the constants the source
+    // declares, rather than restating a literal here: a hard-coded `1` silently
+    // became wrong the moment ACCOUNT_VERSION was bumped, and a hard-coded
+    // length would let the account layout and `GUARD_DATA_LEN` drift apart.
     assert_eq!(
-        guard_account.data[0], 1,
-        "guard not initialized with version badge"
+        guard_account.data.len(),
+        GUARD_DATA_LEN,
+        "guard allocated with a size that disagrees with GUARD_DATA_LEN"
+    );
+    assert_eq!(
+        guard_account.data[0], ACCOUNT_VERSION,
+        "guard not initialized with the current version badge"
     );
     assert_eq!(
         guard_account.owner, program_id,

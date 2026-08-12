@@ -31,6 +31,31 @@ pub enum WickInstruction {
     ConfirmYes = 9,
     /// Create the singleton RouteConfig PDA (kill-switch authority + pause flag).
     InitRouteConfig = 10,
+    /// Close a guard (owner only): refund rent and zero the account so the
+    /// owner can re-init. The guard PDA is a pure function of `b"guard" ||
+    /// owner`, so without this an account that no longer decodes is a
+    /// permanent tombstone at the only address that owner will ever get, with
+    /// its rent unrecoverable.
+    CloseGuard = 11,
+    /// Rotate the RouteConfig kill-switch authority (current authority only).
+    /// Without it the authority written at `InitRouteConfig` is permanent.
+    SetRouteAuthority = 12,
+    /// Reconcile the guard's model of the position against the venue's own
+    /// account (permissionless — anyone may pay the fee to keep a guard honest).
+    /// On a Drift venue this reads the delegated user's `PerpPosition` for the
+    /// pinned market. Divergence is a fail-closed state: autonomous execution
+    /// is blocked until the snapshot converges again (§8.3).
+    ReconcileVenue = 13,
+    /// Create the 2-of-2 margin wallet PDA (`b"margin" || venue_owner`) that
+    /// backs `TopUp` with real lamports. One-time, payer-funded.
+    InitMarginWallet = 14,
+    /// Move lamports from the owner's wallet into the margin-wallet PDA. The
+    /// wallet's lamport balance must stay at or above its rent-exempt minimum
+    /// plus the recorded `balance` (§8.5).
+    FundMarginWallet = 15,
+    /// Withdraw lamports out of the margin wallet. 2-of-2: owner + co_authority
+    /// must both sign, and the same rent-exempt invariant holds on the way out.
+    WithdrawMarginWallet = 16,
 }
 
 impl WickInstruction {
@@ -47,6 +72,12 @@ impl WickInstruction {
             8 => Some(Self::UpdatePosition),
             9 => Some(Self::ConfirmYes),
             10 => Some(Self::InitRouteConfig),
+            11 => Some(Self::CloseGuard),
+            12 => Some(Self::SetRouteAuthority),
+            13 => Some(Self::ReconcileVenue),
+            14 => Some(Self::InitMarginWallet),
+            15 => Some(Self::FundMarginWallet),
+            16 => Some(Self::WithdrawMarginWallet),
             _ => None,
         }
     }

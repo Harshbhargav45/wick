@@ -319,6 +319,170 @@ fn autonomous_tick_cpis_place_perp_order_signed_by_guard_pda() {
     assert_eq!(price, 50_000_000);
 }
 
+/// The guard's model of the position must shrink when a reduce lands, or it
+/// re-solves against the original notional on the next tick and walks the whole
+/// position out of the venue a slice at a time.
+///
+/// Two consecutive ticks on the same breach: the first reduce must shrink
+/// `size`, and the second must be computed off the *reduced* size — strictly
+/// smaller than the first, and never draining to zero.
+#[test]
+fn consecutive_reduces_shrink_the_watched_size_instead_of_draining_it() {
+    let program_id = Address::from_str_const(PROGRAM_ID);
+    let drift_id = Address::from_str_const(DRIFT_PROGRAM_ID);
+    let clock = Address::from_str_const(CLOCK_SYSVAR);
+    let rent = Address::from_str_const(RENT_SYSVAR);
+    let system = Address::from_str_const(SYSTEM_PROGRAM);
+
+    let mut svm = LiteSVM::new().with_sigverify(false);
+    svm.add_program(program_id, &read_so("target/deploy/wick_guard.so"))
+        .unwrap();
+    svm.add_program(
+        drift_id,
+        &read_so("mocks/drift/target/deploy/mock_drift.so"),
+    )
+    .unwrap();
+
+    let owner_kp = Keypair::new();
+    let owner = owner_kp.pubkey();
+    svm.airdrop(&owner, 100 * LAMPORTS_PER_SOL).unwrap();
+
+    let seeds: &[&[u8]] = &[GUARD_SEED, owner.as_ref()];
+    let (guard_pda, bump) = Address::find_program_address(seeds, &program_id);
+
+    let init_ix = Instruction {
+        program_id,
+        accounts: vec![
+            AccountMeta::new(guard_pda, false),
+            AccountMeta::new_readonly(owner, true),
+            AccountMeta::new(owner, true),
+            AccountMeta::new_readonly(rent, false),
+            AccountMeta::new_readonly(system, false),
+        ],
+        data: init_data(bump),
+    };
+    let msg = Message::new_with_blockhash(&[init_ix], Some(&owner), &svm.latest_blockhash());
+    let tx = Transaction::new(&[&owner_kp], msg, svm.latest_blockhash());
+    svm.send_transaction(tx).expect("InitGuard failed");
+
+    let (route_config, _) = init_route_config(&mut svm, program_id, rent, system, &owner_kp, owner);
+
+    const INITIAL_SIZE: i128 = 100_000_000;
+    let mut upd = vec![8u8];
+    upd.extend_from_slice(&45_000_000u128.to_le_bytes());
+    upd.extend_from_slice(&INITIAL_SIZE.to_le_bytes());
+    upd.extend_from_slice(&50_000_000u128.to_le_bytes());
+    let upd_ix = Instruction {
+        program_id,
+        accounts: vec![
+            AccountMeta::new(guard_pda, false),
+            AccountMeta::new_readonly(owner, true),
+            AccountMeta::new_readonly(route_config, false),
+        ],
+        data: upd,
+    };
+    let msg = Message::new_with_blockhash(&[upd_ix], Some(&owner), &svm.latest_blockhash());
+    let tx = Transaction::new(&[&owner_kp], msg, svm.latest_blockhash());
+    svm.send_transaction(tx).expect("UpdatePosition failed");
+
+    let drift_pubkey = Pubkey::from(drift_id.to_bytes());
+    let state = Address::from([30u8; 32]);
+    let user = Address::from([31u8; 32]);
+    let remaining_a = Address::from([40u8; 32]);
+    let remaining_b = Address::from([41u8; 32]);
+    svm.set_account(
+        state,
+        Account {
+            lamports: 1_000_000,
+            data: vec![0u8; 64],
+            owner: drift_pubkey,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    svm.set_account(user, drift_user_account(drift_pubkey, guard_pda))
+        .unwrap();
+    for a in [remaining_a, remaining_b] {
+        svm.set_account(
+            a,
+            Account {
+                lamports: 1_000_000,
+                data: vec![],
+                owner: drift_pubkey,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    }
+
+    let pyth = Address::from([50u8; 32]);
+    svm.set_account(pyth, pyth_account(50_000_000)).unwrap();
+
+    let read_size = |svm: &LiteSVM| -> i128 {
+        let acc = svm.get_account(&guard_pda).expect("guard missing");
+        i128::from_le_bytes(acc.data[195..211].try_into().unwrap())
+    };
+
+    let tick_once = |svm: &mut LiteSVM, nonce: u64, slot: u64| {
+        svm.warp_to_slot(slot);
+        let mut tick = vec![7u8];
+        tick.extend_from_slice(&nonce.to_le_bytes());
+        tick.push(bump);
+        let ix = Instruction {
+            program_id,
+            accounts: vec![
+                AccountMeta::new(guard_pda, false),
+                AccountMeta::new_readonly(clock, false),
+                AccountMeta::new_readonly(route_config, false),
+                AccountMeta::new_readonly(pyth, false),
+                AccountMeta::new_readonly(state, false),
+                AccountMeta::new(user, false),
+                AccountMeta::new(guard_pda, false),
+                AccountMeta::new_readonly(remaining_a, false),
+                AccountMeta::new_readonly(remaining_b, false),
+                AccountMeta::new_readonly(drift_id, false),
+            ],
+            data: tick,
+        };
+        let msg = Message::new_with_blockhash(&[ix], Some(&owner), &svm.latest_blockhash());
+        let tx = Transaction::new(&[&owner_kp], msg, svm.latest_blockhash());
+        let res = svm.send_transaction(tx);
+        assert!(res.is_ok(), "OnPriceTick nonce={nonce} failed: {res:?}");
+    };
+
+    // Tick 1 — the first reduce lands and must be reflected in the snapshot.
+    tick_once(&mut svm, 1, TICK_SLOT);
+    let after_first = read_size(&svm);
+    assert!(
+        after_first < INITIAL_SIZE,
+        "size unchanged after an executed reduce ({after_first}) — the guard \
+         would re-solve against the original notional next tick"
+    );
+    assert!(
+        after_first > 0,
+        "a partial close must not zero the position"
+    );
+    let first_reduce = INITIAL_SIZE - after_first;
+
+    // Tick 2 — same breach. The reduce is a fraction of what is left, so it is
+    // strictly smaller than the first. Against the pre-fix guard both ticks
+    // would reduce by the same amount, off the same stale size.
+    tick_once(&mut svm, 2, TICK_SLOT + 20);
+    let after_second = read_size(&svm);
+    let second_reduce = after_first - after_second;
+    assert!(
+        second_reduce < first_reduce,
+        "second reduce ({second_reduce}) was not computed off the reduced size \
+         ({after_first}); first was {first_reduce}"
+    );
+    assert!(
+        after_second > 0,
+        "position drained to zero across two ticks ({after_second})"
+    );
+}
+
 #[test]
 fn cosigned_tick_never_reaches_venue() {
     // A CoSigned guard must NOT CPI into the venue at all — no owner signature

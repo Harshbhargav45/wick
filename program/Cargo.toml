@@ -33,6 +33,9 @@ solana-hash = "~4.5.0"
 solana-account = "4.3.0"
 solana-pubkey = "4.2.0"
 solana-transaction-error = "~3.3.1"
+proptest = "1.11.0"
+sha2 = "0.10"
+bs58 = "0.5"
 
 [lints.rust]
 unexpected_cfgs = { level = "allow", check-cfg = ['cfg(solana)'] }

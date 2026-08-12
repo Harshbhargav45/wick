@@ -12,12 +12,13 @@
 //!   finishes the session (called by the Delegation Program via CPI).
 
 use pinocchio::error::ProgramResult;
-use pinocchio::AccountView;
+use pinocchio::{AccountView, Address};
 
 use ephemeral_rollups_pinocchio::instruction::{delegate_account, undelegate};
 use ephemeral_rollups_pinocchio::intent_bundle::MagicIntentBundleBuilder;
 use ephemeral_rollups_pinocchio::types::DelegateConfig;
 
+use crate::account::GuardState;
 use crate::error::WickError;
 
 /// Instruction-data buffer for the serialized magic intent bundle.
@@ -26,7 +27,7 @@ const INTENT_BUNDLE_DATA_BUF_SIZE: usize = 512;
 /// Delegate the guard PDA to the Ephemeral Rollup.
 ///
 /// Account layout (mirrors `delegate_account`):
-///   0. `[WRITE, SIGNER]` payer / initializer
+///   0. `[WRITE, SIGNER]` payer / initializer — must be the guard's `venue_owner`
 ///   1. `[WRITE]` guard PDA to delegate
 ///   2. `[]` owner program (this program)
 ///   3. `[WRITE]` delegation buffer PDA
@@ -37,7 +38,11 @@ const INTENT_BUNDLE_DATA_BUF_SIZE: usize = 512;
 ///   8. `[optional]` ER validator to target
 ///
 /// `data` = `[bump]`, the guard PDA bump.
-pub fn process_delegate(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
+pub fn process_delegate(
+    program_id: &Address,
+    accounts: &[AccountView],
+    data: &[u8],
+) -> ProgramResult {
     let bump = *data.first().ok_or(WickError::InvalidInstruction)?;
 
     let [payer, guard, owner_program, buffer, record, metadata, _delegation_program, system_program, rest @ ..] =
@@ -45,6 +50,36 @@ pub fn process_delegate(accounts: &[AccountView], data: &[u8]) -> ProgramResult 
     else {
         return Err(WickError::InvalidInstruction.into());
     };
+
+    // The SDK hands `owner_program` to the delegation program as the account's
+    // owner-of-record, so it has to be us — otherwise the guard comes back
+    // under someone else's program on undelegation.
+    if owner_program.address() != program_id {
+        return Err(WickError::InvalidPda.into());
+    }
+    if !guard.owned_by(program_id) {
+        return Err(WickError::WrongAccountOwner.into());
+    }
+
+    // The guard PDA is `b"guard" || venue_owner || bump`, so the owner has to
+    // come off the account itself. Scoped: `delegate_account` borrows the guard
+    // to copy it into the buffer and then zero it.
+    let venue_owner = {
+        let bytes = guard.try_borrow().map_err(|_| WickError::NotInitialized)?;
+        GuardState::from_bytes(&bytes)
+            .map_err(|_| WickError::NotInitialized)?
+            .venue_owner
+    };
+
+    // Delegation moves the guard's state onto a validator named in this
+    // instruction. Without an owner check any payer could hand someone else's
+    // guard to an ER validator of their choosing.
+    if !payer.is_signer() {
+        return Err(WickError::MissingOwnerAuthority.into());
+    }
+    if payer.address().as_ref() != venue_owner.as_slice() {
+        return Err(WickError::SignerKeyMismatch.into());
+    }
 
     let validator = rest.first().map(|account| *account.address());
     let config = DelegateConfig {
@@ -62,7 +97,7 @@ pub fn process_delegate(accounts: &[AccountView], data: &[u8]) -> ProgramResult 
             metadata,
             system_program,
         ],
-        &[GUARD_SEED],
+        &[GUARD_SEED, &venue_owner],
         bump,
         config,
     )
