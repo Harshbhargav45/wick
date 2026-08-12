@@ -70,6 +70,20 @@ function resolveKeypairPath(raw) {
 }
 
 export function crankerKeypair() {
+  // Railway / cloud: accept the keypair as an inline JSON byte-array so there
+  // is no dependency on a persistent filesystem.
+  const inline = process.env.CRANKER_KEYPAIR_JSON;
+  if (inline) {
+    try {
+      return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(inline)));
+    } catch (err) {
+      throw new Error(
+        `CRANKER_KEYPAIR_JSON is set but cannot be parsed: ${err.message}`
+      );
+    }
+  }
+
+  // Local: read from a file path.
   const path = resolveKeypairPath(
     process.env.CRANKER_KEYPAIR ?? "~/.config/solana/id.json"
   );
@@ -78,7 +92,8 @@ export function crankerKeypair() {
     raw = JSON.parse(readFileSync(path, "utf8"));
   } catch (err) {
     throw new Error(
-      `cannot read keypair at ${path} (${err.code ?? err.message}). Set CRANKER_KEYPAIR in cranker/.env`
+      `cannot read keypair at ${path} (${err.code ?? err.message}). ` +
+      `Set CRANKER_KEYPAIR (file path) or CRANKER_KEYPAIR_JSON (inline byte array)`
     );
   }
   return Keypair.fromSecretKey(Uint8Array.from(raw));
