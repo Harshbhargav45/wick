@@ -185,8 +185,15 @@ fn compute_pnl(size: i128, entry: i128, current: i128) -> Result<i128, GuardErro
     raw.checked_div(SCALE).ok_or(GuardError::MathOverflow)
 }
 
-fn compute_margin_required(abs_size: i128, margin_bps: i128) -> Result<i128, GuardError> {
-    abs_size.checked_mul(margin_bps)
+// The basis is *notional*, not the raw unit count. Taking bps of a unit count
+// yields units, which is then compared against equity in USD — a dimensional
+// mismatch that makes the requirement price-independent and collapses it by a
+// factor of `current`, so the guard only fires at outright insolvency.
+fn compute_margin_required(abs_size: i128, margin_bps: i128, current: i128) -> Result<i128, GuardError> {
+    let notional = abs_size.checked_mul(current)
+        .and_then(|v| v.checked_div(SCALE))
+        .ok_or(GuardError::MathOverflow)?;
+    notional.checked_mul(margin_bps)
         .and_then(|v| v.checked_div(BPS_DENOM))
         .ok_or(GuardError::MathOverflow)
 }
@@ -194,7 +201,7 @@ fn compute_margin_required(abs_size: i128, margin_bps: i128) -> Result<i128, Gua
 fn is_liquidatable(collateral, size, entry, current, margin_bps) -> Result<bool, GuardError> {
     let pnl = compute_pnl(size, entry, current)?;
     let equity = collateral.checked_add(pnl).ok_or(GuardError::MathOverflow)?;
-    let margin_required = compute_margin_required(size.abs(), margin_bps)?;
+    let margin_required = compute_margin_required(size.abs(), margin_bps, current)?;
     Ok(equity < margin_required) // cross-multiplied — never equity/margin_required, never a float
 }
 ```
@@ -217,26 +224,38 @@ The easy-to-miss part: a rejected tick can't just mean "do nothing this tick." I
 ```rust
 fn select_action(
     health: &HealthSnapshot, policy: &VenuePolicy, nonce: u64, last_nonce: u64,
+    daily_spent_usd: u128,
 ) -> Result<Option<Action>, GuardError> {
     if nonce <= last_nonce {
         return Ok(None); // stale or replayed — hard reject
     }
+
+    // 1. TP first if the price has crossed it — realizing a planned exit
+    //    is preferable to a defensive top-up or close. Crossing direction
+    //    follows the sign of `size`: a long takes profit above its target,
+    //    a short below it. `size == 0` never fires.
+    if let Some(tp) = policy.take_profit {
+        if tp.crossed(health.current_price, health.size.signum()) {
+            return Ok(Some(Action::TakeProfit))
+        }
+    }
+
     if !is_liquidatable(health.collateral, health.size, health.entry, health.current_price, policy.maintenance_bps)? {
         return Ok(None);
     }
 
-    // 1. TP first if the price has crossed it — realizing a planned exit
-    //    is preferable to a defensive top-up or close.
-    if let Some(tp) = policy.take_profit {
-        if tp.crossed(health.current_price) {
-            return Ok(Some(Action::ClosePartial))
-        }
-    }
-
     // 2. Top-up if it's enough to clear the breach on its own and within cap.
-    let topup_needed = compute_margin_required(health.size.abs(), policy.maintenance_bps)?
-        .checked_sub(health.collateral.checked_add(compute_pnl(health.size, health.entry, health.current_price)?)?)?;
-    if topup_needed > 0 && policy.action_caps.within_cap(ActionType::TopUp, topup_needed) {
+    //    Target the trigger buffer, not bare maintenance: restoring equity to
+    //    exactly `req` lands it *on* the liquidation line, so the next adverse
+    //    tick re-breaches and burns another top-up against the daily cap. This
+    //    is the same target the partial-close solver uses (§8.3).
+    let req = compute_margin_required(health.size.abs(), policy.maintenance_bps, health.current_price)?;
+    let target = req.checked_mul(BPS_DENOM + policy.trigger_buffer_bps)?.checked_div(BPS_DENOM)?;
+    let equity = health.collateral.checked_add(compute_pnl(health.size, health.entry, health.current_price)?)?;
+    let topup_needed = target.checked_sub(equity)?;
+    if topup_needed > 0
+        && policy.action_caps.within_cap(ActionType::TopUp, topup_needed)
+        && policy.action_caps.within_daily(daily_spent_usd, topup_needed) {
         return Ok(Some(Action::TopUp(topup_needed)))
     }
 
@@ -246,7 +265,14 @@ fn select_action(
         health.collateral, health.size, health.entry, health.current_price,
         policy.maintenance_bps, policy.trigger_buffer_bps, policy.feebps,
     )?;
-    if policy.action_caps.within_cap(ActionType::PartialClose, f_bps) {
+    // The cap is denominated in USD, so it must be applied to the USD notional
+    // actually closed. `f_bps` is a fraction in [0, BPS_DENOM]; comparing it
+    // against a USD ceiling passes for every possible value, which makes the
+    // cap inert and step 4 below unreachable via this branch.
+    let notional = health.size.abs().checked_mul(health.current_price)?.checked_div(SCALE)?;
+    let closed_usd = notional.checked_mul(f_bps)?.checked_div(BPS_DENOM)?;
+    if policy.action_caps.within_cap(ActionType::PartialClose, closed_usd)
+        && policy.action_caps.within_daily(daily_spent_usd, closed_usd) {
         return Ok(Some(Action::PartialClose(f_bps)))
     }
 
@@ -254,6 +280,14 @@ fn select_action(
     Ok(Some(Action::EscalateManualReview))
 }
 ```
+
+Three things in that listing were wrong in earlier revisions of this spec, and the program inherited all three — they are called out inline above because the wrong version reads as perfectly reasonable:
+
+- **The partial-close cap compared `f_bps` against a USD ceiling.** `f_bps` maxes out at `10_000`; the configured ceiling is `5_000 * SCALE`. Every value passed, so the cap never bound and step 4 was unreachable from step 3 — a guard that should have escalated executed an unbounded close instead.
+- **Top-up targeted bare `req`.** That is the liquidation line itself, not a safe distance from it.
+- **`daily_total_usd` had no accumulator**, so it was a second per-action ceiling rather than a daily one, and N successive within-cap top-ups could drain the margin wallet across N ticks. `within_daily` takes the running `daily_spent_usd` and the guard account carries it (`daily_spent_usd: u128` + `daily_epoch_start_slot: u64`, reset on rollover).
+
+The common shape: a cap that is present in the code, reads as enforced on the dashboard, and does nothing. Prefer checks whose units are visible at the comparison site.
 
 The last branch matters: a guard that just no-ops when every option is over-cap looks, from the outside, identical to a guard that checked and decided the position was fine. Those are not the same state — surface the difference.
 
@@ -268,7 +302,7 @@ fn solve_partial_close_fraction(
     // Returns f_bps in [0, 10_000] — fraction of size to close.
     let abs_size = size.abs();
     let pnl = compute_pnl(size, entry, current)?;
-    let m_full = compute_margin_required(abs_size, maintenance_bps)?;
+    let m_full = compute_margin_required(abs_size, maintenance_bps, current)?;
     let target_full = m_full.checked_mul(BPS_DENOM + buffer_bps)?.checked_div(BPS_DENOM)?;
     let notional = abs_size.checked_mul(current)?.checked_div(SCALE)?;
     let fee_full = notional.checked_mul(fee_bps)?.checked_div(BPS_DENOM)?;
