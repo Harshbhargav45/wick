@@ -30,28 +30,21 @@ import { buildPostUpdateInstructions } from "./receiver.mjs";
 import { logEndpointConfig, sharedConnection } from "./rpc.mjs";
 import { guardPda, routeConfigPda } from "./tick.mjs";
 import { DELEGATION_PROGRAM_ID } from "./magicblock.mjs";
+import {
+  G,
+  PENDING_IX_NAMES,
+  RECONCILE_DIVERGED,
+  SCALE,
+  VENUE_DRIFT,
+  readU128LE,
+} from "./guard-layout.mjs";
 
 const CLOCK_SYSVAR = new PublicKey(
   "SysvarC1ock11111111111111111111111111111111"
 );
-const G_NONCE_OFF = 243;
-const G_PRICE_OFF = 227;
-const G_DEGRADED_OFF = 276;
-// `degraded` only flips on the third consecutive stale tick, so the streak is
-// the leading indicator — a run can look clean on `degraded` alone while every
-// tick is actually landing stale.
-const G_STALE_STREAK_OFF = 277;
-const G_LAST_CHECK_TS_OFF = 251;
-const SCALE = 1_000_000n;
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
-}
-
-function readU128LE(d, off) {
-  let v = 0n;
-  for (let i = 15; i >= 0; i--) v = (v << 8n) | BigInt(d[off + i]);
-  return v;
 }
 
 async function sendAndConfirm(connection, tx, signers, blockhash) {
@@ -104,6 +97,26 @@ if (!baseInfo.owner.equals(DELEGATION_PROGRAM_ID)) {
   process.exit(1);
 }
 
+// §8.7 vs §8.6 — an autonomous Drift guard cannot execute here, and the
+// operator has to know that *before* the breach rather than from a failed tick.
+//
+// The reduce is a CPI into Drift, which needs the venue's sub-account writable.
+// The ER only permits writes to accounts delegated to it, and Drift's accounts
+// are not; appending them would make every tick fail, including the healthy ones
+// this loop exists to record. So the accounts are deliberately NOT appended, and
+// the consequence is stated instead: health monitoring works on the ER, autonomous
+// execution does not.
+const erGuardPeek = await er.getAccountInfo(guard);
+const venueByte = (erGuardPeek ?? baseInfo).data[G.venue];
+if (venueByte === VENUE_DRIFT && (erGuardPeek ?? baseInfo).data[G.authorityReq] === 0) {
+  console.error(
+    "[er] WARNING: this is an autonomous Drift guard. Its reduce-only CPI needs Drift's\n" +
+      "[er]          sub-account writable, and the ER can only write accounts delegated to it.\n" +
+      "[er]          Ticks will land and health will be recorded, but a breach will FAIL here.\n" +
+      "[er]          Undelegate before it matters: node src/delegate.mjs undelegate"
+  );
+}
+
 let vaaAhead = fetchLatestVaa().catch(() => null);
 let landed = 0;
 let failed = 0;
@@ -116,7 +129,7 @@ for (let i = 0; i < maxTicks; i += 1) {
     // and trip the `expected_nonce` check.
     const erInfo = await er.getAccountInfo(guard);
     if (!erInfo) throw new Error("guard not present on the ER");
-    const nonce = erInfo.data.readBigUInt64LE(G_NONCE_OFF) + 1n;
+    const nonce = erInfo.data.readBigUInt64LE(G.nonce) + 1n;
 
     const fetched = (await vaaAhead) ?? (await fetchLatestVaa());
     vaaAhead = fetchLatestVaa().catch(() => null);
@@ -177,12 +190,32 @@ for (let i = 0; i < maxTicks; i += 1) {
     const after = await er.getAccountInfo(guard);
     landed += 1;
     console.log(
-      `[er] tick landed nonce=${after.data.readBigUInt64LE(G_NONCE_OFF)} ` +
-        `price=${(Number(readU128LE(after.data, G_PRICE_OFF)) / Number(SCALE)).toFixed(2)} ` +
-        `ts=${after.data.readBigInt64LE(G_LAST_CHECK_TS_OFF)} ` +
-        `degraded=${after.data[G_DEGRADED_OFF]} streak=${after.data[G_STALE_STREAK_OFF]} ` +
+      `[er] tick landed nonce=${after.data.readBigUInt64LE(G.nonce)} ` +
+        `price=${(Number(readU128LE(after.data, G.price)) / Number(SCALE)).toFixed(2)} ` +
+        `ts=${after.data.readBigInt64LE(G.lastCheckTs)} ` +
+        // `degraded` only flips on the third consecutive stale tick, so the
+        // streak is the leading indicator — a run can look clean on `degraded`
+        // alone while every tick is actually landing stale.
+        `degraded=${after.data[G.degraded]} streak=${after.data[G.staleStreak]} ` +
         `${erMs}ms sig=${sig.slice(0, 8)}`
     );
+
+    // A guard that has decided something is the whole point of the loop, so it
+    // gets its own line rather than being inferable from an unchanged nonce.
+    const pxKind = after.data[G.pendingIxKind];
+    if (pxKind !== 0) {
+      console.log(
+        `[er] AWAITING OWNER: ${PENDING_IX_NAMES[pxKind] ?? `kind=${pxKind}`} built at expectedNonce=${after.data.readBigUInt64LE(G.pendingIxNonce)}`
+      );
+    }
+    if (after.data[G.reconcileStatus] === RECONCILE_DIVERGED) {
+      // Reconciliation itself runs on the base layer (index.mjs) — the venue's
+      // accounts are not on the ER — but the verdict travels with the guard, and
+      // it blocks autonomous execution, so it is reported wherever it is read.
+      console.error(
+        "[er] DIVERGED: the guard's model disagrees with the venue; autonomous execution is blocked until the owner runs UpdatePosition"
+      );
+    }
 
     // Best-effort scratch cleanup on L1, after the ER tick has read the account.
     try {

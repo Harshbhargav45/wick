@@ -10,9 +10,12 @@
   "scripts": {
     "init": "node src/init.mjs",
     "start": "node src/index.mjs",
+    "inspect": "node src/inspect.mjs",
     "rpc-check": "node src/rpc-check.mjs",
     "post-vaa": "node src/post-vaa.mjs",
     "delegate": "node src/delegate.mjs",
+    "tick-er": "node src/tick-er.mjs",
+    "margin": "node src/margin-wallet.mjs",
     "test": "node --test test/"
   },
   "overrides": {

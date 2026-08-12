@@ -1,5 +1,5 @@
 import { AnchorProvider, Program, Wallet } from "@coral-xyz/anchor";
-import { Connection, Keypair, PublicKey } from "@solana/web3.js";
+import { Keypair, PublicKey } from "@solana/web3.js";
 import { Buffer as IsomorphicBuffer } from "node:buffer";
 import { parseAccumulatorUpdateData } from "@pythnetwork/price-service-sdk";
 import { IDL as ReceiverIdl } from "@pythnetwork/pyth-solana-receiver/idl/pyth_solana_receiver";
@@ -11,6 +11,7 @@ import {
   getTreasuryPda,
 } from "@pythnetwork/pyth-solana-receiver/address";
 import { config, crankerKeypair } from "./config.mjs";
+import { sharedConnection } from "./rpc.mjs";
 
 const VAA_START = 46;
 const VAA_SPLIT_INDEX = 721;
@@ -51,7 +52,7 @@ let programsCache = null;
  */
 export async function createReceiverPrograms() {
   if (programsCache) return programsCache;
-  const connection = new Connection(config.rpc, "confirmed");
+  const connection = sharedConnection();
   const wallet = new Wallet(crankerKeypair());
   const provider = new AnchorProvider(connection, wallet, {
     commitment: "confirmed",

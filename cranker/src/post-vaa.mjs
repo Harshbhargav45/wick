@@ -1,15 +1,15 @@
 import {
   ComputeBudgetProgram,
-  Connection,
   Transaction,
   VersionedTransaction,
 } from "@solana/web3.js";
 import { config, crankerKeypair } from "./config.mjs";
 import { fetchLatestVaa } from "./hermes.mjs";
 import { buildPostUpdateInstructions } from "./receiver.mjs";
+import { sharedConnection } from "./rpc.mjs";
 
 const payer = crankerKeypair();
-const connection = new Connection(config.rpc, "confirmed");
+const connection = sharedConnection();
 
 async function send(tx, signers) {
   const blockhash = (await connection.getLatestBlockhash("confirmed")).blockhash;

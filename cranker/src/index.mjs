@@ -10,16 +10,19 @@ import { buildPostUpdateInstructions } from "./receiver.mjs";
 import { logEndpointConfig, sharedConnection, verifyEndpoints } from "./rpc.mjs";
 import { routeConfigPda, guardPda } from "./tick.mjs";
 import { DELEGATION_PROGRAM_ID } from "./magicblock.mjs";
+import {
+  ACCOUNT_VERSION,
+  G,
+  GUARD_DATA_LEN,
+  VENUE_DRIFT,
+  isGuardAccount,
+} from "./guard-layout.mjs";
+import { buildDriftTickAccounts, describeVenueAccountError } from "./venue-drift.mjs";
+import { describeReconcile, maybeReconcile } from "./reconcile.mjs";
 
 const CLOCK_SYSVAR = new PublicKey(
   "SysvarC1ock11111111111111111111111111111111"
 );
-const GUARD_DATA_LEN = 366;
-const ACCOUNT_VERSION = 2;
-
-/** Guard byte offsets, mirroring program/src/account.rs. */
-const G_VENUE_OWNER_OFF = 2;
-const G_NONCE_OFF = 243;
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -47,9 +50,7 @@ async function findGuards(connection, programId) {
   const accounts = await connection.getProgramAccounts(programId, {
     filters: [{ dataSize: GUARD_DATA_LEN }],
   });
-  return accounts.filter(
-    ({ account }) => account.data[0] === ACCOUNT_VERSION
-  );
+  return accounts.filter(({ account }) => isGuardAccount(account.data));
 }
 
 /**
@@ -64,16 +65,18 @@ async function findGuards(connection, programId) {
  *
  * Ownership is proven by re-deriving `[b"guard", venue_owner]` and checking it
  * matches the account address, rather than trusting length plus a version byte:
- * another program's delegated 366-byte account could otherwise be misreported
- * as a wick guard.
+ * another program's delegated account of the same length could otherwise be
+ * misreported as a wick guard.
  */
 async function findDelegatedGuards(connection) {
   const accounts = await connection.getProgramAccounts(DELEGATION_PROGRAM_ID, {
     filters: [{ dataSize: GUARD_DATA_LEN }],
   });
   return accounts.filter(({ pubkey, account }) => {
-    if (account.data[0] !== ACCOUNT_VERSION) return false;
-    const owner = new PublicKey(account.data.subarray(2, 34));
+    if (account.data[G.version] !== ACCOUNT_VERSION) return false;
+    const owner = new PublicKey(
+      account.data.subarray(G.venueOwner, G.venueOwner + 32)
+    );
     return guardPda(owner).pda.equals(pubkey);
   });
 }
@@ -161,6 +164,11 @@ async function main() {
   let landed = 0;
   let failed = 0;
 
+  // Reconcile attempts, not just successes. `reconcile_ts` on the account only
+  // records reconciles that landed, so without a local memo a guard whose
+  // venue account is missing would be retried on every single pass.
+  const lastReconcileTs = new Map();
+
   for (let i = 0; i < maxTicks; i += 1) {
     const loopStart = Date.now();
     try {
@@ -177,7 +185,7 @@ async function main() {
       for (const { pubkey, account } of guards) {
         const { pda: routeConfig } = routeConfigPda();
         const venueOwner = new PublicKey(
-          account.data.slice(G_VENUE_OWNER_OFF, G_VENUE_OWNER_OFF + 32)
+          account.data.slice(G.venueOwner, G.venueOwner + 32)
         );
         const { bump } = guardPda(venueOwner);
 
@@ -185,8 +193,66 @@ async function main() {
         // nonce is read from the account rather than counted locally. A local
         // counter desyncs across restarts and on every CoSigned tick, where the
         // nonce stays put until the owner confirms.
-        const committed = account.data.readBigUInt64LE(G_NONCE_OFF);
+        const committed = account.data.readBigUInt64LE(G.nonce);
         const nonce = committed + 1n;
+
+        // §8.3 — reconcile before ticking, on its own cadence. A guard whose
+        // model the venue has already contradicted must not have an autonomous
+        // order sized from that model, and the tick is where that would happen.
+        try {
+          const key = pubkey.toBase58();
+          const result = await maybeReconcile(connection, {
+            programId: config.wickProgramId,
+            guard: pubkey,
+            guardData: account.data,
+            routeConfig,
+            payer,
+            dryRun: config.dryRun,
+            now: Math.floor(Date.now() / 1000),
+            intervalMs: config.reconcileIntervalMs,
+            lastAttemptTs: lastReconcileTs.get(key),
+            send: (tx, signers) => sendAndConfirm(connection, tx, signers),
+          });
+          if (result.status !== "skipped") {
+            lastReconcileTs.set(key, BigInt(Math.floor(Date.now() / 1000)));
+          }
+          const line = describeReconcile(pubkey, result);
+          if (line) {
+            (result.diverged || result.status === "failed"
+              ? console.error
+              : console.log)(`[wick-cranker] ${line}`);
+          }
+        } catch (e) {
+          // Reconciliation is an improvement to the guard's model, not a
+          // precondition for protecting it. Failing here must not cost the
+          // tick — but it must never be silent either.
+          console.error(`[wick-cranker] reconcile errored: ${e.message}`);
+        }
+
+        // §8.7 — a Drift guard executes autonomously, and that CPI needs the
+        // venue's own accounts in the transaction. Without them the guard
+        // computes the correct reduce and then fails at the adapter: protection
+        // that exists everywhere except when it is needed.
+        let venueKeys = [];
+        if (account.data[G.venue] === VENUE_DRIFT) {
+          try {
+            const built = await buildDriftTickAccounts(connection, {
+              guardPda: pubkey,
+              venueOwner,
+              marketIndex: account.data.readUInt16LE(G.driftMarket),
+              subAccountId: account.data.readUInt16LE(G.driftSubaccount),
+            });
+            venueKeys = built.keys;
+          } catch (e) {
+            // Ticking anyway would land a transaction that cannot execute the
+            // one thing this guard exists to do. Skip it, loudly, by name.
+            failed += 1;
+            console.error(
+              `[wick-cranker] skipping ${pubkey.toBase58()} — ${describeVenueAccountError(e)}`
+            );
+            continue;
+          }
+        }
 
         const fetched = (await vaaAhead) ?? (await fetchLatestVaa());
         vaaAhead = fetchLatestVaa().catch(() => null);
@@ -216,19 +282,26 @@ async function main() {
             { pubkey: CLOCK_SYSVAR, isSigner: false, isWritable: false },
             { pubkey: routeConfig, isSigner: false, isWritable: false },
             { pubkey: plans.priceUpdateAccount, isSigner: false, isWritable: false },
+            ...venueKeys,
           ],
           data: tickData,
         };
 
+        // A Drift tick may CPI into `place_perp_order`, which is well past the
+        // budget a price-post plus a health check needs. Under-budgeting shows
+        // up as an exceeded-CU failure on exactly the breach ticks that matter.
         const postAndTickTx = new Transaction().add(
-          ComputeBudgetProgram.setComputeUnitLimit({ units: 250_000 }),
+          ComputeBudgetProgram.setComputeUnitLimit({
+            units: venueKeys.length > 0 ? 600_000 : 250_000,
+          }),
           plans.postUpdateIx,
           tickIx
         );
 
         if (config.dryRun) {
           console.log(
-            `[wick-cranker] dry-run: guard=${pubkey.toBase58()} priceUpdate=${plans.priceUpdateAccount.toBase58()} nonce=${nonce}`
+            `[wick-cranker] dry-run: guard=${pubkey.toBase58()} priceUpdate=${plans.priceUpdateAccount.toBase58()} nonce=${nonce}` +
+              (venueKeys.length > 0 ? ` venueAccounts=${venueKeys.length}` : "")
           );
           continue;
         }

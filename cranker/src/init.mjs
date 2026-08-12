@@ -13,14 +13,25 @@
  */
 
 import {
-  Connection,
   PublicKey,
   SystemProgram,
   Transaction,
 } from "@solana/web3.js";
 import { Buffer as IsomorphicBuffer } from "node:buffer";
 import { config, crankerKeypair } from "./config.mjs";
+import { sharedConnection } from "./rpc.mjs";
 import { guardPda, routeConfigPda } from "./tick.mjs";
+import {
+  ACCOUNT_VERSION,
+  GUARD_DATA_LEN,
+  ROUTE_CONFIG_LEN,
+  SCALE,
+  U128_MAX,
+  VENUE_DRIFT,
+  VENUE_JUPITER,
+  VENUE_NONE,
+  writeU128LE,
+} from "./guard-layout.mjs";
 
 const IX_INIT_GUARD = 0;
 const IX_UPDATE_POSITION = 8;
@@ -43,26 +54,10 @@ function createAccountKeys(target, payer) {
   ];
 }
 
-const GUARD_DATA_LEN = 342;
-const ROUTE_CONFIG_LEN = 34;
-const ACCOUNT_VERSION = 1;
-
-/** Fixed-point scale shared with the program: 6dp on USD, bps on rates. */
-const SCALE = 1_000_000n;
-const U128_MAX = (1n << 128n) - 1n;
-
-const VENUES = { none: 0, jupiter: 2, drift: 3 };
+const VENUES = { none: VENUE_NONE, jupiter: VENUE_JUPITER, drift: VENUE_DRIFT };
 
 /** Autonomous = guard signs its own CPI; CoSigned = guard only builds. */
 const AUTHORITY = { autonomous: 0, cosigned: 1 };
-
-function writeU128LE(buf, off, value) {
-  let v = value < 0n ? (1n << 128n) + value : value;
-  for (let i = 0; i < 16; i++) {
-    buf[off + i] = Number(v & 0xffn);
-    v >>= 8n;
-  }
-}
 
 function parseArgs(argv) {
   const out = {};
@@ -87,13 +82,13 @@ function buildInitGuardData(bump, opts) {
   opts.coAuthority.toBuffer().copy(data, p + 1);
   data[p + 33] = opts.authorityReq;
 
-  writeU128LE(data, p + 34, opts.maintenanceBps);
-  writeU128LE(data, p + 50, opts.triggerBufferBps);
-  writeU128LE(data, p + 66, opts.feeBps);
-  writeU128LE(data, p + 82, opts.capTopUp);
-  writeU128LE(data, p + 98, opts.capPartialClose);
-  writeU128LE(data, p + 114, opts.capDaily);
-  writeU128LE(data, p + 130, opts.takeProfit);
+  writeU128LE(data, opts.maintenanceBps, p + 34);
+  writeU128LE(data, opts.triggerBufferBps, p + 50);
+  writeU128LE(data, opts.feeBps, p + 66);
+  writeU128LE(data, opts.capTopUp, p + 82);
+  writeU128LE(data, opts.capPartialClose, p + 98);
+  writeU128LE(data, opts.capDaily, p + 114);
+  writeU128LE(data, opts.takeProfit, p + 130);
   data.writeUInt16LE(opts.driftMarketIndex, p + 146);
   data.writeUInt16LE(opts.driftSubaccountId, p + 148);
   return data;
@@ -102,9 +97,9 @@ function buildInitGuardData(bump, opts) {
 function buildUpdatePositionData({ collateral, size, entry }) {
   const data = IsomorphicBuffer.alloc(49);
   data[0] = IX_UPDATE_POSITION;
-  writeU128LE(data, 1, collateral);
-  writeU128LE(data, 17, size);
-  writeU128LE(data, 33, entry);
+  writeU128LE(data, collateral, 1);
+  writeU128LE(data, size, 17);
+  writeU128LE(data, entry, 33);
   return data;
 }
 
@@ -139,10 +134,10 @@ function isInitialized(info, expectedLen) {
 async function main() {
   const args = parseArgs(process.argv);
   const payer = crankerKeypair();
-  const connection = new Connection(config.rpc, "confirmed");
+  const connection = sharedConnection();
   const programId = config.wickProgramId;
 
-  console.log(`[init] rpc=${config.rpc}`);
+  console.log(`[init] rpc=${connection.__endpoints.join(" → ")}`);
   console.log(`[init] program=${programId.toBase58()}`);
   console.log(`[init] owner/payer=${payer.publicKey.toBase58()}`);
 
@@ -190,10 +185,11 @@ async function main() {
   const { pda: guard, bump: guardBump } = guardPda(payer.publicKey);
   const guardInfo = await connection.getAccountInfo(guard);
 
-  // Default to the venue-less co-signed tier. The autonomous Drift path needs
-  // the adapter's accounts appended to the tick, and the cranker does not
-  // supply them — a breach there fails the whole tick instead of recording an
-  // action. `--venue drift` is for when those accounts exist.
+  // Default to the venue-less co-signed tier: it needs no venue accounts and no
+  // funded reserve, so a bring-up produces a guard that ticks on the first try.
+  // `--venue drift` is the autonomous tier — the tick loop now assembles the
+  // adapter's accounts itself (see venue-drift.mjs), but an autonomous TopUp
+  // still needs a funded margin reserve or it escalates instead of executing.
   const venueName = (args.venue ?? "none").toLowerCase();
   if (!(venueName in VENUES)) {
     throw new Error(`unknown venue "${venueName}" (none|jupiter|drift)`);
@@ -269,6 +265,16 @@ async function main() {
   console.log(`  NEXT_PUBLIC_GUARD_PROGRAM_ID=${programId.toBase58()}`);
   console.log(`  NEXT_PUBLIC_SOLANA_RPC=${config.rpc}`);
   console.log(`[init] guard PDA: ${guard.toBase58()}`);
+  // Said here rather than silently creating one: an *unfunded* reserve behaves
+  // exactly like no reserve — the top-up escalates either way — so creating the
+  // account without moving value in would only look like the gap was closed.
+  if (authorityReq === AUTHORITY.autonomous) {
+    console.log(
+      "[init] this guard is autonomous. An autonomous TopUp draws on a margin reserve;\n" +
+        "       until one is funded, a top-up escalates for manual review instead of executing:\n" +
+        "         node src/margin-wallet.mjs init && node src/margin-wallet.mjs fund 1"
+    );
+  }
 }
 
 main().catch((err) => {

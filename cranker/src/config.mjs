@@ -40,6 +40,11 @@ export const config = {
     process.env.WICK_PROGRAM_ID ?? "FRtyvM3xcFhL5FbukUdzaMV7t4pePiqxPvp2ZHwptBE"
   ),
   tickIntervalMs: Number(process.env.TICK_INTERVAL_MS ?? 5000),
+  // §8.3 — venue reconciliation runs on its own, much slower cadence than the
+  // tick. It is a correction to the guard's model, not part of the heartbeat,
+  // and putting it on the tick's path would spend the staleness budget the
+  // 10s MAX_TICK_AGE_SECS window measures.
+  reconcileIntervalMs: Number(process.env.RECONCILE_INTERVAL_MS ?? 60_000),
   dryRun: (process.env.DRY_RUN ?? "1") !== "0",
   // §8.6 — where a delegated guard ticks. Kept separate from `rpcEndpoints`:
   // the ER only knows about accounts that have been delegated to it, so sending
