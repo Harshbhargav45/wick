@@ -28,12 +28,13 @@ declare global {
   interface Window {
     solana?: InjectedProvider;
     backpack?: InjectedProvider;
+    solflare?: InjectedProvider;
   }
 }
 
 function findProvider(): InjectedProvider | null {
   if (typeof window === 'undefined') return null;
-  return window.solana ?? window.backpack ?? null;
+  return window.solana ?? window.backpack ?? window.solflare ?? null;
 }
 
 export interface WalletState {
