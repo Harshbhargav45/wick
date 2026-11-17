@@ -12,6 +12,7 @@ import { WalletButton } from '@/components/wick/WalletButton';
 import { ThemeToggle } from '@/components/wick/ThemeToggle';
 import { CopyButton } from '@/components/wick/CopyButton';
 import { GuardInitPanel } from '@/components/wick/GuardInitPanel';
+import { ConsoleSkeleton } from '@/components/wick/ConsoleSkeleton';
 import { explorerAccountUrl } from '@/lib/explorer';
 import { HealthGauge } from '@/components/wick/HealthGauge';
 import { PositionPanel } from '@/components/wick/PositionPanel';
@@ -101,7 +102,9 @@ export default function ConsolePage() {
             <span className="text-foreground">node src/init.mjs</span> in cranker/.
           </p>
         ) : null}
-        {status === 'empty' ? (
+        {status === 'loading' ? (
+          <ConsoleSkeleton />
+        ) : status === 'empty' ? (
           <GuardInitPanel
             programId={programId}
             routeConfig={routeConfig}
