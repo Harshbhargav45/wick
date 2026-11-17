@@ -32,6 +32,9 @@ function Row({
 }
 
 export function PositionPanel({ state, health }: { state: GuardState; health: Health }) {
+  // Zero size is a real state — a freshly initialized guard — not a short. It
+  // gets its own label so the console never suggests exposure that is not there.
+  const isFlat = state.size === 0n;
   const isLong = state.size > 0n;
   const pnl = health.pnl;
   const pnlPct =
@@ -46,10 +49,12 @@ export function PositionPanel({ state, health }: { state: GuardState; health: He
         <span
           className={cn(
             'rounded border px-1.5 py-0.5 font-mono text-[10px] tracking-[0.16em]',
-            isLong ? 'border-healthy/40 text-healthy' : 'border-risk/40 text-risk',
+            isFlat && 'border-border text-muted-foreground',
+            !isFlat && isLong && 'border-healthy/40 text-healthy',
+            !isFlat && !isLong && 'border-risk/40 text-risk',
           )}
         >
-          {isLong ? 'LONG' : 'SHORT'}
+          {isFlat ? 'FLAT' : isLong ? 'LONG' : 'SHORT'}
         </span>
       </div>
 
