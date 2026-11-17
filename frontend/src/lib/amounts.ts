@@ -50,6 +50,17 @@ export function parseSol(input: string): ParseResult {
   return parseDecimal(input, LAMPORT_DECIMALS);
 }
 
+/**
+ * Whole non-negative integer, for values that are not scaled amounts — bps,
+ * market indices, sub-account ids. Unlike `parseDecimal` this accepts zero.
+ */
+export function parseUint(input: string): ParseResult {
+  const text = input.trim();
+  if (text === '') return { ok: false, error: 'Enter a whole number.' };
+  if (!/^\d+$/.test(text)) return { ok: false, error: 'Whole digits only.' };
+  return { ok: true, value: BigInt(text) };
+}
+
 /** Signed decimal, for a position size where negative is short. */
 export function parseSignedDecimal(input: string, decimals: number): ParseResult {
   const text = input.trim();

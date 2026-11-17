@@ -9,7 +9,9 @@ import {
   explainProgramError,
   fundMarginWalletIx,
   guardPda,
+  initGuardIx,
   initMarginWalletIx,
+  initRouteConfigIx,
   marginWalletAddressForBump,
   marginWalletPda,
   routeConfigPda,
@@ -30,11 +32,33 @@ export type OpKind =
   | 'deposit'
   | 'withdraw'
   | 'updatePosition'
+  | 'initGuard'
+  | 'initRouteConfig'
   | 'initReserve'
   | 'fundReserve'
   | 'withdrawReserve'
   | 'closeGuard'
   | 'setPaused';
+
+/**
+ * The values the create-guard form gathers. The co-authority is a base58 string
+ * here and becomes raw bytes at the builder, so the form never has to hold a
+ * `PublicKey` just to render.
+ */
+export interface InitGuardInput {
+  venue: number;
+  coAuthority: string;
+  authorityReq: 0 | 1;
+  maintenanceBps: bigint;
+  triggerBufferBps: bigint;
+  feeBps: bigint;
+  topUpUsdPerAction: bigint;
+  partialCloseUsdPerAction: bigint;
+  dailyTotalUsd: bigint;
+  takeProfit: bigint | null;
+  driftMarketIndex: number;
+  driftSubaccountId: number;
+}
 
 export type TxState =
   | { kind: 'idle' }
@@ -77,6 +101,8 @@ export function useGuardActions(args: {
   const [isPending, startTransition] = useTransition();
 
   const canSend = Boolean(programId && guardAddress && owner);
+  /** Creating a guard or the RouteConfig needs only the program and a wallet. */
+  const canInit = Boolean(programId && owner);
 
   interface BuildCtx {
     program: PublicKey;
@@ -85,30 +111,36 @@ export function useGuardActions(args: {
     routeConfig: PublicKey;
   }
 
+  interface InitCtx {
+    program: PublicKey;
+    owner: PublicKey;
+    routeConfig: PublicKey;
+  }
+
   /**
-   * Build, sign, send, confirm. `coSign: true` stops after the owner's
-   * signature and returns the bytes for the second signer.
+   * Sign, send, confirm. `coSign: true` stops after the owner's signature and
+   * returns the bytes for the second signer.
    */
-  const run = async (
+  const sendIx = async (
     op: OpKind,
-    build: (ctx: BuildCtx) => TransactionInstruction,
-    coSign = false,
+    buildInstruction: () => TransactionInstruction,
+    signer: PublicKey,
+    coSign: boolean,
   ) => {
-    if (!programId || !guardAddress || !owner) return;
     setTx({ kind: 'sending', op });
     try {
-      const program = new PublicKey(programId);
-      const guard = new PublicKey(guardAddress);
-      const [routeConfig] = routeConfigPda(program);
-
+      // Built inside the try so a serializer that rejects an out-of-range value
+      // lands in the same error state as an RPC failure instead of escaping as
+      // an unhandled rejection.
+      const instruction = buildInstruction();
       const connection = createFailoverConnection(rpcEndpoints());
       const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
 
       const transaction = new Transaction({
-        feePayer: owner,
+        feePayer: signer,
         blockhash,
         lastValidBlockHeight,
-      }).add(build({ program, guard, owner, routeConfig }));
+      }).add(instruction);
 
       if (coSign) {
         const signed = await partialSignWithWallet(transaction);
@@ -134,17 +166,75 @@ export function useGuardActions(args: {
     }
   };
 
+  const run = async (
+    op: OpKind,
+    build: (ctx: BuildCtx) => TransactionInstruction,
+    coSign = false,
+  ) => {
+    if (!programId || !guardAddress || !owner) return;
+    const program = new PublicKey(programId);
+    const guard = new PublicKey(guardAddress);
+    const [routeConfig] = routeConfigPda(program);
+    await sendIx(op, () => build({ program, guard, owner, routeConfig }), owner, coSign);
+  };
+
+  const runInit = async (
+    op: OpKind,
+    build: (ctx: InitCtx) => TransactionInstruction,
+  ) => {
+    if (!programId || !owner) return;
+    const program = new PublicKey(programId);
+    const [routeConfig] = routeConfigPda(program);
+    await sendIx(op, () => build({ program, owner, routeConfig }), owner, false);
+  };
+
   const dispatch = (op: OpKind, build: (ctx: BuildCtx) => TransactionInstruction, coSign = false) =>
     startTransition(() => {
       void run(op, build, coSign);
     });
 
+  const dispatchInit = (op: OpKind, build: (ctx: InitCtx) => TransactionInstruction) =>
+    startTransition(() => {
+      void runInit(op, build);
+    });
+
   return {
     tx,
     canSend,
+    canInit,
     isPending,
     /** True when the 2-of-2 paths can produce the owner's half in this browser. */
     canCoSign: canPartialSign(),
+
+    /** Create this wallet's guard PDA with the chosen policy. */
+    initGuard: (input: InitGuardInput) =>
+      dispatchInit('initGuard', ({ program, owner: o }) => {
+        const [guard, bump] = guardPda(program, o);
+        return initGuardIx(program, guard, o, bump, {
+          venue: input.venue,
+          coAuthority: new PublicKey(input.coAuthority).toBytes(),
+          authorityReq: input.authorityReq,
+          maintenanceBps: input.maintenanceBps,
+          triggerBufferBps: input.triggerBufferBps,
+          feeBps: input.feeBps,
+          topUpUsdPerAction: input.topUpUsdPerAction,
+          partialCloseUsdPerAction: input.partialCloseUsdPerAction,
+          dailyTotalUsd: input.dailyTotalUsd,
+          takeProfit: input.takeProfit,
+          driftMarketIndex: input.driftMarketIndex,
+          driftSubaccountId: input.driftSubaccountId,
+        });
+      }),
+
+    /**
+     * Create the singleton RouteConfig. The connected wallet becomes the
+     * kill-switch authority; the panel warns before offering it.
+     */
+    initRouteConfig: () =>
+      dispatchInit('initRouteConfig', ({ program, owner: o, routeConfig }) => {
+        const [, bump] = routeConfigPda(program);
+        return initRouteConfigIx(program, routeConfig, o, o, bump);
+      }),
 
     confirm: () =>
       dispatch('confirm', ({ program, guard, owner: o, routeConfig }) =>

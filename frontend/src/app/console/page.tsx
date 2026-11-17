@@ -11,6 +11,7 @@ import { WickMark } from '@/components/wick/Logo';
 import { WalletButton } from '@/components/wick/WalletButton';
 import { ThemeToggle } from '@/components/wick/ThemeToggle';
 import { CopyButton } from '@/components/wick/CopyButton';
+import { GuardInitPanel } from '@/components/wick/GuardInitPanel';
 import { explorerAccountUrl } from '@/lib/explorer';
 import { HealthGauge } from '@/components/wick/HealthGauge';
 import { PositionPanel } from '@/components/wick/PositionPanel';
@@ -40,7 +41,7 @@ export default function ConsolePage() {
     marginWalletBump: snapshot?.state.marginWalletBump ?? null,
     onDone: refresh,
   });
-  const { tx, canSend, isPending, canCoSign } = actions;
+  const { tx, canSend, canInit, isPending, canCoSign } = actions;
 
   // One reason, one place. Every disabled control quotes the same sentence for
   // the same condition instead of inventing its own.
@@ -100,7 +101,17 @@ export default function ConsolePage() {
             <span className="text-foreground">node src/init.mjs</span> in cranker/.
           </p>
         ) : null}
-        {status !== 'ready' || !snapshot ? (
+        {status === 'empty' ? (
+          <GuardInitPanel
+            programId={programId}
+            routeConfig={routeConfig}
+            canInit={canInit}
+            tx={tx}
+            pending={pending}
+            onInitRouteConfig={actions.initRouteConfig}
+            onInitGuard={actions.initGuard}
+          />
+        ) : status !== 'ready' || !snapshot ? (
           <EmptyState status={status} error={error} programId={programId} />
         ) : (
           <>

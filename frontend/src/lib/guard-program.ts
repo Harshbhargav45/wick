@@ -16,6 +16,13 @@
 import { Buffer } from 'buffer';
 import { PublicKey, TransactionInstruction } from '@solana/web3.js';
 import { ACCOUNT_VERSION } from './guard-layout';
+import {
+  buildInitGuardData,
+  buildInitRouteConfigData,
+  writeI128LE,
+  writeU128LE,
+  type InitGuardPolicy,
+} from './guard-init';
 
 export const IX_INIT_GUARD = 0;
 export const IX_DEPOSIT_MARGIN = 1;
@@ -108,17 +115,62 @@ export function marginWalletAddressForBump(
   }
 }
 
-function writeU128LE(out: Uint8Array, off: number, value: bigint): void {
-  if (value < 0n) throw new Error('writeU128LE: negative value');
-  let v = value;
-  for (let i = 0; i < 16; i++) {
-    out[off + i] = Number(v & 0xffn);
-    v >>= 8n;
-  }
+/**
+ * Create the guard PDA for `owner` and pin its policy.
+ *
+ * Account layout: [0] guard (w, created), [1] owner (signer), [2] payer
+ * (signer, w), [3] rent sysvar, [4] system program — the handler creates the
+ * account by CPI. The console uses the owner as payer, so slots 1 and 2 repeat
+ * the same key, exactly as `cranker/src/init.mjs` does.
+ * Data: [disc, bump, policy(150)].
+ */
+export function initGuardIx(
+  programId: PublicKey,
+  guard: PublicKey,
+  owner: PublicKey,
+  bump: number,
+  policy: InitGuardPolicy,
+): TransactionInstruction {
+  return new TransactionInstruction({
+    programId,
+    keys: [
+      { pubkey: guard, isSigner: false, isWritable: true },
+      { pubkey: owner, isSigner: true, isWritable: false },
+      { pubkey: owner, isSigner: true, isWritable: true },
+      { pubkey: RENT_SYSVAR, isSigner: false, isWritable: false },
+      { pubkey: SYSTEM_PROGRAM, isSigner: false, isWritable: false },
+    ],
+    data: Buffer.from(buildInitGuardData(bump, policy)),
+  });
 }
 
-function writeI128LE(out: Uint8Array, off: number, value: bigint): void {
-  writeU128LE(out, off, value < 0n ? (1n << 128n) + value : value);
+/**
+ * Create the singleton RouteConfig. Permissionless by design: whoever initializes
+ * it becomes the kill-switch authority, which is why the console warns before
+ * offering this and why `init_route_config` refuses an initialized account.
+ *
+ * Account layout: [0] config (w, created), [1] authority (signer), [2] payer
+ * (signer, w), [3] rent sysvar, [4] system program.
+ * Data: [disc, bump].
+ */
+export function initRouteConfigIx(
+  programId: PublicKey,
+  routeConfig: PublicKey,
+  authority: PublicKey,
+  payer: PublicKey,
+  bump: number,
+): TransactionInstruction {
+  return new TransactionInstruction({
+    programId,
+    keys: [
+      { pubkey: routeConfig, isSigner: false, isWritable: true },
+      { pubkey: authority, isSigner: true, isWritable: false },
+      { pubkey: payer, isSigner: true, isWritable: true },
+      { pubkey: RENT_SYSVAR, isSigner: false, isWritable: false },
+      { pubkey: SYSTEM_PROGRAM, isSigner: false, isWritable: false },
+    ],
+    data: Buffer.from(buildInitRouteConfigData(bump)),
+  });
 }
 
 /** `[disc, amount u128 LE]` — the shared payload of every `parse_amount` handler. */

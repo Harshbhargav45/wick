@@ -6,6 +6,7 @@ import {
   parseDecimal,
   parseSignedDecimal,
   parseSol,
+  parseUint,
   parseUsd,
 } from '../.test-build/amounts.js';
 
@@ -46,6 +47,14 @@ describe('amount parsing', () => {
     const r = parseUsd(text);
     assert.equal(r.ok, true);
     assert.equal(r.ok && r.value, 9_007_199_254_740_993_000_000n);
+  });
+
+  it('parses whole non-negative integers, where zero is valid', () => {
+    assert.equal(parseUint('0').ok && parseUint('0').value, 0n);
+    assert.equal(parseUint('500').ok && parseUint('500').value, 500n);
+    for (const bad of ['', ' ', '-1', '1.5', '1e3', '0x10']) {
+      assert.equal(parseUint(bad).ok, false, `expected ${JSON.stringify(bad)} to be rejected`);
+    }
   });
 
   it('parses signed sizes, where negative is short', () => {

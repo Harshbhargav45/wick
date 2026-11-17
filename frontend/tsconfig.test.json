@@ -29,6 +29,7 @@
     "src/lib/guard-layout.ts",
     "src/lib/guard-health.ts",
     "src/lib/guard-program.ts",
+    "src/lib/guard-init.ts",
     "src/lib/explorer.ts"
   ]
 }
