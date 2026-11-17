@@ -98,7 +98,7 @@ export default function ConsolePage() {
         ) : !routeConfig.exists ? (
           <p className="mb-6 rounded-md border border-warning/40 bg-warning/5 px-3 py-2 font-mono text-[11.5px] text-warning">
             RouteConfig is not initialized. The program checks it on every state-mutating
-            instruction, so writes will fail until it exists — run{' '}
+            instruction, so writes will fail until it exists — use the setup card below, or run{' '}
             <span className="text-foreground">node src/init.mjs</span> in cranker/.
           </p>
         ) : null}

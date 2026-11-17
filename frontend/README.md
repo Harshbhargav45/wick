@@ -1,36 +1,65 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Wick console
 
-## Getting Started
+The Next.js frontend for Wick: the landing page at `/` and the live guard
+console at `/console`.
 
-First, run the development server:
+## Setup
 
 ```bash
+cp .env.example .env.local   # set NEXT_PUBLIC_GUARD_PROGRAM_ID
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+`NEXT_PUBLIC_SOLANA_CLUSTER` drives Explorer links and should match the RPC
+cluster. RPC endpoints are tried in order (Helius → QuickNode → explicit →
+public devnet), and `NEXT_PUBLIC_*` values are inlined into the browser bundle,
+so treat any key in this file as public.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Console behavior
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+- With a wallet connected it resolves *your* guard PDA (`b"guard" || owner`).
+  Without one it scans program accounts and stays read-only.
+- A wallet with no guard gets a create flow: initialize RouteConfig if the
+  program has none, then create the guard and enroll a position.
+- Writes quote the same blocking reason everywhere (no wallet, missing/paused
+  RouteConfig, wrong owner). 2-of-2 withdrawals produce a partially signed
+  transaction instead of pretending to send one key short.
+- Addresses, reserve, and transaction signatures link to Solana Explorer.
 
-## Learn More
+The guard account holds current state, not history, so the activity feed records
+only transitions observed during the session and never backfills.
 
-To learn more about Next.js, take a look at the following resources:
+## Scripts
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+| Command | Purpose |
+|---|---|
+| `npm run dev` | Dev server |
+| `npm run build` | Production build |
+| `npm run start` | Serve the production build |
+| `npm run lint` | ESLint |
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+The pure logic in `src/lib` has its own narrow build and test runner:
 
-## Deploy on Vercel
+```bash
+npx tsc -p tsconfig.test.json
+node --test test/
+```
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+That compiles `amounts`, `guard-layout`, `guard-health`, `guard-init`,
+`guard-program`, and `explorer` to CommonJS in `.test-build/`; no browser runner
+or extra dependency. `.test-build/` is gitignored and ESLint-ignored.
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+## Layout
+
+```
+src/app/            routes: / (landing), /console, layout + theme boot script
+src/components/wick design-system and console panels
+src/hooks/          guard polling, derived events, wallet, write actions, motion
+src/lib/            account decoders, health math, payload builders, RPC/Explorer
+test/               node --test specs against .test-build
+```
+
+`src/lib/guard-layout.ts` mirrors `program/src/account.rs` and
+`src/lib/guard-health.ts` mirrors `program/src/state.rs`; they must move
+together with the program.

@@ -190,11 +190,14 @@ npm install && npm run dev
 ```
 
 `/` is the landing page; `/console` attaches to a live guard. With a wallet
-connected it resolves *your* guard by PDA and enables the co-sign confirm; with
-no wallet it stays read-only. It renders explicit unconfigured / no-guard /
-error states rather than falling back to fake numbers, and the activity feed
-records only transitions it actually observes — the guard account holds current
-state, not history, so nothing is backfilled.
+connected it resolves *your* guard by PDA; if there is none it walks you through
+initializing RouteConfig (fresh deployments only) and creating the guard, then
+enrolls a position. Deposits, 2-of-2 withdrawals, reserve management, and the
+co-sign confirm are all surfaced there; with no wallet the console stays
+read-only and offers wallet install links. It renders explicit unconfigured /
+no-guard / error states rather than falling back to fake numbers, and the
+activity feed records only transitions it actually observes — the guard account
+holds current state, not history, so nothing is backfilled.
 
 ### Run the cranker
 
@@ -266,9 +269,16 @@ Stated plainly, because a risk tool that oversells itself is worse than none:
   devnet (`FRtyvM3xcFhL5FbukUdzaMV7t4pePiqxPvp2ZHwptBE`) and the
   delegate/commit/undelegate hooks exist, but the live MagicBlock round trip is
   unverified.
-- **The console is read + confirm.** It resolves the guard, decodes it, and can
-  land `ConfirmYes`. Init, deposit, and position enrollment are built as
-  instruction builders but not yet surfaced as forms.
+- **RouteConfig initialization is a deployment step, not an owner action.** The
+  console can create it when missing, but that makes the connected wallet the
+  kill-switch authority. On a live deployment — where the config already exists —
+  initialization is refused; use the existing authority rather than expecting
+  the button to hand you control.
+- **The console covers the owner lifecycle.** It resolves a guard, initializes
+  RouteConfig and the guard on a fresh deployment, enrolls a position,
+  deposits/withdraws, manages the margin reserve, and confirms co-signed
+  instructions. 2-of-2 withdrawals still hand off a partially signed
+  transaction rather than sending one key short.
 - **Drift market and sub-account are pinned at init** and cannot be changed
   without re-initialization.
 - `npm audit` reports 3 moderate advisories, all transitive through
@@ -286,6 +296,7 @@ Stated plainly, because a risk tool that oversells itself is worse than none:
 - [x] Measured latency benchmark (187 µs p50) + honest dashboard chart
 - [x] Devnet deployment + cranker driving real price ticks
 - [x] Frontend — Ember Circuit brand, landing page, live console, wallet co-sign
+- [x] Console — guard/RouteConfig init, position enrollment, reserve management, Explorer links, theme toggle
 - [ ] Jupiter defensive-close instruction build
 - [ ] ER delegation round-trip on live MagicBlock
 - [ ] On-chain end-to-end latency measurement
