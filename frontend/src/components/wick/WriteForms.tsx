@@ -1,9 +1,12 @@
 'use client';
 
 import { useId, useState, type ReactNode } from 'react';
+import { ExternalLink } from 'lucide-react';
 import type { OpKind, TxState } from '@/hooks/useGuardActions';
+import { explorerTxUrl } from '@/lib/explorer';
 import { cn } from '@/lib/utils';
 import type { ParseResult } from '@/lib/amounts';
+import { CopyButton } from './CopyButton';
 
 /**
  * The result of one write, scoped to the operation that produced it.
@@ -26,8 +29,17 @@ export function TxResult({ tx, op }: { tx: TxState; op: OpKind }) {
 
   if (tx.kind === 'sent') {
     return (
-      <p className="mt-2 font-mono text-[11px] break-all text-healthy">
-        confirmed · {tx.signature.slice(0, 16)}…
+      <p className="mt-2 flex items-center gap-2 font-mono text-[11px] break-all text-healthy">
+        <span>confirmed ·</span>
+        <a
+          href={explorerTxUrl(tx.signature)}
+          target="_blank"
+          rel="noreferrer"
+          className="underline decoration-healthy/40 underline-offset-2 hover:decoration-healthy"
+        >
+          {tx.signature.slice(0, 16)}…
+        </a>
+        <ExternalLink className="h-3 w-3 shrink-0" aria-hidden="true" />
       </p>
     );
   }
@@ -48,19 +60,6 @@ export function TxResult({ tx, op }: { tx: TxState; op: OpKind }) {
  * and a spinner over a transaction that cannot land is worse than a hand-off.
  */
 function CoSignHandoff({ base64 }: { base64: string }) {
-  const [copied, setCopied] = useState(false);
-
-  const copy = async () => {
-    try {
-      await navigator.clipboard.writeText(base64);
-      setCopied(true);
-    } catch {
-      // A clipboard the browser refuses is not worth an error banner — the
-      // textarea below is still selectable by hand.
-      setCopied(false);
-    }
-  };
-
   return (
     <div className="mt-3 rounded-md border border-warning/40 bg-warning/5 p-3">
       <p className="font-mono text-[11px] tracking-[0.06em] text-warning">
@@ -78,13 +77,13 @@ function CoSignHandoff({ base64 }: { base64: string }) {
         aria-label="Partially signed transaction, base64"
         className="mt-2 w-full resize-none rounded border border-border bg-background px-2 py-1.5 font-mono text-[10px] break-all text-muted-foreground"
       />
-      <button
-        type="button"
-        onClick={copy}
-        className="mt-2 rounded border border-border px-2.5 py-1 font-mono text-[11px] text-muted-foreground transition-colors hover:border-warning hover:text-warning"
-      >
-        {copied ? 'copied' : 'copy base64'}
-      </button>
+      <CopyButton
+        value={base64}
+        label="copy base64"
+        copiedLabel="copied"
+        showLabel
+        className="mt-2 px-2.5 text-[11px] hover:border-warning hover:text-warning"
+      />
     </div>
   );
 }

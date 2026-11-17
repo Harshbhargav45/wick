@@ -24,5 +24,11 @@
     "declaration": false,
     "sourceMap": false
   },
-  "include": ["src/lib/amounts.ts", "src/lib/guard-layout.ts", "src/lib/guard-health.ts", "src/lib/guard-program.ts"]
+  "include": [
+    "src/lib/amounts.ts",
+    "src/lib/guard-layout.ts",
+    "src/lib/guard-health.ts",
+    "src/lib/guard-program.ts",
+    "src/lib/explorer.ts"
+  ]
 }

@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { PublicKey } from '@solana/web3.js';
-import { ArrowLeft, RefreshCw } from 'lucide-react';
+import { ArrowLeft, ExternalLink, RefreshCw } from 'lucide-react';
 import { useGuardAccount, writeBlockReason } from '@/hooks/useGuardAccount';
 import { useGuardEvents } from '@/hooks/useGuardEvents';
 import { useGuardActions, type OpKind } from '@/hooks/useGuardActions';
@@ -10,6 +10,8 @@ import { useWallet } from '@/hooks/useWallet';
 import { WickMark } from '@/components/wick/Logo';
 import { WalletButton } from '@/components/wick/WalletButton';
 import { ThemeToggle } from '@/components/wick/ThemeToggle';
+import { CopyButton } from '@/components/wick/CopyButton';
+import { explorerAccountUrl } from '@/lib/explorer';
 import { HealthGauge } from '@/components/wick/HealthGauge';
 import { PositionPanel } from '@/components/wick/PositionPanel';
 import { PolicyPanel } from '@/components/wick/PolicyPanel';
@@ -105,10 +107,22 @@ export default function ConsolePage() {
             <div className="flex flex-wrap items-end justify-between gap-4">
               <div className="min-w-0">
                 <h1 className="font-serif text-3xl text-foreground">{snapshot.venueLabel}</h1>
-                <p className="mt-1 font-mono text-[11px] text-muted-foreground">
-                  guard {snapshot.address.slice(0, 6)}…{snapshot.address.slice(-6)} · last tick{' '}
-                  {describeTick(snapshot.state.lastCheckTs, snapshot.chainTs)}
-                </p>
+                <div className="mt-1 flex flex-wrap items-center gap-2 font-mono text-[11px] text-muted-foreground">
+                  <span className="inline-flex items-center gap-1.5">
+                    guard
+                    <a
+                      href={explorerAccountUrl(snapshot.address)}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-foreground/80 underline decoration-border underline-offset-2 transition-colors hover:text-primary"
+                    >
+                      {snapshot.address.slice(0, 6)}…{snapshot.address.slice(-6)}
+                    </a>
+                    <ExternalLink className="h-3 w-3" aria-hidden="true" />
+                    <CopyButton value={snapshot.address} label="Copy guard address" />
+                  </span>
+                  <span>· last tick {describeTick(snapshot.state.lastCheckTs, snapshot.chainTs)}</span>
+                </div>
               </div>
               <span className="rounded-md border border-border px-2.5 py-1.5 font-mono text-[11px] text-muted-foreground">
                 {snapshot.isCoSigned ? 'co-signed · guard builds only' : 'autonomous · guard signs'}

@@ -1,9 +1,12 @@
 'use client';
 
+import { ExternalLink } from 'lucide-react';
 import type { ReserveState } from '@/hooks/useGuardAccount';
 import type { OpKind, TxState } from '@/hooks/useGuardActions';
 import { formatSol, parseSol } from '@/lib/amounts';
+import { explorerAccountUrl } from '@/lib/explorer';
 import { AmountForm, TxResult } from './WriteForms';
+import { CopyButton } from './CopyButton';
 import { cn } from '@/lib/utils';
 
 /**
@@ -79,9 +82,18 @@ export function ReservePanel({
                 </dd>
               </div>
             </dl>
-            <p className="mt-2 font-mono text-[10px] break-all text-muted-foreground/60">
-              {reserve.address}
-            </p>
+            <div className="mt-2 flex items-start gap-1.5 font-mono text-[10px] text-muted-foreground/60">
+              <a
+                href={explorerAccountUrl(reserve.address)}
+                target="_blank"
+                rel="noreferrer"
+                className="min-w-0 break-all underline decoration-border/60 underline-offset-2 transition-colors hover:text-foreground"
+              >
+                {reserve.address}
+              </a>
+              <ExternalLink className="mt-0.5 h-3 w-3 shrink-0" aria-hidden="true" />
+              <CopyButton value={reserve.address} label="Copy reserve address" className="shrink-0" />
+            </div>
 
             {reserve.balance === 0n && topUpCap > 0n ? (
               <p className="mt-3 rounded-md border border-warning/40 bg-warning/5 px-2.5 py-2 text-[11.5px] leading-relaxed text-warning">
