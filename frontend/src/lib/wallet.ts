@@ -43,7 +43,9 @@ export interface WalletState {
 }
 
 const listeners = new Set<() => void>();
-let state: WalletState = { connected: false, publicKey: null, providerName: null };
+/** Stable identity for "no wallet" — see `getWalletServerSnapshot`. */
+const DISCONNECTED: WalletState = { connected: false, publicKey: null, providerName: null };
+let state: WalletState = DISCONNECTED;
 
 function emit(next: WalletState) {
   state = next;
@@ -89,7 +91,9 @@ export function getWalletSnapshot(): WalletState {
 }
 
 export function getWalletServerSnapshot(): WalletState {
-  return { connected: false, publicKey: null, providerName: null };
+  // `useSyncExternalStore` compares snapshots with `Object.is`; returning a new
+  // object here would make every read look like a change and re-render forever.
+  return DISCONNECTED;
 }
 
 export function isWalletAvailable(): boolean {
