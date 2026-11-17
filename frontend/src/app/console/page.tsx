@@ -9,6 +9,7 @@ import { useGuardActions, type OpKind } from '@/hooks/useGuardActions';
 import { useWallet } from '@/hooks/useWallet';
 import { WickMark } from '@/components/wick/Logo';
 import { WalletButton } from '@/components/wick/WalletButton';
+import { ThemeToggle } from '@/components/wick/ThemeToggle';
 import { HealthGauge } from '@/components/wick/HealthGauge';
 import { PositionPanel } from '@/components/wick/PositionPanel';
 import { PolicyPanel } from '@/components/wick/PolicyPanel';
@@ -70,6 +71,7 @@ export default function ConsolePage() {
 
           <div className="flex shrink-0 items-center gap-1.5 sm:gap-3">
             <StatusPill status={status} snapshot={snapshot} />
+            <ThemeToggle />
             <WalletButton />
             <button
               type="button"

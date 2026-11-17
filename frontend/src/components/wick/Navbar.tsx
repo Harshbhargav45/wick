@@ -5,6 +5,7 @@ import Link from 'next/link';
 import { ArrowUpRight, Menu, X } from 'lucide-react';
 import { WickLogo } from './Logo';
 import { PoweredByMagicBlock } from './PoweredByMagicBlock';
+import { ThemeToggle } from './ThemeToggle';
 import { useScrolled } from '@/hooks/useWickMotion';
 import { cn } from '@/lib/utils';
 
@@ -56,6 +57,7 @@ export function Navbar() {
 
           <div className="flex shrink-0 items-center gap-3">
             <PoweredByMagicBlock className="hidden lg:inline-flex" />
+            <ThemeToggle className="h-8 w-8" />
             <span className="hidden items-center gap-2 font-mono text-[11px] tracking-wider text-muted-foreground lg:flex">
               <span aria-hidden="true" className="h-1.5 w-1.5 rounded-full bg-healthy animate-pulse-dot" />
               devnet · drift delegated
